@@ -38,16 +38,16 @@ fn build_connection_string(config: &LocalDbConfig) -> String {
     )
 }
 
-/// Sanitize SQL identifier (table names & column names) to avoid SQL injection
+/// Sanitize SQL identifier (table names & column names) by escaping with backticks.
+/// Allows any character including spaces — backticks within the name are escaped.
 fn sanitize_identifier(ident: &str) -> Result<String, String> {
     let trimmed = ident.trim().trim_matches('`');
     if trimmed.is_empty() {
         return Err("Nama tabel atau kolom tidak boleh kosong".to_string());
     }
-    if !trimmed.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
-        return Err(format!("Karakter tidak valid pada identifier SQL: '{}'", ident));
-    }
-    Ok(format!("`{}`", trimmed))
+    // Escape any backtick characters within the identifier itself
+    let escaped = trimmed.replace('`', "``");
+    Ok(format!("`{}`", escaped))
 }
 
 mod urlencoding {
@@ -131,7 +131,61 @@ pub async fn get_last_local_id(
     Ok(None)
 }
 
+/// Get the maximum updated_at timestamp from a local table.
+/// Returns None if the table doesn't exist or has no updated_at column.
+#[tauri::command]
+pub async fn get_local_max_updated_at(
+    config: LocalDbConfig,
+    table_name: String,
+) -> Result<Option<String>, String> {
+    let safe_table = sanitize_identifier(&table_name)?;
+    let conn_str = build_connection_string(&config);
+
+    let pool = MySqlPoolOptions::new()
+        .max_connections(2)
+        .connect(&conn_str)
+        .await
+        .map_err(|e| format!("Koneksi ke MySQL lokal gagal: {}", e))?;
+
+    // Check whether updated_at column exists in this table
+    let col_check_query = format!(
+        "SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '{}' AND COLUMN_NAME = 'updated_at'",
+        table_name.replace('\'', "''")
+    );
+    let col_row = sqlx::query(&col_check_query)
+        .fetch_optional(&pool)
+        .await
+        .map_err(|e| format!("Gagal memeriksa kolom updated_at: {}", e))?;
+
+    let has_updated_at = col_row
+        .and_then(|r| r.try_get::<i64, _>(0).ok())
+        .unwrap_or(0) > 0;
+
+    if !has_updated_at {
+        pool.close().await;
+        return Ok(None);
+    }
+
+    let query = format!("SELECT MAX(updated_at) AS max_updated_at FROM {}", safe_table);
+    let row = sqlx::query(&query)
+        .fetch_optional(&pool)
+        .await
+        .map_err(|e| format!("Gagal query MAX(updated_at): {}", e))?;
+
+    pool.close().await;
+
+    if let Some(r) = row {
+        if let Ok(val) = r.try_get::<String, _>(0) {
+            return Ok(Some(val));
+        }
+    }
+
+    Ok(None)
+}
+
 /// Sync array of JSON objects to local MySQL via bulk ON DUPLICATE KEY UPDATE (Upsert)
+/// Automatically disables FOREIGN_KEY_CHECKS for the duration of the insert to prevent
+/// constraint errors when syncing tables with foreign key references.
 #[tauri::command]
 pub async fn sync_to_local_db(
     config: LocalDbConfig,
@@ -179,11 +233,19 @@ pub async fn sync_to_local_db(
         safe_cols.push(sanitize_identifier(col)?);
     }
 
-    let batch_size = 100;
+    let mut tx = pool.begin().await
+        .map_err(|e| format!("Gagal memulai transaksi MySQL lokal: {}", e))?;
+
+    // Nonaktifkan FK checks dan strict SQL mode pada transaksi ini
+    let _ = sqlx::query("SET FOREIGN_KEY_CHECKS=0").execute(&mut *tx).await;
+    let _ = sqlx::query("SET SESSION sql_mode=''").execute(&mut *tx).await;
+
+    let batch_size = 500;
     let mut total_affected: u64 = 0;
     let total_rows = rows.len();
+    let mut upsert_error: Option<String> = None;
 
-    for batch in rows.chunks(batch_size) {
+    'batch_loop: for batch in rows.chunks(batch_size) {
         let mut query = format!("INSERT INTO {} ({}) VALUES ", safe_table, safe_cols.join(", "));
         let mut value_clauses = Vec::new();
 
@@ -222,15 +284,32 @@ pub async fn sync_to_local_db(
             query.push_str(&format!(" ON DUPLICATE KEY UPDATE {}=VALUES({})", safe_pk, safe_pk));
         }
 
-        let res = sqlx::query(&query)
-            .execute(&pool)
-            .await
-            .map_err(|e| format!("Gagal memproses query bulk upsert: {}", e))?;
-
-        total_affected += res.rows_affected();
+        match sqlx::query(&query).execute(&mut *tx).await {
+            Ok(res) => total_affected += res.rows_affected(),
+            Err(e) => {
+                upsert_error = Some(format!("Gagal memproses query bulk upsert: {}", e));
+                break 'batch_loop;
+            }
+        }
     }
 
+    if let Some(err) = upsert_error {
+        let _ = tx.rollback().await;
+        pool.close().await;
+        return Err(err);
+    }
+
+    let _ = sqlx::query("SET FOREIGN_KEY_CHECKS=1").execute(&mut *tx).await;
+    let _ = sqlx::query("SET SESSION sql_mode=DEFAULT").execute(&mut *tx).await;
+
+    tx.commit().await
+        .map_err(|e| format!("Gagal meng-commit data ke MySQL lokal: {}", e))?;
+
     pool.close().await;
+
+    if let Some(err) = upsert_error {
+        return Err(err);
+    }
 
     Ok(SyncResult {
         success: true,
@@ -239,6 +318,7 @@ pub async fn sync_to_local_db(
         rows_inserted_or_updated: total_affected,
     })
 }
+
 
 /// Fetch sample preview rows from local table
 #[tauri::command]
@@ -291,6 +371,48 @@ pub async fn get_local_table_preview(
     }
 
     Ok(result)
+}
+
+/// Truncate local table for Fresh Sync mode
+/// Automatically disables FOREIGN_KEY_CHECKS before TRUNCATE and re-enables after.
+#[tauri::command]
+pub async fn truncate_local_table(
+    config: LocalDbConfig,
+    table_name: String,
+) -> Result<String, String> {
+    let safe_table = sanitize_identifier(&table_name)?;
+    let conn_str = build_connection_string(&config);
+
+    let pool = MySqlPoolOptions::new()
+        .max_connections(2)
+        .connect(&conn_str)
+        .await
+        .map_err(|e| format!("Koneksi ke MySQL lokal gagal: {}", e))?;
+
+    // Disable FK checks agar TRUNCATE tidak gagal karena relasi foreign key
+    sqlx::query("SET FOREIGN_KEY_CHECKS=0")
+        .execute(&pool)
+        .await
+        .map_err(|e| format!("Gagal menonaktifkan FOREIGN_KEY_CHECKS: {}", e))?;
+
+    let query = format!("TRUNCATE TABLE {}", safe_table);
+
+    let truncate_result = sqlx::query(&query)
+        .execute(&pool)
+        .await
+        .map_err(|e| format!("Gagal mengosongkan (TRUNCATE) tabel lokal {}: {}", table_name, e));
+
+    // Selalu re-enable FK checks, bahkan jika TRUNCATE gagal
+    let _ = sqlx::query("SET FOREIGN_KEY_CHECKS=1")
+        .execute(&pool)
+        .await;
+
+    pool.close().await;
+
+    // Propagate error setelah FK checks di-restore
+    truncate_result?;
+
+    Ok(format!("Tabel lokal '{}' berhasil dikosongkan (TRUNCATE).", table_name))
 }
 
 /// Helper function to format JSON value safely into SQL literal

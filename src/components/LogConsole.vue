@@ -75,20 +75,21 @@ const currentFilter = ref('all');
 const searchQuery = ref('');
 
 const filteredLogs = computed(() => {
-  return props.logs.filter((log) => {
+  const list = props.logs.filter((log) => {
     const matchesLevel = currentFilter.value === 'all' || log.type === currentFilter.value;
     const matchesSearch = !searchQuery.value || log.message.toLowerCase().includes(searchQuery.value.toLowerCase());
     return matchesLevel && matchesSearch;
   });
+  return list.slice().reverse();
 });
 
-// Auto-scroll to bottom on new log entry
+// Auto-scroll to top on new log entry (since newest logs are at the top)
 watch(
   () => props.logs.length,
   async () => {
     await nextTick();
     if (logContainer.value) {
-      logContainer.value.scrollTop = logContainer.value.scrollHeight;
+      logContainer.value.scrollTop = 0;
     }
   }
 );
