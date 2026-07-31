@@ -3,7 +3,7 @@
     <!-- Environment Mode Warning Banner if opened in Web Browser -->
     <div v-if="!isTauri" class="browser-banner">
       <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path><line x1="12" y1="9" x2="12" y2="13"></line><line x1="12" y1="17" x2="12.01" y2="17"></line></svg>
-      <span>Mode Pratinjau Web Browser terdeteksi. Untuk mengaktifkan koneksi port native MySQL (3306), buka aplikasi desktop Tauri dengan perintah: <code>npm run tauri dev</code></span>
+      <span>Mode Pratinjau Web Browser terdeteksi. Untuk mengaktifkan koneksi port native MySQL Local, buka aplikasi desktop Tauri dengan perintah: <code>npm run tauri dev</code></span>
     </div>
 
     <!-- Navbar Header -->
@@ -21,17 +21,26 @@
         <ConnectionConfig
           v-model:pma-config="pmaConfig"
           v-model:local-config="localConfig"
+          v-model:selected-tables="selectedTables"
+          v-model:available-tables="availableTables"
+          v-model:sync-mode="syncMode"
+          v-model:row-limit="rowLimit"
           :testing-pma="testingPma"
           :testing-local="testingLocal"
+          :fetching-tables="fetchingTables"
           @test-pma="testPmaConnection"
           @test-local="testLocalConnection"
+          @fetch-tables="fetchTablesFromPma"
+          @preset-changed="handlePresetChanged"
         />
 
         <SyncControl
           :is-syncing="isSyncing"
           v-model:auto-sync-interval="autoSyncInterval"
           :stats="stats"
+          :sync-progress="syncProgress"
           @start-sync="handleStartSync"
+          @stop-sync="handleStopSync"
         />
       </div>
 
@@ -42,10 +51,10 @@
           @clear-logs="logs = []"
         />
 
-        <DataPreview
+        <!-- <DataPreview
           :rows="previewRows"
           @refresh-local-preview="fetchLocalPreview"
-        />
+        /> -->
       </div>
     </main>
   </div>
@@ -57,7 +66,7 @@ import Navbar from './components/Navbar.vue';
 import ConnectionConfig from './components/ConnectionConfig.vue';
 import SyncControl from './components/SyncControl.vue';
 import LogConsole from './components/LogConsole.vue';
-import DataPreview from './components/DataPreview.vue';
+// import DataPreview from './components/DataPreview.vue';
 import { PmaClient } from './services/pmaClient.js';
 import { SyncEngine } from './services/syncEngine.js';
 import { isTauriEnvironment, safeInvoke } from './services/tauriHelper.js';
@@ -83,10 +92,17 @@ const localConfig = ref({
   table: 'users',
 });
 
+// Multi-table & Sync options state
+const availableTables = ref([]);
+const selectedTables = ref([]);
+const syncMode = ref('incremental'); // 'incremental' | 'fresh'
+const rowLimit = ref(0); // 0 = unlimited
+
 const pmaStatus = ref({ connected: false });
 const localStatus = ref({ connected: false });
 const testingPma = ref(false);
 const testingLocal = ref(false);
+const fetchingTables = ref(false);
 
 // Sync execution state
 const isSyncing = ref(false);
@@ -110,8 +126,17 @@ onMounted(() => {
   try {
     const savedPma = localStorage.getItem('db_sync_pma_config');
     const savedLocal = localStorage.getItem('db_sync_local_config');
+    const savedTables = localStorage.getItem('db_sync_selected_tables');
+    const savedAvailable = localStorage.getItem('db_sync_available_tables');
+    const savedMode = localStorage.getItem('db_sync_mode');
+    const savedLimit = localStorage.getItem('db_sync_row_limit');
+
     if (savedPma) Object.assign(pmaConfig.value, JSON.parse(savedPma));
     if (savedLocal) Object.assign(localConfig.value, JSON.parse(savedLocal));
+    if (savedAvailable) availableTables.value = JSON.parse(savedAvailable);
+    if (savedTables) selectedTables.value = JSON.parse(savedTables);
+    if (savedMode) syncMode.value = savedMode;
+    if (savedLimit !== null && savedLimit !== undefined) rowLimit.value = parseInt(savedLimit, 10);
   } catch (e) {
     console.error('Failed reading saved config:', e);
   }
@@ -125,33 +150,30 @@ onMounted(() => {
   } else {
     addLog({
       type: 'warning',
-      message: 'Aplikasi berjalan di Web Browser. Untuk sinkronisasi ke port 3306 MySQL lokal, jalankan: npm run tauri dev',
+      message: 'Aplikasi berjalan di Web Browser. Untuk sinkronisasi ke port MySQL lokal, jalankan: npm run tauri dev',
       timestamp: new Date().toLocaleTimeString(),
     });
   }
 
   addLog({
     type: 'info',
-    message: 'DB-Sync Desktop Client siap. Atur konfigurasi remote & lokal lalu tekan "Mulai Sinkronisasi Data".',
+    message: 'DB-Sync Desktop Client siap. Pilih tabel dan mode sinkronisasi, lalu tekan "Mulai Sinkronisasi Data".',
     timestamp: new Date().toLocaleTimeString(),
   });
 });
 
-watch(
-  pmaConfig,
-  (val) => {
-    localStorage.setItem('db_sync_pma_config', JSON.stringify(val));
-  },
-  { deep: true }
-);
+watch(pmaConfig, (val) => localStorage.setItem('db_sync_pma_config', JSON.stringify(val)), { deep: true });
+watch(localConfig, (val) => localStorage.setItem('db_sync_local_config', JSON.stringify(val)), { deep: true });
+watch(availableTables, (val) => localStorage.setItem('db_sync_available_tables', JSON.stringify(val)), { deep: true });
+watch(selectedTables, (val) => localStorage.setItem('db_sync_selected_tables', JSON.stringify(val)), { deep: true });
+watch(syncMode, (val) => localStorage.setItem('db_sync_mode', val));
+watch(rowLimit, (val) => localStorage.setItem('db_sync_row_limit', String(val)));
 
-watch(
-  localConfig,
-  (val) => {
-    localStorage.setItem('db_sync_local_config', JSON.stringify(val));
-  },
-  { deep: true }
-);
+const handlePresetChanged = () => {
+  pmaStatus.value.connected = false;
+  localStatus.value.connected = false;
+};
+
 
 // Auto-sync scheduler
 watch(autoSyncInterval, (sec) => {
@@ -181,6 +203,49 @@ watch(autoSyncInterval, (sec) => {
 onUnmounted(() => {
   if (timerId) clearInterval(timerId);
 });
+
+// Fetch list of tables dynamically from remote PMA
+const fetchTablesFromPma = async () => {
+  fetchingTables.value = true;
+  addLog({
+    type: 'info',
+    message: `Menarik daftar tabel dari database PMA remote (${pmaConfig.value.database})...`,
+    timestamp: new Date().toLocaleTimeString(),
+  });
+
+  try {
+    const client = new PmaClient(pmaConfig.value);
+    await client.authenticate();
+    const tables = await client.fetchTablesList();
+
+    if (tables && tables.length > 0) {
+      availableTables.value = tables;
+      // Default: check all tables
+      selectedTables.value = [...tables];
+      pmaStatus.value.connected = true;
+
+      addLog({
+        type: 'success',
+        message: `✅ Berhasil mengekstrak ${tables.length} tabel dari PMA: ${tables.slice(0, 10).join(', ')}${tables.length > 10 ? ` ... +${tables.length - 10} lainnya` : ''}`,
+        timestamp: new Date().toLocaleTimeString(),
+      });
+    } else {
+      addLog({
+        type: 'error',
+        message: `Tidak ada tabel yang ditemukan di database '${pmaConfig.value.database}'. Pastikan nama database benar, credentials memiliki akses, dan coba lakukan "Tes Koneksi PMA" terlebih dahulu sebelum fetch tabel.`,
+        timestamp: new Date().toLocaleTimeString(),
+      });
+    }
+  } catch (err) {
+    addLog({
+      type: 'error',
+      message: `Gagal menarik daftar tabel: ${err.message || err}`,
+      timestamp: new Date().toLocaleTimeString(),
+    });
+  } finally {
+    fetchingTables.value = false;
+  }
+};
 
 // Test PMA Remote connection
 const testPmaConnection = async () => {
@@ -252,9 +317,13 @@ const testLocalConnection = async () => {
 
 // Fetch preview of local MySQL table
 const fetchLocalPreview = async () => {
+  const targetTable = (selectedTables.value && selectedTables.value.length > 0)
+    ? selectedTables.value[0]
+    : (localConfig.value.table || pmaConfig.value.table);
+
   addLog({
     type: 'info',
-    message: `Mengambil data preview dari tabel MySQL lokal: ${localConfig.value.table || pmaConfig.value.table}...`,
+    message: `Mengambil data preview dari tabel MySQL lokal: ${targetTable}...`,
     timestamp: new Date().toLocaleTimeString(),
   });
 
@@ -267,14 +336,14 @@ const fetchLocalPreview = async () => {
         password: localConfig.value.password || '',
         database: localConfig.value.database || '',
       },
-      tableName: localConfig.value.table || pmaConfig.value.table,
+      tableName: targetTable,
       limit: 20,
     });
 
     previewRows.value = rows;
     addLog({
       type: 'success',
-      message: `Berhasil mengambil ${rows.length} baris preview dari tabel lokal.`,
+      message: `Berhasil mengambil ${rows.length} baris preview dari tabel lokal '${targetTable}'.`,
       timestamp: new Date().toLocaleTimeString(),
     });
   } catch (err) {
@@ -286,32 +355,84 @@ const fetchLocalPreview = async () => {
   }
 };
 
-// Execute full sync cycle
+// Live sync progress tracking
+let activeEngineInstance = null;
+
+const syncProgress = ref({
+  currentTableIndex: 0,
+  totalTables: 0,
+  currentTableName: '',
+  rowsSyncedCurrentTable: 0,
+  totalSyncedAllTables: 0,
+  status: 'idle',
+});
+
+// Stop ongoing sync cycle safely
+const handleStopSync = () => {
+  if (activeEngineInstance) {
+    activeEngineInstance.stopSync();
+  }
+};
+
+// Execute full sync cycle across selected tables
 const handleStartSync = async () => {
   if (isSyncing.value) return;
 
+  const tablesToSync = selectedTables.value.length > 0
+    ? selectedTables.value
+    : [pmaConfig.value.table || 'users'];
+
   isSyncing.value = true;
+  syncProgress.value = {
+    currentTableIndex: 0,
+    totalTables: tablesToSync.length,
+    currentTableName: tablesToSync[0] || '',
+    rowsSyncedCurrentTable: 0,
+    totalSyncedAllTables: 0,
+    status: 'starting',
+  };
+
   const engine = new SyncEngine(pmaConfig.value, localConfig.value, {
     onLog: addLog,
+    onProgress: (p) => {
+      syncProgress.value = {
+        currentTableIndex: p.currentTableIndex,
+        totalTables: p.totalTables,
+        currentTableName: p.currentTableName,
+        rowsSyncedCurrentTable: p.rowsSyncedForCurrentTable,
+        totalSyncedAllTables: p.totalSyncedAllTables,
+        status: p.status,
+      };
+    },
+  });
+  activeEngineInstance = engine;
+
+  const res = await engine.runMultiTableSync({
+    tables: tablesToSync,
+    syncMode: syncMode.value,
+    rowLimit: rowLimit.value,
+    batchSize: 2000,
   });
 
-  const res = await engine.runIncrementalSync(500);
+  const countSynced = (res && res.count) || syncProgress.value.totalSyncedAllTables || 0;
+  if (countSynced > 0) {
+    stats.value.totalSynced += countSynced;
+  }
+  if (res && res.durationMs) {
+    stats.value.lastDuration = res.durationMs;
+  }
+  stats.value.lastSyncTime = new Date().toLocaleTimeString();
 
-  if (res.success) {
+  if (res && res.success) {
     pmaStatus.value.connected = true;
     localStatus.value.connected = true;
 
-    if (res.count > 0) {
-      stats.value.totalSynced += res.count;
-      stats.value.lastDuration = res.durationMs;
-      stats.value.lastSyncTime = new Date().toLocaleTimeString();
-
-      if (res.fetchedRows) {
-        previewRows.value = res.fetchedRows;
-      }
+    if (res.fetchedRows && res.fetchedRows.length > 0) {
+      previewRows.value = res.fetchedRows;
     }
   }
 
+  activeEngineInstance = null;
   isSyncing.value = false;
 };
 </script>
@@ -361,14 +482,8 @@ const handleStartSync = async () => {
 
 .grid-bottom {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: 1fr;
   gap: 16px;
   flex: 1;
-}
-
-@media (max-width: 1024px) {
-  .grid-bottom {
-    grid-template-columns: 1fr;
-  }
 }
 </style>

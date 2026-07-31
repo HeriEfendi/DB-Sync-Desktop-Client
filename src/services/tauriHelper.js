@@ -44,7 +44,8 @@ export async function safeFetch(url, options = {}) {
       const { fetch: tauriFetch } = await import('@tauri-apps/plugin-http');
       return await tauriFetch(url, options);
     } catch (e) {
-      console.warn('Tauri HTTP fetch error, fallback to standard fetch:', e);
+      console.warn('Tauri HTTP fetch error:', e);
+      throw e;
     }
   }
   return await fetch(url, options);

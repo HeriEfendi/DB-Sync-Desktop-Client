@@ -10,7 +10,7 @@
       </div>
       <div class="brand-text">
         <h1 class="brand-title">DB-Sync <span class="badge-tag">v1.0</span></h1>
-        <p class="brand-subtitle">PMA Remote &rarr; Local MySQL Port 3306</p>
+        <p class="brand-subtitle">PMA Remote &rarr; Local MySQL Port</p>
       </div>
     </div>
 
@@ -30,7 +30,7 @@
       </div>
     </div>
 
-    <div class="nav-actions">
+    <!-- <div class="nav-actions">
       <button class="btn btn-primary" :disabled="isSyncing" @click="$emit('trigger-sync')">
         <svg v-if="!isSyncing" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <path d="M21.5 2v6h-6M2.13 15.57a10 10 0 1 0 0-7.14l-1.63-1.63"></path>
@@ -47,7 +47,7 @@
         </svg>
         <span>{{ isSyncing ? 'Menyinkronkan...' : 'Sinkronkan Sekarang' }}</span>
       </button>
-    </div>
+    </div> -->
   </header>
 </template>
 
