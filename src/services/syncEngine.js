@@ -97,6 +97,8 @@ export class SyncEngine {
     if (isTauriEnvironment()) {
       this.log('info', `[Tauri Native Engine] Memulai Direct SQL/GZIP Stream export.php (${tables.length} tabel)...`);
 
+      let latestTotalSyncedRows = 0;
+
       const unlistenLog = await safeListen('pma-log', (event) => {
         if (event.payload) {
           this.log(event.payload.type, event.payload.message);
@@ -105,11 +107,16 @@ export class SyncEngine {
 
       const unlistenProgress = await safeListen('pma-progress', (event) => {
         if (event.payload) {
+          const rowsCount = event.payload.rows_synced_current_table || 0;
+          if (event.payload.total_synced_all_tables) {
+            latestTotalSyncedRows = event.payload.total_synced_all_tables;
+          }
           this.onProgress({
             currentTableIndex: event.payload.current_table_index,
             totalTables: event.payload.total_tables,
             currentTableName: event.payload.current_table_name,
-            rowsSyncedCurrentTable: event.payload.rows_synced_current_table,
+            rowsSyncedCurrentTable: rowsCount,
+            rowsSyncedForCurrentTable: rowsCount,
             totalSyncedAllTables: event.payload.total_synced_all_tables,
             status: event.payload.status,
           });
@@ -147,7 +154,9 @@ export class SyncEngine {
 
         return {
           success: true,
-          count: tables.length,
+          count: latestTotalSyncedRows,
+          totalRowsSynced: latestTotalSyncedRows,
+          totalTables: tables.length,
           durationMs: elapsed,
         };
       } catch (err) {

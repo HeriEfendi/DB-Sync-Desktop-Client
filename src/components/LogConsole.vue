@@ -75,7 +75,8 @@ const currentFilter = ref('all');
 const searchQuery = ref('');
 
 const filteredLogs = computed(() => {
-  const list = props.logs.filter((log) => {
+  const recentLogs = props.logs.length > 300 ? props.logs.slice(-300) : props.logs;
+  const list = recentLogs.filter((log) => {
     const matchesLevel = currentFilter.value === 'all' || log.type === currentFilter.value;
     const matchesSearch = !searchQuery.value || log.message.toLowerCase().includes(searchQuery.value.toLowerCase());
     return matchesLevel && matchesSearch;

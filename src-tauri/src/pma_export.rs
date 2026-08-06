@@ -41,7 +41,8 @@ fn current_timestamp() -> String {
 
 fn emit_log(app: &tauri::AppHandle, log_type: &str, message: impl Into<String>) {
     let msg = message.into();
-    let noisy_info = log_type == "info"
+
+    let noisy_http = log_type == "info"
         && [
             "Inisialisasi HTTP Session",
             "PMA final URL setelah redirect",
@@ -58,12 +59,16 @@ fn emit_log(app: &tauri::AppHandle, log_type: &str, message: impl Into<String>) 
             "POST request ke export",
             "Endpoint PMA valid ditemukan",
             "Export menerima",
+
         ]
         .iter()
-        .any(|prefix| msg.starts_with(prefix));
+        .any(|prefix| msg.starts_with(prefix) || msg.contains(prefix));
+
     let noisy_fallback =
         log_type == "warn" && msg.contains("mengembalikan HTML response: 404 Not Found");
-    if noisy_info || noisy_fallback {
+
+    if noisy_http || noisy_fallback {
+        println!("[PMA-LOG] [{}]: {}", log_type, msg);
         return;
     }
 

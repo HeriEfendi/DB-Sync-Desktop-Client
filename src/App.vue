@@ -6,34 +6,6 @@
     </div>
 
     <div class="desktop-frame">
-      <aside class="app-sidebar" aria-label="Navigasi aplikasi">
-        <div class="sidebar-brand">
-          <div class="logo-icon" aria-hidden="true">
-            <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg>
-          </div>
-          <div><strong>DB-Sync</strong><small>Desktop Client</small></div>
-        </div>
-
-
-        <nav class="sidebar-nav sidebar-group">
-          <button type="button" class="sidebar-item" :class="{ active: activeNav === 'connections' }" @click="selectNav('connections')"><span class="nav-icon">◈</span> Connections <span class="nav-count">2</span></button>
-        </nav>
-
-        <nav class="sidebar-nav sidebar-group">
-          <button type="button" class="sidebar-item" :class="{ active: activeNav === 'tables' }" @click="selectNav('tables')"><span class="nav-icon">▦</span> Tables</button>
-        </nav>
-
-        <nav class="sidebar-nav sidebar-group">
-          <button type="button" class="sidebar-item" :class="{ active: activeNav === 'sync' }" @click="selectNav('sync')"><span class="nav-icon">↻</span> Sync Jobs</button>
-        </nav>
-
-        <div class="sidebar-spacer"></div>
-        <div class="sidebar-footer">
-          <div class="runtime-state"><span class="state-dot" :class="{ online: isTauri }"></span><span>{{ isTauri ? 'Tauri runtime' : 'Browser preview' }}</span></div>
-          <small>DB-Sync Client · v1.0</small>
-        </div>
-      </aside>
-
       <section class="desktop-content">
         <Navbar :pma-status="pmaStatus" :local-status="localStatus" :is-syncing="isSyncing" @trigger-sync="handleStartSync" />
 
@@ -161,8 +133,21 @@ const stats = ref({
   lastSyncTime: '',
 });
 
+let logSaveTimer = null;
+
 const addLog = (entry) => {
   logs.value.push(entry);
+  if (logs.value.length > 300) {
+    logs.value.shift();
+  }
+  if (!logSaveTimer) {
+    logSaveTimer = setTimeout(() => {
+      try {
+        localStorage.setItem('db_sync_logs', JSON.stringify(logs.value.slice(-100)));
+      } catch (e) {}
+      logSaveTimer = null;
+    }, 2500);
+  }
 };
 
 onMounted(() => {
@@ -173,6 +158,8 @@ onMounted(() => {
     const savedAvailable = localStorage.getItem('db_sync_available_tables');
     const savedMode = localStorage.getItem('db_sync_mode');
     const savedLimit = localStorage.getItem('db_sync_row_limit');
+    const savedStats = localStorage.getItem('db_sync_stats');
+    const savedLogs = localStorage.getItem('db_sync_logs');
 
     if (savedPma) Object.assign(pmaConfig.value, JSON.parse(savedPma));
     if (savedLocal) Object.assign(localConfig.value, JSON.parse(savedLocal));
@@ -180,6 +167,13 @@ onMounted(() => {
     if (savedTables) selectedTables.value = JSON.parse(savedTables);
     if (savedMode) syncMode.value = savedMode;
     if (savedLimit !== null && savedLimit !== undefined) rowLimit.value = parseInt(savedLimit, 10);
+    if (savedStats) Object.assign(stats.value, JSON.parse(savedStats));
+    if (savedLogs) {
+      try {
+        const parsed = JSON.parse(savedLogs);
+        if (Array.isArray(parsed) && parsed.length > 0) logs.value = parsed;
+      } catch (e) {}
+    }
   } catch (e) {
     console.error('Failed reading saved config:', e);
   }
@@ -211,6 +205,7 @@ watch(availableTables, (val) => localStorage.setItem('db_sync_available_tables',
 watch(selectedTables, (val) => localStorage.setItem('db_sync_selected_tables', JSON.stringify(val)), { deep: true });
 watch(syncMode, (val) => localStorage.setItem('db_sync_mode', val));
 watch(rowLimit, (val) => localStorage.setItem('db_sync_row_limit', String(val)));
+watch(stats, (val) => localStorage.setItem('db_sync_stats', JSON.stringify(val)), { deep: true });
 
 const handlePresetChanged = () => {
   pmaStatus.value.connected = false;
@@ -476,13 +471,15 @@ const handleStartSync = async () => {
   const engine = new SyncEngine(pmaConfig.value, localConfig.value, {
     onLog: addLog,
     onProgress: (p) => {
+      const rowsCount = p.rowsSyncedCurrentTable ?? p.rowsSyncedForCurrentTable ?? 0;
       syncProgress.value = {
-        currentTableIndex: p.currentTableIndex,
-        totalTables: p.totalTables,
-        currentTableName: p.currentTableName,
-        rowsSyncedCurrentTable: p.rowsSyncedForCurrentTable,
-        totalSyncedAllTables: p.totalSyncedAllTables,
-        status: p.status,
+        currentTableIndex: p.currentTableIndex || 0,
+        totalTables: p.totalTables || 0,
+        currentTableName: p.currentTableName || '',
+        rowsSyncedCurrentTable: rowsCount,
+        rowsSyncedForCurrentTable: rowsCount,
+        totalSyncedAllTables: p.totalSyncedAllTables || 0,
+        status: p.status || 'idle',
       };
     },
   });
@@ -496,7 +493,7 @@ const handleStartSync = async () => {
       batchSize: 2000,
     });
 
-    const countSynced = (res && res.count) || syncProgress.value.totalSyncedAllTables || 0;
+    const countSynced = (res && res.totalRowsSynced !== undefined ? res.totalRowsSynced : res?.count) || syncProgress.value.totalSyncedAllTables || 0;
     if (countSynced > 0) stats.value.totalSynced += countSynced;
     if (res && res.durationMs) stats.value.lastDuration = res.durationMs;
     stats.value.lastSyncTime = new Date().toLocaleTimeString();

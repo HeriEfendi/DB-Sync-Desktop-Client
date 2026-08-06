@@ -55,7 +55,7 @@
           <span class="stat-label">{{ isSyncing ? 'Baris Masuk (Live)' : 'Total Data Disinkron' }}</span>
         </div>
 
-        <div v-if="isSyncing" class="stat-card stat-live">
+        <div v-if="isSyncing" class="stat-card stat-live" style="width: 300px;">
           <span class="stat-value text-cyan">
             {{ formatNumber(syncProgress.currentTableIndex) }} / {{ formatNumber(syncProgress.totalTables) }}
           </span>
@@ -67,9 +67,9 @@
           <span class="stat-label">Durasi Terakhir</span>
         </div>
 
-        <div class="stat-card">
-          <span class="stat-value text-amber">{{ isSyncing ? `${formatNumber(syncProgress.rowsSyncedCurrentTable)} baris` : (stats.lastSyncTime || '-') }}</span>
-          <span class="stat-label">{{ isSyncing ? 'Row Tabel Saat Ini' : 'Waktu Sinkron Terakhir' }}</span>
+        <div v-if="!isSyncing" class="stat-card">
+          <span class="stat-value text-amber">{{ (stats.lastSyncTime || '-') }}</span>
+          <span class="stat-label">{{ 'Waktu Sinkron Terakhir' }}</span>
         </div>
       </div>
     </div>
@@ -234,6 +234,7 @@ const formatDuration = (ms) => {
   color: #111827;
 }
 
+.sync-options-card,
 .sync-settings-box {
   background: rgba(15, 23, 42, 0.5);
   border: 1px solid var(--border-color);
@@ -242,6 +243,7 @@ const formatDuration = (ms) => {
   width: 100%;
 }
 
+.options-row,
 .sync-settings-row {
   display: flex;
   align-items: center;

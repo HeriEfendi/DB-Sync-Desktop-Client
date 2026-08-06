@@ -2,7 +2,13 @@
   <div class="glass-panel config-card">
     <div class="card-header">
       <div class="title-wrap">
-        <h3>Daftar Tabel</h3>
+        <div class="title-row">
+          <h3>Daftar Tabel</h3>
+          <!-- <span class="selection-badge">
+            <span class="badge-dot"></span>
+            <strong>{{ selectedTables.length }}</strong> dari {{ availableTables.length }} tabel dipilih
+          </span> -->
+        </div>
         <p class="subtitle">Pilih tabel yang akan disinkronkan dan simpan template centangan untuk reuse.</p>
       </div>
     </div>
@@ -14,6 +20,9 @@
       <div class="table-search-box"><input v-model="tableSearchQuery" type="text" class="form-input form-input-sm" placeholder="Cari tabel..." /></div>
       <button class="btn btn-ghost btn-xs" @click="selectAllTables">Centang Semua</button>
       <button class="btn btn-ghost btn-xs" @click="deselectAllTables">Hapus Centang</button>
+      <div class="selection-info-pill">
+        <span>Terpilih: <strong>{{ selectedTables.length }}</strong> / {{ availableTables.length }}</span>
+      </div>
       <div class="tools-divider"></div>
       <select v-model="selectedTemplateName" class="form-select preset-select" @change="loadTableTemplate"><option value="">-- Template Tabel --</option><option v-for="(t, key) in tableTemplates" :key="key" :value="key">{{ key }}</option></select>
       <button class="btn btn-secondary btn-xs" :disabled="!selectedTemplateName" @click="updateTableTemplate">Simpan</button>
@@ -172,14 +181,63 @@ const deleteTableTemplate = () => {
   margin-bottom: 16px;
 }
 
+.title-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
 .title-wrap h3 {
   font-size: 1.05rem;
   font-weight: 600;
+  margin: 0;
+}
+
+.selection-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: rgba(6, 182, 212, 0.12);
+  border: 1px solid rgba(6, 182, 212, 0.3);
+  color: #38bdf8;
+  font-size: 0.78rem;
+  font-weight: 500;
+  padding: 2px 10px;
+  border-radius: 12px;
+}
+
+.selection-badge strong {
+  color: #38bdf8;
+  font-weight: 700;
+}
+
+.badge-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #38bdf8;
+  box-shadow: 0 0 6px #38bdf8;
+}
+
+.selection-info-pill {
+  font-size: 0.76rem;
+  color: var(--text-muted);
+  background: rgba(15, 23, 42, 0.5);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  padding: 3px 8px;
+  border-radius: 6px;
+  white-space: nowrap;
+}
+
+.selection-info-pill strong {
+  color: var(--accent-cyan);
 }
 
 .subtitle {
   font-size: 0.78rem;
   color: var(--text-muted);
+  margin-top: 4px;
 }
 
 .table-tools-bar {

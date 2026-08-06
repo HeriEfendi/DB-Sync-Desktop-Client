@@ -12,7 +12,15 @@ export default defineConfig(async () => ({
     strictPort: true,
     host: true,
     watch: {
-      ignored: ["**/src-tauri/**"],
+      ignored: [
+        "**/src-tauri/**",
+        "**/target/**",
+        "**/dist/**",
+        "**/*.log",
+        "**/*.tmp",
+        "**/*.sql",
+        "**/.git/**"
+      ],
     },
   },
 }));
