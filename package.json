@@ -8,7 +8,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "release": "node -e \"const v=process.argv[1]; if(!/^\\d+\\.\\d+\\.\\d+$/.test(v||'')){console.error('Usage: npm run release -- 1.0.1'); process.exit(1)}; const {execSync}=require('child_process'); execSync('git tag -a v'+v+' -m \\\"Release v'+v+'\\\" && git push origin v'+v,{stdio:'inherit'})\""
+    "release": "node -e \"let v=process.argv[1]||''; if(/^\\d+\\.\\d+$/.test(v)) v+='.0'; if(!/^\\d+\\.\\d+\\.\\d+$/.test(v)){console.error('Usage: npm run release 1.0.1'); process.exit(1)}; const {execSync}=require('child_process'); const remote=(execSync('git remote').toString().trim().split(/\\s+/).includes('origin')?'origin':execSync('git remote').toString().trim().split(/\\s+/)[0]); if(!remote){console.error('No Git remote configured'); process.exit(1)}; execSync('git tag -a v'+v+' -m \\\"Release v'+v+'\\\" 2>/dev/null || git tag -f -a v'+v+' -m \\\"Release v'+v+'\\\" && git push '+remote+' v'+v,{stdio:'inherit'})\""
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",
