@@ -18,8 +18,6 @@ pub fn run() {
             pma_export::export_pma_database,
             pma_export::get_pma_tables
         ])
-
-
         .run(tauri::generate_context!())
         .expect("Error while running Tauri application");
 }

@@ -6,36 +6,19 @@
         <p class="subtitle">Pilih tabel yang akan disinkronkan dan simpan template centangan untuk reuse.</p>
       </div>
     </div>
-
     <div class="table-tools-bar">
       <button class="btn btn-primary btn-sm" :disabled="fetchingTables" @click="$emit('fetch-tables')">
         <span v-if="fetchingTables" class="spin-sm"></span>
-        <svg v-else xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
         <span>Ambil Tabel</span>
       </button>
-
-      <div class="table-search-box">
-        <input v-model="tableSearchQuery" type="text" class="form-input form-input-sm" placeholder="Cari tabel..." />
-      </div>
-
+      <div class="table-search-box"><input v-model="tableSearchQuery" type="text" class="form-input form-input-sm" placeholder="Cari tabel..." /></div>
       <button class="btn btn-ghost btn-xs" @click="selectAllTables">Centang Semua</button>
       <button class="btn btn-ghost btn-xs" @click="deselectAllTables">Hapus Centang</button>
-
       <div class="tools-divider"></div>
-
-      <select v-model="selectedTemplateName" class="form-select preset-select" @change="loadTableTemplate" style="max-width:160px">
-        <option value="">-- Template Tabel --</option>
-        <option v-for="(t, key) in tableTemplates" :key="key" :value="key">{{ key }}</option>
-      </select>
-      <button class="btn btn-secondary btn-xs" title="Simpan centangan ke template aktif" :disabled="!selectedTemplateName" @click="updateTableTemplate">
-        Simpan
-      </button>
-      <button class="btn btn-primary btn-xs" title="Buat template baru dari centangan saat ini" @click="createTableTemplate">
-        Buat
-      </button>
-      <button class="btn btn-danger btn-xs" title="Hapus template yang dipilih" :disabled="!selectedTemplateName" @click="deleteTableTemplate">
-        Hapus
-      </button>
+      <select v-model="selectedTemplateName" class="form-select preset-select" @change="loadTableTemplate"><option value="">-- Template Tabel --</option><option v-for="(t, key) in tableTemplates" :key="key" :value="key">{{ key }}</option></select>
+      <button class="btn btn-secondary btn-xs" :disabled="!selectedTemplateName" @click="updateTableTemplate">Simpan</button>
+      <button class="btn btn-primary btn-xs" @click="createTableTemplate">Buat</button>
+      <button class="btn btn-danger btn-xs" :disabled="!selectedTemplateName" @click="deleteTableTemplate">Hapus</button>
     </div>
 
     <div class="table-select-container">
@@ -218,7 +201,7 @@ const deleteTableTemplate = () => {
 }
 
 .preset-select {
-  padding: 5px 10px;
+  padding: 0px 2px;
   font-size: 0.8rem;
   width: auto;
   max-width: 180px;

@@ -71,7 +71,7 @@
               @start-sync="handleStartSync"
               @stop-sync="handleStopSync"
               @update:sync-mode="syncMode = $event"
-              @update:row-limit="rowLimit = $event"
+              @update:row-limit="rowLimit = Number.isFinite(Number($event)) ? Number($event) : 0"
             />
           </div>
 
@@ -149,13 +149,11 @@ const testingPma = ref(false);
 const testingLocal = ref(false);
 const fetchingTables = ref(false);
 
-// Sync execution state
 const isSyncing = ref(false);
 const autoSyncInterval = ref(0);
 let timerId = null;
 
 const logs = ref([]);
-const previewRows = ref([]);
 
 const stats = ref({
   totalSynced: 0,
@@ -219,8 +217,6 @@ const handlePresetChanged = () => {
   localStatus.value.connected = false;
 };
 
-
-// Auto-sync scheduler
 watch(autoSyncInterval, (sec) => {
   if (timerId) clearInterval(timerId);
 
@@ -492,33 +488,34 @@ const handleStartSync = async () => {
   });
   activeEngineInstance = engine;
 
-  const res = await engine.runMultiTableSync({
-    tables: tablesToSync,
-    syncMode: syncMode.value,
-    rowLimit: rowLimit.value,
-    batchSize: 2000,
-  });
+  try {
+    const res = await engine.runMultiTableSync({
+      tables: tablesToSync,
+      syncMode: syncMode.value,
+      rowLimit: rowLimit.value,
+      batchSize: 2000,
+    });
 
-  const countSynced = (res && res.count) || syncProgress.value.totalSyncedAllTables || 0;
-  if (countSynced > 0) {
-    stats.value.totalSynced += countSynced;
-  }
-  if (res && res.durationMs) {
-    stats.value.lastDuration = res.durationMs;
-  }
-  stats.value.lastSyncTime = new Date().toLocaleTimeString();
+    const countSynced = (res && res.count) || syncProgress.value.totalSyncedAllTables || 0;
+    if (countSynced > 0) stats.value.totalSynced += countSynced;
+    if (res && res.durationMs) stats.value.lastDuration = res.durationMs;
+    stats.value.lastSyncTime = new Date().toLocaleTimeString();
 
-  if (res && res.success) {
-    pmaStatus.value.connected = true;
-    localStatus.value.connected = true;
-
-    if (res.fetchedRows && res.fetchedRows.length > 0) {
-      previewRows.value = res.fetchedRows;
+    if (res && res.success) {
+      pmaStatus.value.connected = true;
+      localStatus.value.connected = true;
+      if (res.fetchedRows && res.fetchedRows.length > 0) previewRows.value = res.fetchedRows;
     }
+  } catch (err) {
+    addLog({
+      type: 'error',
+      message: `Sinkronisasi gagal: ${err?.message || err}`,
+      timestamp: new Date().toLocaleTimeString(),
+    });
+  } finally {
+    activeEngineInstance = null;
+    isSyncing.value = false;
   }
-
-  activeEngineInstance = null;
-  isSyncing.value = false;
 };
 </script>
 

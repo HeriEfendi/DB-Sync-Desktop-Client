@@ -239,15 +239,15 @@ const loadPreset = async () => {
 }
 
 .preset-select {
-  padding: 5px 10px;
+  padding: 0px 2px;
   font-size: 0.8rem;
   width: auto;
   max-width: 180px;
-  color: #000;
+  color: #111827;
 }
 
 .preset-select option {
-  color: #000;
+  color: #111827;
 }
 
 .btn-sm {
@@ -303,31 +303,6 @@ const loadPreset = async () => {
   font-size: 0.72rem;
   font-weight: 550;
   color: var(--text-muted);
-}
-
-.form-input,
-.form-select {
-  width: 100%;
-  background: var(--bg-input);
-  border: 1px solid var(--border-color);
-  border-radius: var(--radius-sm);
-  padding: 8px 10px;
-  color: #fff !important;
-  -webkit-text-fill-color: #fff !important;
-  font-size: 0.78rem;
-  outline: 0;
-}
-
-.preset-select,
-.preset-select option {
-  color: #000 !important;
-  -webkit-text-fill-color: #000 !important;
-}
-
-.form-input:focus,
-.form-select:focus {
-  border-color: var(--primary);
-  box-shadow: 0 0 0 3px var(--primary-light);
 }
 
 .action-bar {

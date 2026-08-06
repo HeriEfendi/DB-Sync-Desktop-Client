@@ -1,11 +1,10 @@
+use crate::commands::LocalDbConfig;
+use flate2::read::MultiGzDecoder;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 use tauri::Emitter;
-use futures_util::StreamExt;
-use flate2::read::GzDecoder;
-use crate::commands::LocalDbConfig;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PmaExportConfig {
@@ -21,7 +20,6 @@ pub struct PmaExportConfig {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct LogPayload {
-
     pub r#type: String, // "info" | "success" | "warning" | "error"
     pub message: String,
     pub timestamp: String,
@@ -37,38 +35,38 @@ pub struct ProgressPayload {
     pub status: String,
 }
 
-/// Reader that converts a tokio mpsc channel of byte chunks into std::io::Read
-struct ChannelReader {
-    rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
-    buffer: Vec<u8>,
-    cursor: usize,
-}
-
-impl Read for ChannelReader {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if self.cursor >= self.buffer.len() {
-            match self.rx.blocking_recv() {
-                Some(data) => {
-                    self.buffer = data;
-                    self.cursor = 0;
-                }
-                None => return Ok(0), // EOF
-            }
-        }
-        let remaining = self.buffer.len() - self.cursor;
-        let to_copy = buf.len().min(remaining);
-        buf[..to_copy].copy_from_slice(&self.buffer[self.cursor..self.cursor + to_copy]);
-        self.cursor += to_copy;
-        Ok(to_copy)
-    }
-}
-
 fn current_timestamp() -> String {
     chrono::Local::now().format("%H:%M:%S").to_string()
 }
 
 fn emit_log(app: &tauri::AppHandle, log_type: &str, message: impl Into<String>) {
     let msg = message.into();
+    let noisy_info = log_type == "info"
+        && [
+            "Inisialisasi HTTP Session",
+            "PMA final URL setelah redirect",
+            "HTML index.php",
+            "Redirect HTML ditemukan",
+            "Resolved redirect URL",
+            "effective_base_url diperbarui",
+            "Re-fetch dari",
+            "CSRF token diekstrak",
+            "Melakukan otentikasi login PMA",
+            "POST login ke",
+            "Login response:",
+            "Token baru dari login response",
+            "POST request ke export",
+            "Endpoint PMA valid ditemukan",
+            "Export menerima",
+        ]
+        .iter()
+        .any(|prefix| msg.starts_with(prefix));
+    let noisy_fallback =
+        log_type == "warn" && msg.contains("mengembalikan HTML response: 404 Not Found");
+    if noisy_info || noisy_fallback {
+        return;
+    }
+
     println!("[PMA-LOG] [{}]: {}", log_type, msg);
     let _ = app.emit(
         "pma-log",
@@ -142,7 +140,11 @@ fn regex_find_token(html: &str) -> Option<String> {
                 for part in line.split("value=\"").skip(1) {
                     if let Some(end) = part.find('"') {
                         let val = part[..end].trim();
-                        if val.len() >= 16 && val.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
+                        if val.len() >= 16
+                            && val
+                                .chars()
+                                .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+                        {
                             return Some(val.to_string());
                         }
                     }
@@ -152,7 +154,11 @@ fn regex_find_token(html: &str) -> Option<String> {
                 for part in line.split("value='").skip(1) {
                     if let Some(end) = part.find('\'') {
                         let val = part[..end].trim();
-                        if val.len() >= 16 && val.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
+                        if val.len() >= 16
+                            && val
+                                .chars()
+                                .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+                        {
                             return Some(val.to_string());
                         }
                     }
@@ -173,17 +179,21 @@ fn regex_find_token(html: &str) -> Option<String> {
     None
 }
 
-
 /// Authenticate with remote phpMyAdmin server and get cookie-store client & CSRF token
 async fn authenticate_pma(
     pma_config: &PmaExportConfig,
     app: &tauri::AppHandle,
 ) -> Result<(reqwest::Client, String, String), String> {
     let base_url = pma_config.url.trim().trim_end_matches('/').to_string();
-    emit_log(app, "info", format!("Inisialisasi HTTP Session ke PMA: {}", base_url));
+    emit_log(
+        app,
+        "info",
+        format!("Inisialisasi HTTP Session ke PMA: {}", base_url),
+    );
 
     let client = reqwest::Client::builder()
         .cookie_store(true)
+        .gzip(false)
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) DB-Sync-Client/1.0")
         .timeout(Duration::from_secs(300))
         .redirect(reqwest::redirect::Policy::limited(10))
@@ -198,46 +208,100 @@ async fn authenticate_pma(
         .map_err(|e| format!("Gagal menghubungi PMA ({}): {}", index_url, e))?;
 
     let final_url = resp.url().to_string();
-    emit_log(app, "info", format!("PMA final URL setelah redirect: {}", final_url));
+    emit_log(
+        app,
+        "info",
+        format!("PMA final URL setelah redirect: {}", final_url),
+    );
 
     let mut effective_base_url = if final_url.contains("/index.php") {
-        final_url.split("/index.php").next().unwrap_or(&base_url).to_string()
+        final_url
+            .split("/index.php")
+            .next()
+            .unwrap_or(&base_url)
+            .to_string()
     } else {
         base_url.clone()
     };
 
-    let mut html = resp.text().await.map_err(|e| format!("Gagal membaca response HTML dari PMA: {}", e))?;
-    emit_log(app, "info", format!("HTML index.php len={}, preview={}", html.len(), &html[..html.len().min(200)]));
+    let mut html = resp
+        .text()
+        .await
+        .map_err(|e| format!("Gagal membaca response HTML dari PMA: {}", e))?;
+    emit_log(
+        app,
+        "info",
+        format!(
+            "HTML index.php len={}, preview={}",
+            html.len(),
+            &html[..html.len().min(200)]
+        ),
+    );
 
     // Check for HTML meta refresh or JS redirect (e.g. redirecting to ./public/ or cPanel subpath)
     if let Some(redirect_path) = find_html_redirect(&html) {
-        emit_log(app, "info", format!("Redirect HTML ditemukan: {}", redirect_path));
+        emit_log(
+            app,
+            "info",
+            format!("Redirect HTML ditemukan: {}", redirect_path),
+        );
         let resolved_url = resolve_relative_url(&index_url, &redirect_path);
-        emit_log(app, "info", format!("Resolved redirect URL: {}", resolved_url));
+        emit_log(
+            app,
+            "info",
+            format!("Resolved redirect URL: {}", resolved_url),
+        );
 
         // Update effective_base_url to the new subpath (e.g. https://host/public)
         effective_base_url = if resolved_url.contains("/index.php") {
-            resolved_url.split("/index.php").next().unwrap_or(&resolved_url).to_string()
+            resolved_url
+                .split("/index.php")
+                .next()
+                .unwrap_or(&resolved_url)
+                .to_string()
         } else {
             resolved_url.trim_end_matches('/').to_string()
         };
-        emit_log(app, "info", format!("effective_base_url diperbarui: {}", effective_base_url));
+        emit_log(
+            app,
+            "info",
+            format!("effective_base_url diperbarui: {}", effective_base_url),
+        );
 
         // Re-fetch from the actual PMA location
         let new_index_url = format!("{}/index.php", effective_base_url);
         if let Ok(r) = client.get(&new_index_url).send().await {
             if let Ok(new_html) = r.text().await {
-                emit_log(app, "info", format!("Re-fetch dari {}: len={}", new_index_url, new_html.len()));
+                emit_log(
+                    app,
+                    "info",
+                    format!("Re-fetch dari {}: len={}", new_index_url, new_html.len()),
+                );
                 html = new_html;
             }
         }
     }
 
     let mut csrf_token = extract_csrf_token(&html).unwrap_or_default();
-    emit_log(app, "info", format!("CSRF token diekstrak: '{}' (len={})", &csrf_token[..csrf_token.len().min(16)], csrf_token.len()));
+    emit_log(
+        app,
+        "info",
+        format!(
+            "CSRF token diekstrak: '{}' (len={})",
+            &csrf_token[..csrf_token.len().min(16)],
+            csrf_token.len()
+        ),
+    );
 
     if !pma_config.username.is_empty() {
-        emit_log(app, "info", format!("Melakukan otentikasi login PMA untuk user '{}'...", pma_config.username));
+        emit_log(
+            app,
+            "info",
+            format!(
+                "Melakukan otentikasi login PMA untuk user '{}'...",
+                pma_config.username
+            ),
+        );
         let login_url = format!("{}/index.php?route=/login", effective_base_url);
         let mut form = vec![
             ("pma_username", pma_config.username.as_str()),
@@ -254,50 +318,81 @@ async fn authenticate_pma(
 
         emit_log(app, "info", format!("POST login ke: {}", login_url));
 
-        let login_resp = client
-            .post(&login_url)
-            .form(&form)
-            .send()
-            .await;
+        let login_resp = client.post(&login_url).form(&form).send().await;
 
         let login_resp = match login_resp {
             Ok(r) => r,
             Err(_) => {
                 let alt_login_url = format!("{}/index.php", effective_base_url);
-                emit_log(app, "warn", format!("Login route=/login gagal, mencoba: {}", alt_login_url));
-                client.post(&alt_login_url).form(&form).send().await
+                emit_log(
+                    app,
+                    "warn",
+                    format!("Login route=/login gagal, mencoba: {}", alt_login_url),
+                );
+                client
+                    .post(&alt_login_url)
+                    .form(&form)
+                    .send()
+                    .await
                     .map_err(|e| format!("Gagal login ke PMA: {}", e))?
             }
         };
 
         let login_status = login_resp.status();
         let login_final_url = login_resp.url().to_string();
-        let login_html = login_resp.text().await.map_err(|e| format!("Gagal membaca response login: {}", e))?;
+        let login_html = login_resp
+            .text()
+            .await
+            .map_err(|e| format!("Gagal membaca response login: {}", e))?;
 
-        emit_log(app, "info", format!(
-            "Login response: status={}, final_url={}, len={}, preview={}",
-            login_status.as_u16(),
-            login_final_url,
-            login_html.len(),
-            &login_html[..login_html.len().min(300)]
-        ));
+        emit_log(
+            app,
+            "info",
+            format!(
+                "Login response: status={}, final_url={}, len={}, preview={}",
+                login_status.as_u16(),
+                login_final_url,
+                login_html.len(),
+                &login_html[..login_html.len().min(300)]
+            ),
+        );
 
         if let Some(new_token) = extract_csrf_token(&login_html) {
-            emit_log(app, "info", format!("Token baru dari login response: '{}' (len={})", &new_token[..new_token.len().min(16)], new_token.len()));
+            emit_log(
+                app,
+                "info",
+                format!(
+                    "Token baru dari login response: '{}' (len={})",
+                    &new_token[..new_token.len().min(16)],
+                    new_token.len()
+                ),
+            );
             csrf_token = new_token;
         } else {
-            emit_log(app, "warn", "Tidak ada token baru di login response, menggunakan token lama");
+            emit_log(
+                app,
+                "warn",
+                "Tidak ada token baru di login response, menggunakan token lama",
+            );
         }
 
-        if login_html.contains("Access denied") || login_html.contains("Cannot log in to the MySQL server") {
-            return Err("Login PMA Gagal: Username atau Password salah atau akses ditolak.".to_string());
+        if login_html.contains("Access denied")
+            || login_html.contains("Cannot log in to the MySQL server")
+        {
+            return Err(
+                "Login PMA Gagal: Username atau Password salah atau akses ditolak.".to_string(),
+            );
         }
 
         // Check if login was actually successful by looking for authenticated page indicators
-        let login_ok = !login_html.contains("pma_username") && !login_html.contains("\"name\":\"pma_username\"")
-            && (login_html.contains("main_pane_left") || login_html.contains("navigation_tree")
-                || login_html.contains("pma-core") || login_html.contains("\"success\":true")
-                || login_html.contains("db=") || !csrf_token.is_empty());
+        let login_ok = !login_html.contains("pma_username")
+            && !login_html.contains("\"name\":\"pma_username\"")
+            && (login_html.contains("main_pane_left")
+                || login_html.contains("navigation_tree")
+                || login_html.contains("pma-core")
+                || login_html.contains("\"success\":true")
+                || login_html.contains("db=")
+                || !csrf_token.is_empty());
 
         if login_ok {
             emit_log(app, "success", "Otentikasi login PMA berhasil.");
@@ -309,18 +404,24 @@ async fn authenticate_pma(
     Ok((client, effective_base_url, csrf_token))
 }
 
-
 fn find_html_redirect(html: &str) -> Option<String> {
     for line in html.lines() {
         if line.to_lowercase().contains("refresh") || line.contains("window.location") {
             if let Some(start) = line.find("url=") {
                 let rest = &line[start + 4..];
-                let end = rest.find('"').or_else(|| rest.find('\'')).unwrap_or(rest.len());
+                let end = rest
+                    .find('"')
+                    .or_else(|| rest.find('\''))
+                    .unwrap_or(rest.len());
                 return Some(rest[..end].trim().to_string());
             }
-            let start_opt = line.find("window.location=").or_else(|| line.find("window.location ="));
+            let start_opt = line
+                .find("window.location=")
+                .or_else(|| line.find("window.location ="));
             if let Some(start) = start_opt {
-                if let Some(quote_start) = line[start..].find('"').or_else(|| line[start..].find('\'')) {
+                if let Some(quote_start) =
+                    line[start..].find('"').or_else(|| line[start..].find('\''))
+                {
                     let rest = &line[start + quote_start + 1..];
                     if let Some(quote_end) = rest.find('"').or_else(|| rest.find('\'')) {
                         return Some(rest[..quote_end].trim().to_string());
@@ -331,7 +432,6 @@ fn find_html_redirect(html: &str) -> Option<String> {
     }
     None
 }
-
 
 fn resolve_relative_url(base: &str, relative: &str) -> String {
     if relative.starts_with("http://") || relative.starts_with("https://") {
@@ -353,8 +453,15 @@ fn resolve_relative_url(base: &str, relative: &str) -> String {
     if relative.starts_with('/') {
         // Absolute path — keep only the origin (scheme + host)
         let protocol_end = base_dir.find("://").map(|i| i + 3).unwrap_or(0);
-        let origin_end = base_dir[protocol_end..].find('/').map(|i| i + protocol_end).unwrap_or(base_dir.len());
-        return format!("{}{}", &base_dir[..origin_end], relative.trim_end_matches('/'));
+        let origin_end = base_dir[protocol_end..]
+            .find('/')
+            .map(|i| i + protocol_end)
+            .unwrap_or(base_dir.len());
+        return format!(
+            "{}{}",
+            &base_dir[..origin_end],
+            relative.trim_end_matches('/')
+        );
     }
 
     // Relative path (may start with ./ or just a name)
@@ -374,7 +481,11 @@ pub async fn fetch_pma_tables(
     let (client, base_url, csrf_token) = authenticate_pma(pma_config, app).await?;
     let db = &pma_config.database;
 
-    emit_log(app, "info", format!("Mengambil daftar tabel dari database '{}'...", db));
+    emit_log(
+        app,
+        "info",
+        format!("Mengambil daftar tabel dari database '{}'...", db),
+    );
 
     let mut found_tables: Vec<String> = Vec::new();
 
@@ -409,7 +520,15 @@ pub async fn fetch_pma_tables(
                 form_data.push(("token", csrf_token.clone()));
             }
 
-            emit_log(app, "info", format!("Mencoba AJAX SQL ke '{}': {}", sql_url, &query[..query.len().min(60)]));
+            emit_log(
+                app,
+                "info",
+                format!(
+                    "Mencoba AJAX SQL ke '{}': {}",
+                    sql_url,
+                    &query[..query.len().min(60)]
+                ),
+            );
 
             let resp_result = client
                 .post(sql_url)
@@ -422,21 +541,37 @@ pub async fn fetch_pma_tables(
             let resp = match resp_result {
                 Ok(r) => r,
                 Err(e) => {
-                    emit_log(app, "warn", format!("AJAX SQL request gagal ke '{}': {}", sql_url, e));
+                    emit_log(
+                        app,
+                        "warn",
+                        format!("AJAX SQL request gagal ke '{}': {}", sql_url, e),
+                    );
                     continue;
                 }
             };
 
             let status = resp.status();
             let raw_text = resp.text().await.unwrap_or_default();
-            emit_log(app, "info", format!("AJAX SQL response status={}, len={}, preview={}",
-                status.as_u16(), raw_text.len(), &raw_text[..raw_text.len().min(300)]));
+            emit_log(
+                app,
+                "info",
+                format!(
+                    "AJAX SQL response status={}, len={}, preview={}",
+                    status.as_u16(),
+                    raw_text.len(),
+                    &raw_text[..raw_text.len().min(300)]
+                ),
+            );
 
             // Try parse JSON
             if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&raw_text) {
-                let success = json_val.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+                let success = json_val
+                    .get("success")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 if !success {
-                    let err_msg = json_val.get("error")
+                    let err_msg = json_val
+                        .get("error")
                         .or_else(|| json_val.get("message"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("unknown error");
@@ -446,7 +581,14 @@ pub async fn fetch_pma_tables(
 
                 let mut tables = extract_tables_from_json(&json_val, db);
                 if !tables.is_empty() {
-                    emit_log(app, "success", format!("AJAX SQL berhasil, {} tabel ditemukan pada batch awal", tables.len()));
+                    emit_log(
+                        app,
+                        "success",
+                        format!(
+                            "AJAX SQL berhasil, {} tabel ditemukan pada batch awal",
+                            tables.len()
+                        ),
+                    );
 
                     // PAGINATION LOOP: If PMA hard-capped the result (e.g. 250 rows limit per response), fetch next pages via OFFSET
                     let mut offset = tables.len();
@@ -473,7 +615,11 @@ pub async fn fetch_pma_tables(
                             paged_form.push(("token", csrf_token.clone()));
                         }
 
-                        emit_log(app, "info", format!("Mengekstrak halaman lanjutan offset {}...", offset));
+                        emit_log(
+                            app,
+                            "info",
+                            format!("Mengekstrak halaman lanjutan offset {}...", offset),
+                        );
                         if let Ok(paged_resp) = client
                             .post(sql_url)
                             .header("X-Requested-With", "XMLHttpRequest")
@@ -483,7 +629,9 @@ pub async fn fetch_pma_tables(
                             .await
                         {
                             if let Ok(paged_text) = paged_resp.text().await {
-                                if let Ok(paged_json) = serde_json::from_str::<serde_json::Value>(&paged_text) {
+                                if let Ok(paged_json) =
+                                    serde_json::from_str::<serde_json::Value>(&paged_text)
+                                {
                                     let new_page_tables = extract_tables_from_json(&paged_json, db);
                                     if new_page_tables.is_empty() {
                                         break;
@@ -509,16 +657,31 @@ pub async fn fetch_pma_tables(
                     break 'outer;
                 }
 
-                emit_log(app, "warn", "AJAX SQL success=true tapi tidak ada tabel di response JSON");
+                emit_log(
+                    app,
+                    "warn",
+                    "AJAX SQL success=true tapi tidak ada tabel di response JSON",
+                );
             } else {
-                emit_log(app, "warn", format!("AJAX SQL response bukan JSON valid (len={})", raw_text.len()));
+                emit_log(
+                    app,
+                    "warn",
+                    format!(
+                        "AJAX SQL response bukan JSON valid (len={})",
+                        raw_text.len()
+                    ),
+                );
             }
         }
     }
 
     // === FALLBACK: HTML scraping dari database structure & export pages ===
     if found_tables.is_empty() {
-        emit_log(app, "warn", "AJAX SQL tidak menghasilkan tabel, mencoba HTML scraping...");
+        emit_log(
+            app,
+            "warn",
+            "AJAX SQL tidak menghasilkan tabel, mencoba HTML scraping...",
+        );
 
         let db_encoded = urlencoding::encode(db);
         let token_param = if !csrf_token.is_empty() {
@@ -529,10 +692,19 @@ pub async fn fetch_pma_tables(
 
         // Prioritize export page because export pages list ALL tables without pagination
         let candidate_urls = vec![
-            format!("{}/index.php?route=/database/export&db={}{}", base_url, db_encoded, token_param),
+            format!(
+                "{}/index.php?route=/database/export&db={}{}",
+                base_url, db_encoded, token_param
+            ),
             format!("{}/export.php?db={}{}", base_url, db_encoded, token_param),
-            format!("{}/index.php?route=/database/structure&db={}{}", base_url, db_encoded, token_param),
-            format!("{}/db_structure.php?db={}{}", base_url, db_encoded, token_param),
+            format!(
+                "{}/index.php?route=/database/structure&db={}{}",
+                base_url, db_encoded, token_param
+            ),
+            format!(
+                "{}/db_structure.php?db={}{}",
+                base_url, db_encoded, token_param
+            ),
             format!("{}/index.php?db={}{}", base_url, db_encoded, token_param),
         ];
 
@@ -569,11 +741,27 @@ pub async fn fetch_pma_tables(
                 }
 
                 if !tables.is_empty() {
-                    emit_log(app, "info", format!("HTML scraping dari '{}' menemukan {} tabel", url, tables.len()));
+                    emit_log(
+                        app,
+                        "info",
+                        format!(
+                            "HTML scraping dari '{}' menemukan {} tabel",
+                            url,
+                            tables.len()
+                        ),
+                    );
                     found_tables = tables;
                     break;
                 } else {
-                    emit_log(app, "warn", format!("HTML scraping dari '{}': tidak ada tabel (len={})", url, html.len()));
+                    emit_log(
+                        app,
+                        "warn",
+                        format!(
+                            "HTML scraping dari '{}': tidak ada tabel (len={})",
+                            url,
+                            html.len()
+                        ),
+                    );
                 }
             }
         }
@@ -582,7 +770,15 @@ pub async fn fetch_pma_tables(
     if !found_tables.is_empty() {
         found_tables.sort();
         found_tables.dedup();
-        emit_log(app, "success", format!("Ditemukan {} tabel dari database '{}'.", found_tables.len(), db));
+        emit_log(
+            app,
+            "success",
+            format!(
+                "Ditemukan {} tabel dari database '{}'.",
+                found_tables.len(),
+                db
+            ),
+        );
         return Ok(found_tables);
     }
 
@@ -681,8 +877,13 @@ fn extract_tables_from_json(json_val: &serde_json::Value, db: &str) -> Vec<Strin
 
 fn extract_table_name_from_row(row: &serde_json::Value, _db: &str) -> Option<String> {
     let try_keys = [
-        "TABLE_NAME", "table_name", "Tables_in_db", "Name", "name",
-        "Table", "table",
+        "TABLE_NAME",
+        "table_name",
+        "Tables_in_db",
+        "Name",
+        "name",
+        "Table",
+        "table",
     ];
     if let Some(obj) = row.as_object() {
         // try well-known keys first
@@ -727,7 +928,6 @@ pub async fn get_pma_tables(
     fetch_pma_tables(&pma_config, &app).await
 }
 
-
 fn extract_tables_from_html(html: &str) -> Vec<String> {
     let mut tables = Vec::new();
 
@@ -752,18 +952,79 @@ fn extract_tables_from_html(html: &str) -> Vec<String> {
         }
         // Exclude known PMA UI / system values / export options / compatibility modes
         let nl = n.to_lowercase();
-        !matches!(nl.as_str(),
-            "phpmyadmin" | "index" | "true" | "false" | "select" | "structure" |
-            "sql" | "export" | "import" | "checkall" | "select_all" | "uncheck_all" |
-            "none" | "null" | "yes" | "no" | "ok" | "on" | "off" | "go" |
-            "db" | "server" | "action" | "table" | "view" | "all" | "new" |
-            "ansi" | "db2" | "maxdb" | "mssql" | "mysql323" | "mysql40" | "oracle" |
-            "traditional" | "insert" | "replace" | "update" | "structure_and_data" |
-            "texytext" | "textext" | "toon" | "win" | "xml" | "yaml" | "zip" |
-            "gzip" | "bzip2" | "codegen" | "csv" | "excel" | "htmldir" | "htmlword" |
-            "json" | "latex" | "mediawiki" | "ods" | "odt" | "pdf" | "phparray" |
-            "shift_jis" | "sjis" | "utf8" | "utf8mb4" | "latin1" | "ascii" |
-            "quick" | "custom" | "quick_export" | "sendit" | "asfile"
+        !matches!(
+            nl.as_str(),
+            "phpmyadmin"
+                | "index"
+                | "true"
+                | "false"
+                | "select"
+                | "structure"
+                | "sql"
+                | "export"
+                | "import"
+                | "checkall"
+                | "select_all"
+                | "uncheck_all"
+                | "none"
+                | "null"
+                | "yes"
+                | "no"
+                | "ok"
+                | "on"
+                | "off"
+                | "go"
+                | "db"
+                | "server"
+                | "action"
+                | "table"
+                | "view"
+                | "all"
+                | "new"
+                | "ansi"
+                | "db2"
+                | "maxdb"
+                | "mssql"
+                | "mysql323"
+                | "mysql40"
+                | "oracle"
+                | "traditional"
+                | "insert"
+                | "replace"
+                | "update"
+                | "structure_and_data"
+                | "texytext"
+                | "textext"
+                | "toon"
+                | "win"
+                | "xml"
+                | "yaml"
+                | "zip"
+                | "gzip"
+                | "bzip2"
+                | "codegen"
+                | "csv"
+                | "excel"
+                | "htmldir"
+                | "htmlword"
+                | "json"
+                | "latex"
+                | "mediawiki"
+                | "ods"
+                | "odt"
+                | "pdf"
+                | "phparray"
+                | "shift_jis"
+                | "sjis"
+                | "utf8"
+                | "utf8mb4"
+                | "latin1"
+                | "ascii"
+                | "quick"
+                | "custom"
+                | "quick_export"
+                | "sendit"
+                | "asfile"
         )
     };
 
@@ -785,7 +1046,11 @@ fn extract_tables_from_html(html: &str) -> Vec<String> {
     let mut inside_table_select = false;
     for line in html.lines() {
         let line_lower = line.to_lowercase();
-        if line_lower.contains("<select") && (line_lower.contains("table_select") || line_lower.contains("table_structure") || line_lower.contains("selected_tbl")) {
+        if line_lower.contains("<select")
+            && (line_lower.contains("table_select")
+                || line_lower.contains("table_structure")
+                || line_lower.contains("selected_tbl"))
+        {
             inside_table_select = true;
         }
 
@@ -845,9 +1110,6 @@ fn extract_tables_from_html(html: &str) -> Vec<String> {
     tables
 }
 
-
-
-
 /// Execute stream export for a single table via export.php/route endpoints and pipe decompressed or raw stream directly to mysql STDIN
 async fn stream_export_single_table(
     client: &reqwest::Client,
@@ -857,7 +1119,7 @@ async fn stream_export_single_table(
     local_config: &LocalDbConfig,
     table_name: &str,
     app: &tauri::AppHandle,
-) -> Result<(), String> {
+) -> Result<usize, String> {
     let sql_type_val = if pma_config.sync_mode.as_deref() == Some("fresh") {
         "INSERT"
     } else {
@@ -879,39 +1141,58 @@ async fn stream_export_single_table(
     'endpoint_loop: for export_url in &export_urls {
         for compression_mode in &compressions {
             let is_gz = *compression_mode == "gzip";
-            let mut form = vec![
-                ("db", pma_config.database.as_str()),
-                ("table", table_name),
-                ("table_select[]", table_name),
-                ("table_structure[]", table_name),
-                ("table_data[]", table_name),
-                ("single_table", "true"),
-                ("what", "sql"),
-                ("export_type", "table"),
-                ("export_method", "quick"),
-                ("quick_or_custom", "quick"),
-                ("quick_export", "true"),
-                ("output_format", "sendit"),
-                ("compression", compression_mode),
-                ("asfile", "sendit"),
-                ("sql_structure_or_data", "structure_and_data"),
-                ("sql_if_not_exists", "true"),
-                ("sql_auto_increment", "1"),
-                ("sql_backquotes", "1"),
-                ("sql_type", sql_type_val),
+            let mut form: Vec<(String, String)> = vec![
+                ("db".to_string(), pma_config.database.clone()),
+                ("table".to_string(), table_name.to_string()),
+                ("table_select[]".to_string(), table_name.to_string()),
+                ("table_structure[]".to_string(), table_name.to_string()),
+                ("table_data[]".to_string(), table_name.to_string()),
+                ("single_table".to_string(), "true".to_string()),
+                ("what".to_string(), "sql".to_string()),
+                ("export_type".to_string(), "table".to_string()),
+                ("export_method".to_string(), "quick".to_string()),
+                ("quick_or_custom".to_string(), "quick".to_string()),
+                ("quick_export".to_string(), "true".to_string()),
+                ("output_format".to_string(), "sendit".to_string()),
+                ("compression".to_string(), compression_mode.to_string()),
+                ("asfile".to_string(), "sendit".to_string()),
+                (
+                    "sql_structure_or_data".to_string(),
+                    "structure_and_data".to_string(),
+                ),
+                ("sql_structure".to_string(), "1".to_string()),
+                ("sql_data".to_string(), "1".to_string()),
+                ("sql_create_table".to_string(), "true".to_string()),
+                ("sql_drop_table".to_string(), "false".to_string()),
+                ("sql_if_not_exists".to_string(), "true".to_string()),
+                ("sql_auto_increment".to_string(), "1".to_string()),
+                ("sql_backquotes".to_string(), "1".to_string()),
+                ("sql_type".to_string(), sql_type_val.to_string()),
             ];
 
-            if !csrf_token.is_empty() {
-                form.push(("token", csrf_token));
+            if let Some(limit) = pma_config.row_limit.filter(|limit| *limit > 0) {
+                let safe_table = table_name.replace('`', "``");
+                let limited_query = format!("SELECT * FROM `{}` LIMIT {}", safe_table, limit);
+                form.push(("sql_query".to_string(), limited_query));
+                form.push(("query_type".to_string(), "table".to_string()));
+                form.push(("sql_query_input".to_string(), "true".to_string()));
             }
-
-            emit_log(app, "info", format!("[Tabel '{}'] POST request ke export (URL: {}, comp={})...", table_name, export_url, compression_mode));
+            if !csrf_token.is_empty() {
+                form.push(("token".to_string(), csrf_token.to_string()));
+            }
 
             let response_res = client.post(export_url).form(&form).send().await;
             let response = match response_res {
                 Ok(r) => r,
                 Err(e) => {
-                    emit_log(app, "warn", format!("[Tabel '{}'] POST ke {} gagal: {}", table_name, export_url, e));
+                    emit_log(
+                        app,
+                        "warn",
+                        format!(
+                            "[Tabel '{}'] POST ke {} gagal: {}",
+                            table_name, export_url, e
+                        ),
+                    );
                     continue;
                 }
             };
@@ -926,11 +1207,25 @@ async fn stream_export_single_table(
             if content_type.contains("text/html") {
                 let err_html = response.text().await.unwrap_or_default();
                 last_html_err = sanitize_html_error(&err_html);
-                emit_log(app, "warn", format!("[Tabel '{}'] Endpoint {} (comp={}) mengembalikan HTML response: {}", table_name, export_url, compression_mode, last_html_err));
+                emit_log(
+                    app,
+                    "warn",
+                    format!(
+                        "[Tabel '{}'] Endpoint {} (comp={}) mengembalikan HTML response: {}",
+                        table_name, export_url, compression_mode, last_html_err
+                    ),
+                );
                 continue;
             }
 
-            emit_log(app, "info", format!("[Tabel '{}'] Endpoint PMA valid ditemukan ({}, Content-Type: {})", table_name, export_url, content_type));
+            emit_log(
+                app,
+                "info",
+                format!(
+                    "[Tabel '{}'] Endpoint PMA valid ditemukan ({}, Content-Type: {})",
+                    table_name, export_url, content_type
+                ),
+            );
             valid_response = Some((response, is_gz));
             break 'endpoint_loop;
         }
@@ -946,29 +1241,60 @@ async fn stream_export_single_table(
         }
     };
 
-    let host = if local_config.host.is_empty() { "127.0.0.1" } else { &local_config.host };
-    let port_str = if local_config.port == 0 { "3306".to_string() } else { local_config.port.to_string() };
-    let db_name = if local_config.database.is_empty() { "db_sync" } else { &local_config.database };
+    let host = if local_config.host.is_empty() {
+        "127.0.0.1"
+    } else {
+        &local_config.host
+    };
+    let port_str = if local_config.port == 0 {
+        "3306".to_string()
+    } else {
+        local_config.port.to_string()
+    };
+    let db_name = if local_config.database.is_empty() {
+        "db_sync"
+    } else {
+        &local_config.database
+    };
 
     if pma_config.sync_mode.as_deref() == Some("fresh") {
         emit_log(app, "info", format!("[Tabel '{}'] Mode Fresh Sync — Menghapus (DROP TABLE IF EXISTS) tabel lokal terlebih dahulu...", table_name));
         let mut drop_cmd = Command::new("mysql");
-        drop_cmd.arg("-h").arg(host).arg("-P").arg(&port_str).arg("-u").arg(&local_config.username);
+        drop_cmd
+            .arg("-h")
+            .arg(host)
+            .arg("-P")
+            .arg(&port_str)
+            .arg("-u")
+            .arg(&local_config.username);
         if !local_config.password.is_empty() {
             drop_cmd.arg(format!("-p{}", local_config.password));
         }
-        drop_cmd.arg(db_name).arg("-e").arg(format!("DROP TABLE IF EXISTS `{}`;", table_name.replace('`', "``")));
-        let _ = drop_cmd.output();
+        drop_cmd.arg(db_name).arg("-e").arg(format!(
+            "SET FOREIGN_KEY_CHECKS=0; DROP TABLE IF EXISTS `{}`; SET FOREIGN_KEY_CHECKS=1;",
+            table_name.replace('`', "``")
+        ));
+        let drop_output = drop_cmd
+            .output()
+            .map_err(|e| format!("Gagal menjalankan DROP TABLE untuk '{}': {}", table_name, e))?;
+        if !drop_output.status.success() {
+            let stderr = String::from_utf8_lossy(&drop_output.stderr);
+            return Err(format!(
+                "Gagal menghapus tabel lokal '{}': {}",
+                table_name,
+                stderr.trim()
+            ));
+        }
     }
 
     // Spawn child process `mysql` CLI
     let mut cmd = Command::new("mysql");
     cmd.arg("-h")
-       .arg(host)
-       .arg("-P")
-       .arg(&port_str)
-       .arg("-u")
-       .arg(&local_config.username);
+        .arg(host)
+        .arg("-P")
+        .arg(&port_str)
+        .arg("-u")
+        .arg(&local_config.username);
 
     if !local_config.password.is_empty() {
         cmd.arg(format!("-p{}", local_config.password));
@@ -989,64 +1315,174 @@ async fn stream_export_single_table(
         }
     };
 
-    let mut mysql_stdin = child.stdin.take().ok_or_else(|| "Gagal membuka STDIN child process mysql".to_string())?;
-
-    // Channel for streaming HTTP bytes to decompression reader thread
-    let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
-    let channel_reader = ChannelReader { rx, buffer: Vec::new(), cursor: 0 };
-
-    let pipe_handle = tokio::task::spawn_blocking(move || {
-        if is_gzip {
-            let mut gz_decoder = GzDecoder::new(channel_reader);
-            std::io::copy(&mut gz_decoder, &mut mysql_stdin)
-        } else {
-            let mut reader = channel_reader;
-            std::io::copy(&mut reader, &mut mysql_stdin)
-        }
-    });
-
-    let mut stream = response.bytes_stream();
-    let mut total_bytes: usize = 0;
-
-    while let Some(chunk_result) = stream.next().await {
-        match chunk_result {
-            Ok(bytes) => {
-                total_bytes += bytes.len();
-                if tx.send(bytes.to_vec()).await.is_err() {
-                    break;
-                }
-            }
-            Err(e) => {
-                emit_log(app, "error", format!("[Tabel '{}'] Error saat streaming bytes dari PMA: {}", table_name, e));
-                return Err(format!("Stream error: {}", e));
-            }
-        }
+    // Read export body once. Detect real GZIP signature; PMA may label plain SQL as application/x-gzip.
+    let response_bytes = response
+        .bytes()
+        .await
+        .map_err(|e| format!("Gagal membaca body export PMA: {}", e))?;
+    let total_bytes = response_bytes.len();
+    if total_bytes == 0 {
+        return Err(format!(
+            "Export tabel '{}' mengembalikan response kosong.",
+            table_name
+        ));
     }
 
-    drop(tx);
+    let is_actual_gzip =
+        response_bytes.len() >= 2 && response_bytes[0] == 0x1f && response_bytes[1] == 0x8b;
+    emit_log(
+        app,
+        "info",
+        format!(
+            "[Tabel '{}'] Export menerima {} byte; format aktual: {} (Content-Type gzip: {}).",
+            table_name,
+            total_bytes,
+            if is_actual_gzip { "GZIP" } else { "SQL/raw" },
+            is_gzip
+        ),
+    );
 
-    let copy_result = pipe_handle.await.map_err(|e| format!("Join error: {}", e))?;
-    let processed_bytes = copy_result.map_err(|e| format!("Stream read / STDIN write error: {}", e))?;
+    let mut sql_bytes = if is_actual_gzip {
+        let mut decoder = MultiGzDecoder::new(std::io::Cursor::new(response_bytes));
+        let mut decoded = Vec::new();
+        decoder
+            .read_to_end(&mut decoded)
+            .map_err(|e| format!("GZIP export tidak valid: {}", e))?;
+        decoded
+    } else {
+        response_bytes.to_vec()
+    };
+    let processed_bytes = sql_bytes.len();
+    if processed_bytes == 0 {
+        return Err(format!(
+            "Export tabel '{}' menghasilkan SQL kosong.",
+            table_name
+        ));
+    }
 
-    let output = child.wait_with_output().map_err(|e| format!("Gagal menghentikan child process mysql: {}", e))?;
+    // Import table independently; referenced tables may be synchronized later.
+    let mut import_sql = b"SET FOREIGN_KEY_CHECKS=0;\n".to_vec();
+    import_sql.append(&mut sql_bytes);
+    import_sql.extend_from_slice(b"\nSET FOREIGN_KEY_CHECKS=1;\n");
+    let sql_bytes = import_sql;
+
+    let mut mysql_stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "Gagal membuka STDIN child process mysql".to_string())?;
+    use std::io::Write;
+    let write_result = mysql_stdin.write_all(&sql_bytes);
+    drop(mysql_stdin);
+
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("Gagal menghentikan child process mysql: {}", e))?;
     if !output.status.success() {
-        let stderr_str = String::from_utf8_lossy(&output.stderr);
-        emit_log(app, "error", format!("[Tabel '{}'] Executable MySQL gagal: {}", table_name, stderr_str));
-        return Err(format!("MySQL CLI import error: {}", stderr_str));
+        let stderr_full = String::from_utf8_lossy(&output.stderr);
+        let stderr_tail = stderr_full
+            .lines()
+            .rev()
+            .take(12)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\\n");
+        let write_context = write_result
+            .err()
+            .map(|e| format!(" (stdin: {})", e))
+            .unwrap_or_default();
+        emit_log(
+            app,
+            "error",
+            format!(
+                "[Tabel '{}'] Executable MySQL gagal:\\n{}{}",
+                table_name, stderr_tail, write_context
+            ),
+        );
+        return Err(format!(
+            "MySQL CLI import error: {}{}",
+            stderr_tail, write_context
+        ));
     }
+    if let Err(e) = write_result {
+        return Err(format!("Gagal mengirim SQL ke MySQL: {}", e));
+    }
+
+    let mut verify_cmd = Command::new("mysql");
+    verify_cmd
+        .arg("-h")
+        .arg(host)
+        .arg("-P")
+        .arg(&port_str)
+        .arg("-u")
+        .arg(&local_config.username);
+    if !local_config.password.is_empty() {
+        verify_cmd.arg(format!("-p{}", local_config.password));
+    }
+    verify_cmd.arg(db_name).arg("--batch").arg("--skip-column-names").arg("-e").arg(format!(
+        "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = '{}' AND TABLE_NAME = '{}';",
+        db_name.replace('\\', "\\\\").replace('\'', "\\'"),
+        table_name.replace('\\', "\\\\").replace('\'', "\\'")
+    ));
+    let verify_output = verify_cmd
+        .output()
+        .map_err(|e| format!("Gagal memverifikasi tabel lokal '{}': {}", table_name, e))?;
+    if !verify_output.status.success()
+        || String::from_utf8_lossy(&verify_output.stdout).trim() != table_name
+    {
+        let stderr = String::from_utf8_lossy(&verify_output.stderr);
+        return Err(format!(
+            "Tabel lokal '{}' tidak ditemukan setelah import. {}",
+            table_name,
+            stderr.trim()
+        ));
+    }
+    let mut count_cmd = Command::new("mysql");
+    count_cmd
+        .arg("-h")
+        .arg(host)
+        .arg("-P")
+        .arg(&port_str)
+        .arg("-u")
+        .arg(&local_config.username);
+    if !local_config.password.is_empty() {
+        count_cmd.arg(format!("-p{}", local_config.password));
+    }
+    count_cmd
+        .arg(db_name)
+        .arg("--batch")
+        .arg("--skip-column-names")
+        .arg("-e")
+        .arg(format!(
+            "SELECT COUNT(*) FROM `{}`;",
+            table_name.replace('`', "``")
+        ));
+    let count_output = count_cmd
+        .output()
+        .map_err(|e| format!("Gagal menghitung row tabel '{}': {}", table_name, e))?;
+    if !count_output.status.success() {
+        return Err(format!(
+            "Gagal menghitung row tabel '{}': {}",
+            table_name,
+            String::from_utf8_lossy(&count_output.stderr).trim()
+        ));
+    }
+    let imported_rows = String::from_utf8_lossy(&count_output.stdout)
+        .trim()
+        .parse::<usize>()
+        .unwrap_or(0);
 
     emit_log(
         app,
         "success",
         format!(
-            "[Tabel '{}'] Selesai! Streamed {} KB HTTP -> {} KB SQL langsung ke MySQL lokal.",
-            table_name,
-            total_bytes / 1024,
-            processed_bytes / 1024
+            "[Tabel '{}'] Selesai! {} row masuk.",
+            table_name, imported_rows
         ),
     );
 
-    Ok(())
+    Ok(imported_rows)
 }
 
 fn sanitize_html_error(html: &str) -> String {
@@ -1073,23 +1509,38 @@ fn sanitize_html_error(html: &str) -> String {
 }
 
 fn ensure_local_database_exists(local_config: &LocalDbConfig, app: &tauri::AppHandle) {
-    let host = if local_config.host.is_empty() { "127.0.0.1" } else { &local_config.host };
-    let port_str = if local_config.port == 0 { "3306".to_string() } else { local_config.port.to_string() };
+    let host = if local_config.host.is_empty() {
+        "127.0.0.1"
+    } else {
+        &local_config.host
+    };
+    let port_str = if local_config.port == 0 {
+        "3306".to_string()
+    } else {
+        local_config.port.to_string()
+    };
 
     let mut cmd = Command::new("mysql");
     cmd.arg("-h")
-       .arg(host)
-       .arg("-P")
-       .arg(&port_str)
-       .arg("-u")
-       .arg(&local_config.username);
+        .arg(host)
+        .arg("-P")
+        .arg(&port_str)
+        .arg("-u")
+        .arg(&local_config.username);
 
     if !local_config.password.is_empty() {
         cmd.arg(format!("-p{}", local_config.password));
     }
 
-    let db_name = if local_config.database.is_empty() { "db_sync" } else { &local_config.database };
-    let create_sql = format!("CREATE DATABASE IF NOT EXISTS `{}`;", db_name.replace('`', "``"));
+    let db_name = if local_config.database.is_empty() {
+        "db_sync"
+    } else {
+        &local_config.database
+    };
+    let create_sql = format!(
+        "CREATE DATABASE IF NOT EXISTS `{}`;",
+        db_name.replace('`', "``")
+    );
 
     cmd.arg("-e").arg(&create_sql);
 
@@ -1097,13 +1548,25 @@ fn ensure_local_database_exists(local_config: &LocalDbConfig, app: &tauri::AppHa
         Ok(out) => {
             if !out.status.success() {
                 let err = String::from_utf8_lossy(&out.stderr);
-                emit_log(app, "warn", format!("Penyiapan DB lokal '{}': {}", db_name, err));
+                emit_log(
+                    app,
+                    "warn",
+                    format!("Penyiapan DB lokal '{}': {}", db_name, err),
+                );
             } else {
-                emit_log(app, "info", format!("Database lokal '{}' terverifikasi siap.", db_name));
+                emit_log(
+                    app,
+                    "info",
+                    format!("Database lokal '{}' terverifikasi siap.", db_name),
+                );
             }
         }
         Err(e) => {
-            emit_log(app, "warn", format!("Gagal memeriksa/membuat DB lokal via CLI mysql: {}", e));
+            emit_log(
+                app,
+                "warn",
+                format!("Gagal memeriksa/membuat DB lokal via CLI mysql: {}", e),
+            );
         }
     }
 }
@@ -1115,7 +1578,11 @@ pub async fn export_pma_database(
     local_config: LocalDbConfig,
     app: tauri::AppHandle,
 ) -> Result<String, String> {
-    emit_log(&app, "info", "🚀 Memulai Sinkronisasi via Direct SQL/GZIP Stream (export.php)...");
+    emit_log(
+        &app,
+        "info",
+        "🚀 Memulai Sinkronisasi via Direct SQL/GZIP Stream (export.php)...",
+    );
 
     // Ensure target local database exists before streaming tables
     ensure_local_database_exists(&local_config, &app);
@@ -1129,34 +1596,107 @@ pub async fn export_pma_database(
     };
 
     let total_tables = tables.len();
-    emit_log(&app, "info", format!("Total {} tabel akan disinkronkan berurutan.", total_tables));
+    emit_log(
+        &app,
+        "info",
+        format!("Total {} tabel akan disinkronkan berurutan.", total_tables),
+    );
 
-    let throttle_ms = pma_config.throttle_ms.unwrap_or(400);
+    use futures_util::stream::{self, StreamExt};
 
-    for (idx, table_name) in tables.iter().enumerate() {
-        emit_progress(&app, idx + 1, total_tables, table_name, 0, idx, "syncing");
+    const WORKER_COUNT: usize = 3;
+    emit_log(
+        &app,
+        "info",
+        format!(
+            "Menjalankan {} worker async untuk {} tabel.",
+            WORKER_COUNT, total_tables
+        ),
+    );
 
-        match stream_export_single_table(&client, &base_url, &csrf_token, &pma_config, &local_config, table_name, &app).await {
-            Ok(_) => {
-                emit_progress(&app, idx + 1, total_tables, table_name, 1, idx + 1, "syncing");
-            }
-            Err(e) => {
-                emit_log(&app, "error", format!("⚠️ Gagal memproses tabel '{}': {}. Menghentikan eksekusi.", table_name, e));
-                emit_progress(&app, idx + 1, total_tables, table_name, 0, idx, "error");
-                return Err(format!("Proses sinkronisasi dihentikan karena error pada tabel '{}': {}", table_name, e));
-            }
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    let completed_tables = Arc::new(AtomicUsize::new(0));
+    let total_rows = Arc::new(AtomicUsize::new(0));
+
+    let results = stream::iter(tables.iter().cloned().map(|table_name| {
+        let client = client.clone();
+        let base_url = base_url.clone();
+        let csrf_token = csrf_token.clone();
+        let pma_config = pma_config.clone();
+        let local_config = local_config.clone();
+        let app = app.clone();
+        let completed_tables = completed_tables.clone();
+        let total_rows = total_rows.clone();
+        async move {
+            emit_progress(
+                &app,
+                completed_tables.load(Ordering::Relaxed),
+                total_tables,
+                &table_name,
+                0,
+                total_rows.load(Ordering::Relaxed),
+                "syncing",
+            );
+            let imported_rows = stream_export_single_table(
+                &client,
+                &base_url,
+                &csrf_token,
+                &pma_config,
+                &local_config,
+                &table_name,
+                &app,
+            )
+            .await?;
+            let done = completed_tables.fetch_add(1, Ordering::Relaxed) + 1;
+            let rows = total_rows.fetch_add(imported_rows, Ordering::Relaxed) + imported_rows;
+            emit_progress(
+                &app,
+                done,
+                total_tables,
+                &table_name,
+                imported_rows,
+                rows,
+                "syncing",
+            );
+            Ok::<(), String>(())
         }
+    }))
+    .buffer_unordered(WORKER_COUNT)
+    .collect::<Vec<Result<(), String>>>()
+    .await;
 
-        // Throttle sleep to prevent remote server CPU spike
-        if idx + 1 < total_tables {
-            tokio::time::sleep(Duration::from_millis(throttle_ms)).await;
+    for result in results {
+        if let Err(e) = result {
+            emit_log(&app, "error", format!("Gagal memproses tabel: {}", e));
+            return Err(format!("Sinkronisasi async gagal: {}", e));
         }
     }
 
-    emit_progress(&app, total_tables, total_tables, "", 0, total_tables, "finished");
-    emit_log(&app, "success", format!("🎉 Direct SQL/GZIP Stream Sync Berhasil! {} tabel telah disinkronkan.", total_tables));
+    emit_progress(
+        &app,
+        completed_tables.load(Ordering::Relaxed),
+        total_tables,
+        "",
+        0,
+        total_rows.load(Ordering::Relaxed),
+        "finished",
+    );
+    emit_log(
+        &app,
+        "success",
+        format!(
+            "🎉 Direct SQL/GZIP Stream Sync Berhasil! {} tabel telah disinkronkan.",
+            total_tables
+        ),
+    );
 
-    Ok(format!("Berhasil menyinkronkan {} tabel via Direct GZIP Stream.", total_tables))
+    Ok(format!(
+        "Berhasil menyinkronkan {} tabel via Direct GZIP Stream.",
+        total_tables
+    ))
 }
 
 mod urlencoding {

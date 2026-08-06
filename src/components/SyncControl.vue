@@ -7,7 +7,7 @@
           class="btn btn-primary btn-sm"
           @click="$emit('start-sync')"
         >
-          <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+          <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
             <polyline points="23 4 23 10 17 10"></polyline>
             <polyline points="1 20 1 14 7 14"></polyline>
             <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
@@ -21,7 +21,7 @@
           title="Klik untuk menghentikan sinkronisasi saat ini. Data yang sudah masuk tetap tersimpan."
           @click="$emit('stop-sync')"
         >
-          <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+          <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="currentColor">
             <rect x="6" y="6" width="12" height="12" rx="2"></rect>
           </svg>
           <span class="btn-text">Hentikan Sinkronisasi</span>
@@ -59,7 +59,7 @@
           <span class="stat-value text-cyan">
             {{ formatNumber(syncProgress.currentTableIndex) }} / {{ formatNumber(syncProgress.totalTables) }}
           </span>
-          <span class="stat-label">Tabel Process: {{ syncProgress.currentTableName || '...' }}</span>
+           <span class="stat-label">Tabel Process: <span class="table-name-truncated" :title="syncProgress.currentTableName">{{ syncProgress.currentTableName || '...' }}</span></span>
         </div>
 
         <div v-else class="stat-card">
@@ -73,34 +73,21 @@
         </div>
       </div>
     </div>
-
-    <div class="sync-settings-box">
-      <div class="sync-settings-row">
+    <div class="sync-options-card">
+      <div class="options-row">
         <div class="option-inline">
           <span class="option-title">Mode:</span>
-          <label class="radio-label-inline" title="Tarik ID baru yang belum ada di lokal, dan update baris jika updated_at di server lebih baru">
-            <input type="radio" name="syncMode" value="incremental" :checked="syncMode === 'incremental'" @change="$emit('update:syncMode', 'incremental')" />
-            <span>Sync (New &amp; Update)</span>
-          </label>
-          <label class="radio-label-inline warning-radio">
-            <input type="radio" name="syncMode" value="fresh" :checked="syncMode === 'fresh'" @change="$emit('update:syncMode', 'fresh')" />
-            <span>Fresh Sync</span>
-          </label>
+          <label class="radio-label-inline"><input type="radio" name="syncMode" value="incremental" :checked="syncMode === 'incremental'" @change="$emit('update:sync-mode', 'incremental')" /> <span>Sync (New &amp; Update)</span></label>
+          <label class="radio-label-inline warning-radio"><input type="radio" name="syncMode" value="fresh" :checked="syncMode === 'fresh'" @change="$emit('update:sync-mode', 'fresh')" /> <span>Fresh Sync</span></label>
         </div>
-
         <div class="option-inline">
           <span class="option-title">Limit:</span>
           <select
-            :value="rowLimit"
-            class="form-select interval-select"
-            @change="$emit('update:rowLimit', parseInt($event.target.value, 10))"
+            :value="Number.isFinite(Number(rowLimit)) ? Number(rowLimit) : 0"
+            class="form-select limit-select"
+            @change="$emit('update:row-limit', Number($event.target.value) || 0)"
           >
-            <option :value="0">Semua Row (Default)</option>
-            <option :value="1000">1.000 Row</option>
-            <option :value="10000">10.000 Row</option>
-            <option :value="100000">100.000 Row</option>
-            <option :value="500000">500.000 Row</option>
-            <option :value="2000000">2.000.000 Row</option>
+            <option :value="0">Semua Row (Default)</option><option :value="1000">1.000 Row</option><option :value="10000">10.000 Row</option><option :value="100000">100.000 Row</option><option :value="500000">500.000 Row</option><option :value="2000000">2.000.000 Row</option>
           </select>
         </div>
       </div>
@@ -154,7 +141,7 @@ const props = defineProps({
   },
 });
 
-const emit = defineEmits(['start-sync', 'stop-sync', 'update:autoSyncInterval', 'update:syncMode', 'update:rowLimit']);
+const emit = defineEmits(['start-sync', 'stop-sync', 'update:autoSyncInterval', 'update:sync-mode', 'update:row-limit']);
 
 const formatNumber = (val) => {
   if (val === null || val === undefined || isNaN(val)) return '0';
@@ -216,12 +203,6 @@ const formatDuration = (ms) => {
   flex-wrap: wrap;
 }
 
-.btn-sm {
-  padding: 12px 24px;
-  font-size: 0.95rem;
-  border-radius: var(--radius-md);
-}
-
 .auto-sync-box {
   display: flex;
   align-items: center;
@@ -241,17 +222,16 @@ const formatDuration = (ms) => {
 }
 
 .interval-select {
-  padding: 4px 8px;
+  padding: 0px 2px;
   font-size: 0.8rem;
   width: auto;
   border: none;
   background: transparent;
-  color: #edf0f7;
+  color: #111827;
 }
 
 .interval-select option {
   color: #111827;
-  background: #ffffff;
 }
 
 .sync-settings-box {
@@ -273,6 +253,19 @@ const formatDuration = (ms) => {
   display: flex;
   align-items: center;
   gap: 8px;
+}
+
+.stat-label {
+  min-width: 0;
+}
+
+.table-name-truncated {
+  display: inline-block;
+  max-width: 12rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
 }
 
 .option-title {
@@ -307,18 +300,16 @@ const formatDuration = (ms) => {
 }
 
 .limit-select {
-  padding: 6px 12px;
+  padding: 0px 2px;
   font-size: 0.8rem;
   width: auto;
   min-width: 160px;
   max-width: 260px;
-  color: #edf0f7;
-  background: rgba(16, 18, 23, 0.8);
+  color: #111827;
 }
 
 .limit-select option {
   color: #111827;
-  background: #ffffff;
 }
 
 .stats-grid {
