@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
-use sqlx::{mysql::MySqlPoolOptions, Column, Row};
-use std::collections::HashMap;
+use sqlx::{mysql::{MySqlPool, MySqlPoolOptions}, Column, Row};
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct LocalDbConfig {
@@ -48,6 +48,157 @@ fn sanitize_identifier(ident: &str) -> Result<String, String> {
     // Escape any backtick characters within the identifier itself
     let escaped = trimmed.replace('`', "``");
     Ok(format!("`{}`", escaped))
+}
+
+async fn table_exists(pool: &MySqlPool, table_name: &str) -> Result<bool, String> {
+    let escaped_name = table_name.replace('\'', "''");
+    let query = format!(
+        "SELECT COUNT(*) AS cnt FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '{}'",
+        escaped_name
+    );
+
+    let row = sqlx::query(&query)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| format!("Gagal mengecek keberadaan tabel lokal '{}': {}", table_name, e))?;
+
+    let count = row
+        .and_then(|r| r.try_get::<i64, _>(0).ok())
+        .unwrap_or(0);
+
+    Ok(count > 0)
+}
+
+async fn get_local_table_columns(pool: &MySqlPool, table_name: &str) -> Result<Vec<String>, String> {
+    let escaped_name = table_name.replace('\'', "''");
+    let query = format!(
+        "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '{}' ORDER BY ORDINAL_POSITION ASC",
+        escaped_name
+    );
+
+    let rows = sqlx::query(&query)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| format!("Gagal membaca struktur kolom tabel lokal '{}': {}", table_name, e))?;
+
+    let mut columns = Vec::new();
+    for row in rows {
+        if let Ok(col_name) = row.try_get::<String, _>(0) {
+            columns.push(col_name);
+        }
+    }
+
+    Ok(columns)
+}
+
+fn infer_mysql_column_type(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "LONGTEXT",
+        serde_json::Value::Bool(_) => "TINYINT(1)",
+        serde_json::Value::Number(n) => {
+            if n.is_i64() {
+                "BIGINT"
+            } else {
+                "DOUBLE"
+            }
+        }
+        serde_json::Value::String(_) => "LONGTEXT",
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => "JSON",
+    }
+}
+
+async fn rebuild_local_table(
+    pool: &MySqlPool,
+    safe_table: &str,
+    safe_pk: &str,
+    table_name: &str,
+    primary_key: Option<&String>,
+    sample_obj: &serde_json::Map<String, serde_json::Value>,
+    raw_cols: &[String],
+) -> Result<(), String> {
+    let mut definitions = Vec::new();
+    for col_name in raw_cols {
+        let safe_col = sanitize_identifier(col_name)?;
+        let inferred_type = infer_mysql_column_type(sample_obj.get(col_name).unwrap_or(&serde_json::Value::Null));
+        definitions.push(format!("{} {} NULL", safe_col, inferred_type));
+    }
+
+    let pk_def = if let Some(primary_key) = primary_key {
+        if raw_cols.iter().any(|col| col == primary_key) {
+            format!(", PRIMARY KEY ({})", safe_pk)
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
+    let create_query = format!(
+        "CREATE TABLE {} ({}){}",
+        safe_table,
+        definitions.join(", "),
+        pk_def
+    );
+
+    sqlx::query(&format!("DROP TABLE IF EXISTS {}", safe_table))
+        .execute(pool)
+        .await
+        .map_err(|e| format!("Gagal menghapus tabel lokal '{}' sebelum rebuild: {}", table_name, e))?;
+
+    sqlx::query(&create_query)
+        .execute(pool)
+        .await
+        .map_err(|e| format!("Gagal membuat ulang tabel lokal '{}' secara otomatis: {}", table_name, e))?;
+
+    Ok(())
+}
+
+async fn ensure_local_table_exists(
+    pool: &MySqlPool,
+    safe_table: &str,
+    safe_pk: &str,
+    table_name: &str,
+    primary_key: Option<&String>,
+    sample_obj: &serde_json::Map<String, serde_json::Value>,
+    raw_cols: &[String],
+) -> Result<(), String> {
+    if table_exists(pool, table_name).await? {
+        let local_cols = get_local_table_columns(pool, table_name).await?;
+        let local_set: HashSet<String> = local_cols
+            .iter()
+            .map(|col| col.to_ascii_lowercase())
+            .collect();
+        let remote_set: HashSet<String> = raw_cols
+            .iter()
+            .map(|col| col.to_ascii_lowercase())
+            .collect();
+
+        if local_set != remote_set {
+            rebuild_local_table(
+                pool,
+                safe_table,
+                safe_pk,
+                table_name,
+                primary_key,
+                sample_obj,
+                raw_cols,
+            )
+            .await?;
+        }
+
+        return Ok(());
+    }
+
+    rebuild_local_table(
+        pool,
+        safe_table,
+        safe_pk,
+        table_name,
+        primary_key,
+        sample_obj,
+        raw_cols,
+    )
+    .await
 }
 
 mod urlencoding {
@@ -190,7 +341,7 @@ pub async fn get_local_max_updated_at(
 pub async fn sync_to_local_db(
     config: LocalDbConfig,
     table_name: String,
-    primary_key: String,
+    primary_key: Option<String>,
     rows: Vec<serde_json::Value>,
 ) -> Result<SyncResult, String> {
     if rows.is_empty() {
@@ -203,7 +354,10 @@ pub async fn sync_to_local_db(
     }
 
     let safe_table = sanitize_identifier(&table_name)?;
-    let safe_pk = sanitize_identifier(&primary_key)?;
+    let safe_pk = match primary_key.as_deref() {
+        Some(pk) => sanitize_identifier(pk)?,
+        None => String::new(),
+    };
     let conn_str = build_connection_string(&config);
 
     let pool = MySqlPoolOptions::new()
@@ -227,6 +381,18 @@ pub async fn sync_to_local_db(
         pool.close().await;
         return Err("Data baris tidak memiliki kolom/field".to_string());
     }
+
+    let primary_key_ref = primary_key.as_ref();
+    ensure_local_table_exists(
+        &pool,
+        &safe_table,
+        &safe_pk,
+        &table_name,
+        primary_key_ref,
+        sample_obj,
+        &raw_cols,
+    )
+    .await?;
 
     let mut safe_cols = Vec::new();
     for col in &raw_cols {
@@ -269,19 +435,21 @@ pub async fn sync_to_local_db(
 
         query.push_str(&value_clauses.join(", "));
 
-        let mut update_clauses = Vec::new();
-        for col_name in &raw_cols {
-            let safe_col = sanitize_identifier(col_name)?;
-            if safe_col != safe_pk {
-                update_clauses.push(format!("{}=VALUES({})", safe_col, safe_col));
+        if !safe_pk.trim().is_empty() {
+            let mut update_clauses = Vec::new();
+            for col_name in &raw_cols {
+                let safe_col = sanitize_identifier(col_name)?;
+                if safe_col != safe_pk {
+                    update_clauses.push(format!("{}=VALUES({})", safe_col, safe_col));
+                }
             }
-        }
 
-        if !update_clauses.is_empty() {
-            query.push_str(" ON DUPLICATE KEY UPDATE ");
-            query.push_str(&update_clauses.join(", "));
-        } else {
-            query.push_str(&format!(" ON DUPLICATE KEY UPDATE {}=VALUES({})", safe_pk, safe_pk));
+            if !update_clauses.is_empty() {
+                query.push_str(" ON DUPLICATE KEY UPDATE ");
+                query.push_str(&update_clauses.join(", "));
+            } else {
+                query.push_str(&format!(" ON DUPLICATE KEY UPDATE {}=VALUES({})", safe_pk, safe_pk));
+            }
         }
 
         match sqlx::query(&query).execute(&mut *tx).await {
@@ -388,6 +556,11 @@ pub async fn truncate_local_table(
         .connect(&conn_str)
         .await
         .map_err(|e| format!("Koneksi ke MySQL lokal gagal: {}", e))?;
+
+    if !table_exists(&pool, &table_name).await? {
+        pool.close().await;
+        return Ok(format!("Tabel lokal '{}' tidak ada, skip TRUNCATE.", table_name));
+    }
 
     // Disable FK checks agar TRUNCATE tidak gagal karena relasi foreign key
     sqlx::query("SET FOREIGN_KEY_CHECKS=0")

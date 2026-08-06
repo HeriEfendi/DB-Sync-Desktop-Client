@@ -47,6 +47,7 @@
     <!-- Navigation Tabs -->
     <div class="tab-header">
       <button
+        data-tab="remote"
         class="tab-btn"
         :class="{ active: activeTab === 'remote' }"
         @click="activeTab = 'remote'"
@@ -56,6 +57,7 @@
       </button>
 
       <button
+        data-tab="local"
         class="tab-btn"
         :class="{ active: activeTab === 'local' }"
         @click="activeTab = 'local'"
@@ -65,6 +67,7 @@
       </button>
 
       <button
+        data-tab="tables"
         class="tab-btn"
         :class="{ active: activeTab === 'tables' }"
         @click="activeTab = 'tables'"
@@ -284,7 +287,7 @@
               :checked="selectedTables.includes(tableName)"
               @change="toggleTableSelection(tableName)"
             />
-            <span class="table-name-text">{{ tableName }}</span>
+            <span class="table-name-text" :title="tableName">{{ tableName }}</span>
           </label>
         </div>
       </div>
@@ -576,6 +579,37 @@ const loadPreset = () => {
   font-weight: 600;
 }
 
+.form-label {
+  color: #ffffff !important;
+  font-weight: 600;
+}
+
+.config-card input.form-input,
+.config-card select.form-select {
+  color: #ffffff !important;
+  -webkit-text-fill-color: #ffffff !important;
+  background: #111827 !important;
+  padding: 8px 10px;
+  font-size: 0.78rem;
+}
+
+.config-card input.form-input::placeholder {
+  color: #cbd5e1 !important;
+  opacity: 1 !important;
+}
+
+.config-card input.form-input:-webkit-autofill,
+.config-card input.form-input:-webkit-autofill:hover,
+.config-card input.form-input:-webkit-autofill:focus {
+  -webkit-text-fill-color: #ffffff !important;
+  box-shadow: 0 0 0 1000px #111827 inset !important;
+}
+
+.form-select option {
+  color: #ffffff;
+  background: #111827;
+}
+
 .subtitle {
   font-size: 0.78rem;
   color: var(--text-muted);
@@ -587,16 +621,28 @@ const loadPreset = () => {
   gap: 8px;
 }
 
-.preset-select {
-  padding: 5px 10px;
-  font-size: 0.8rem;
-  width: auto;
+select.preset-select {
+  box-sizing: border-box;
+  width: 100%;
   max-width: 180px;
-  color: #111827;
+  min-height: 34px;
+  padding: 8px 10px;
+  background: var(--bg-input) !important;
+  border: 1px solid var(--border-color) !important;
+  border-radius: var(--radius-sm);
+  color: var(--text-main) !important;
+  -webkit-text-fill-color: var(--text-main) !important;
+  font-family: inherit;
+  font-size: 0.78rem;
+  font-weight: 400;
+  line-height: normal;
+  color-scheme: dark;
 }
 
-.preset-select option {
-  color: #111827;
+select.preset-select option {
+  color: var(--text-main) !important;
+  background: var(--bg-input) !important;
+  font: inherit;
 }
 
 .btn-sm {
@@ -719,12 +765,14 @@ const loadPreset = () => {
 }
 
 .table-name-text {
+  display: block;
   font-size: 0.82rem;
   font-family: 'JetBrains Mono', monospace;
   color: var(--text-main);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+  word-break: break-word;
 }
 
 .sync-options-card {

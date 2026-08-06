@@ -105,8 +105,8 @@ const copyLogs = () => {
 .log-console-card {
   display: flex;
   flex-direction: column;
-  flex: 1;
-  min-height: 250px;
+  min-height: 290px;
+  max-height: 48vh;
   overflow: hidden;
 }
 
@@ -178,6 +178,7 @@ const copyLogs = () => {
 }
 
 .log-window {
+  min-height: 220px;
   flex: 1;
   padding: 12px 16px;
   overflow-y: auto;

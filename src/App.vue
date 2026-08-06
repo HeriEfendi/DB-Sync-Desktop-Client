@@ -1,69 +1,95 @@
 <template>
-  <div class="app-layout">
-    <!-- Environment Mode Warning Banner if opened in Web Browser -->
+  <div class="app-layout desktop-shell">
     <div v-if="!isTauri" class="browser-banner">
-      <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path><line x1="12" y1="9" x2="12" y2="13"></line><line x1="12" y1="17" x2="12.01" y2="17"></line></svg>
-      <span>Mode Pratinjau Web Browser terdeteksi. Untuk mengaktifkan koneksi port native MySQL Local, buka aplikasi desktop Tauri dengan perintah: <code>npm run tauri dev</code></span>
+      <span class="banner-dot"></span>
+      <span>Mode browser aktif. Jalankan <code>npm run tauri dev</code> untuk akses MySQL lokal.</span>
     </div>
 
-    <!-- Navbar Header -->
-    <Navbar
-      :pma-status="pmaStatus"
-      :local-status="localStatus"
-      :is-syncing="isSyncing"
-      @trigger-sync="handleStartSync"
-    />
+    <div class="desktop-frame">
+      <aside class="app-sidebar" aria-label="Navigasi aplikasi">
+        <div class="sidebar-brand">
+          <div class="logo-icon" aria-hidden="true">
+            <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg>
+          </div>
+          <div><strong>DB-Sync</strong><small>Desktop Client</small></div>
+        </div>
 
-    <!-- Main Dashboard Content -->
-    <main class="dashboard-body">
-      <!-- Top Grid: Config & Controls -->
-      <div class="grid-top">
-        <ConnectionConfig
-          v-model:pma-config="pmaConfig"
-          v-model:local-config="localConfig"
-          v-model:selected-tables="selectedTables"
-          v-model:available-tables="availableTables"
-          v-model:sync-mode="syncMode"
-          v-model:row-limit="rowLimit"
-          :testing-pma="testingPma"
-          :testing-local="testingLocal"
-          :fetching-tables="fetchingTables"
-          @test-pma="testPmaConnection"
-          @test-local="testLocalConnection"
-          @fetch-tables="fetchTablesFromPma"
-          @preset-changed="handlePresetChanged"
-        />
 
-        <SyncControl
-          :is-syncing="isSyncing"
-          v-model:auto-sync-interval="autoSyncInterval"
-          :stats="stats"
-          :sync-progress="syncProgress"
-          @start-sync="handleStartSync"
-          @stop-sync="handleStopSync"
-        />
-      </div>
+        <nav class="sidebar-nav sidebar-group">
+          <button type="button" class="sidebar-item" :class="{ active: activeNav === 'connections' }" @click="selectNav('connections')"><span class="nav-icon">◈</span> Connections <span class="nav-count">2</span></button>
+        </nav>
 
-      <!-- Bottom Grid: Log Console & Data Inspector -->
-      <div class="grid-bottom">
-        <LogConsole
-          :logs="logs"
-          @clear-logs="logs = []"
-        />
+        <nav class="sidebar-nav sidebar-group">
+          <button type="button" class="sidebar-item" :class="{ active: activeNav === 'tables' }" @click="selectNav('tables')"><span class="nav-icon">▦</span> Tables</button>
+        </nav>
 
-        <!-- <DataPreview
-          :rows="previewRows"
-          @refresh-local-preview="fetchLocalPreview"
-        /> -->
-      </div>
-    </main>
+        <nav class="sidebar-nav sidebar-group">
+          <button type="button" class="sidebar-item" :class="{ active: activeNav === 'sync' }" @click="selectNav('sync')"><span class="nav-icon">↻</span> Sync Jobs</button>
+        </nav>
+
+        <div class="sidebar-spacer"></div>
+        <div class="sidebar-footer">
+          <div class="runtime-state"><span class="state-dot" :class="{ online: isTauri }"></span><span>{{ isTauri ? 'Tauri runtime' : 'Browser preview' }}</span></div>
+          <small>DB-Sync Client · v1.0</small>
+        </div>
+      </aside>
+
+      <section class="desktop-content">
+        <Navbar :pma-status="pmaStatus" :local-status="localStatus" :is-syncing="isSyncing" @trigger-sync="handleStartSync" />
+
+        <main class="dashboard-body">
+          <div class="workspace-heading">
+            <div><span class="eyebrow">WORKSPACE / OVERVIEW</span><h1>Database sync workspace</h1><p>Kelola koneksi, tabel, dan proses sinkronisasi dari satu tempat.</p></div>
+            <div class="heading-meta"><span class="live-indicator"></span> Live workspace</div>
+          </div>
+
+          <div class="config-stack">
+            <ConnectionConfigSection
+              v-model:pma-config="pmaConfig"
+              v-model:local-config="localConfig"
+              :testing-pma="testingPma"
+              :testing-local="testingLocal"
+              @test-pma="testPmaConnection"
+              @test-local="testLocalConnection"
+              @preset-changed="handlePresetChanged"
+            />
+
+            <TableConfig
+              v-model:selected-tables="selectedTables"
+              v-model:available-tables="availableTables"
+              :fetching-tables="fetchingTables"
+              @fetch-tables="fetchTablesFromPma"
+            />
+
+            <SyncControl
+              :is-syncing="isSyncing"
+              v-model:auto-sync-interval="autoSyncInterval"
+              :sync-mode="syncMode"
+              :row-limit="rowLimit"
+              :stats="stats"
+              :sync-progress="syncProgress"
+              @start-sync="handleStartSync"
+              @stop-sync="handleStopSync"
+              @update:sync-mode="syncMode = $event"
+              @update:row-limit="rowLimit = $event"
+            />
+          </div>
+
+          <div class="grid-bottom">
+            <LogConsole :logs="logs" @clear-logs="logs = []" />
+          </div>
+        </main>
+        <footer class="status-bar"><span><i class="status-dot"></i> Ready</span><span>Local workspace</span><span class="status-spacer"></span><span>UTF-8</span><span>v1.0.0</span></footer>
+      </section>
+    </div>
   </div>
 </template>
 
 <script setup>
 import { ref, watch, onMounted, onUnmounted } from 'vue';
 import Navbar from './components/Navbar.vue';
-import ConnectionConfig from './components/ConnectionConfig.vue';
+import ConnectionConfigSection from './components/ConnectionConfigSection.vue';
+import TableConfig from './components/TableConfig.vue';
 import SyncControl from './components/SyncControl.vue';
 import LogConsole from './components/LogConsole.vue';
 // import DataPreview from './components/DataPreview.vue';
@@ -72,6 +98,25 @@ import { SyncEngine } from './services/syncEngine.js';
 import { isTauriEnvironment, safeInvoke } from './services/tauriHelper.js';
 
 const isTauri = ref(isTauriEnvironment());
+const activeNav = ref('connections');
+
+const selectNav = (item) => {
+  activeNav.value = item;
+
+  if (item === 'connections') {
+    document.querySelector('[data-tab="remote"]')?.click();
+    document.querySelector('.grid-top')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    return;
+  }
+
+  if (item === 'tables') {
+    document.querySelector('[data-tab="tables"]')?.click();
+    document.querySelector('.grid-top')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    return;
+  }
+
+  document.querySelector('.sync-control-card')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+};
 
 // Connection state
 const pmaConfig = ref({
@@ -213,10 +258,48 @@ const fetchTablesFromPma = async () => {
     timestamp: new Date().toLocaleTimeString(),
   });
 
+  let pmaLogUnlisten = null;
+
   try {
-    const client = new PmaClient(pmaConfig.value);
-    await client.authenticate();
-    const tables = await client.fetchTablesList();
+    let tables = [];
+    if (isTauri.value) {
+      // Listen to pma-log events from Rust so diagnostics appear in the app console
+      try {
+        pmaLogUnlisten = await safeListen('pma-log', (event) => {
+          const { type: t, message } = event.payload || {};
+          addLog({ type: t || 'info', message: `[PMA] ${message}`, timestamp: new Date().toLocaleTimeString() });
+        });
+      } catch (_) {}
+
+      try {
+        tables = await safeInvoke('get_pma_tables', {
+          pmaConfig: {
+            url: pmaConfig.value.url,
+            username: pmaConfig.value.username,
+            password: pmaConfig.value.password,
+            database: pmaConfig.value.database,
+            tables: [],
+          },
+        });
+      } catch (e) {
+        addLog({
+          type: 'warning',
+          message: `Engine native Rust gagal ekstraksi tabel (${e.message || e}), mencoba fallback client JS...`,
+          timestamp: new Date().toLocaleTimeString(),
+        });
+      }
+    }
+
+    if (!tables || tables.length === 0) {
+      addLog({ type: 'info', message: 'Mencoba fallback JS PmaClient...', timestamp: new Date().toLocaleTimeString() });
+      try {
+        const client = new PmaClient(pmaConfig.value);
+        await client.authenticate();
+        tables = await client.fetchTablesList();
+      } catch (jsErr) {
+        addLog({ type: 'warning', message: `JS PmaClient fallback gagal: ${jsErr.message}`, timestamp: new Date().toLocaleTimeString() });
+      }
+    }
 
     if (tables && tables.length > 0) {
       availableTables.value = tables;
@@ -244,8 +327,10 @@ const fetchTablesFromPma = async () => {
     });
   } finally {
     fetchingTables.value = false;
+    if (pmaLogUnlisten) pmaLogUnlisten();
   }
 };
+
 
 // Test PMA Remote connection
 const testPmaConnection = async () => {
@@ -437,53 +522,8 @@ const handleStartSync = async () => {
 };
 </script>
 
-<style scoped>
-.app-layout {
-  display: flex;
-  flex-direction: column;
-  height: 100vh;
-  overflow: hidden;
-}
+.app-layout { display:flex; flex-direction:column; width:100%; height:100vh; min-width:0; overflow:hidden; }
+.desktop-frame { flex:1 1 auto; width:100%; min-width:0; }
+.desktop-content { width:100%; min-width:0; }
+.browser-banner { flex:0 0 auto; }
 
-.browser-banner {
-  background: rgba(245, 158, 11, 0.18);
-  color: var(--accent-amber);
-  border-bottom: 1px solid rgba(245, 158, 11, 0.3);
-  padding: 8px 16px;
-  font-size: 0.8rem;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  justify-content: center;
-}
-
-.browser-banner code {
-  background: rgba(0, 0, 0, 0.4);
-  padding: 2px 6px;
-  border-radius: 4px;
-  font-family: 'JetBrains Mono', monospace;
-  color: white;
-}
-
-.dashboard-body {
-  flex: 1;
-  padding: 20px 24px;
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-  overflow-y: auto;
-}
-
-.grid-top {
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-}
-
-.grid-bottom {
-  display: grid;
-  grid-template-columns: 1fr;
-  gap: 16px;
-  flex: 1;
-}
-</style>

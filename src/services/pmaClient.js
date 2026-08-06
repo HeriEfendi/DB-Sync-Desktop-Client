@@ -25,6 +25,7 @@ export class PmaClient {
     this.primaryKey = config.primaryKey || 'id';
     this.cookieHeader = '';
     this.token = '';
+    this._columnCache = new Map();
   }
 
   /**
@@ -34,6 +35,42 @@ export class PmaClient {
     const base = this.activeBaseUrl || this.baseUrl;
     if (!path) return base;
     return `${base}/${path.replace(/^\//, '')}`;
+  }
+
+  updateCookies(responseHeaders) {
+    if (!responseHeaders) return;
+
+    let setCookieHeaders = [];
+    if (typeof responseHeaders.getSetCookie === 'function') {
+      setCookieHeaders = responseHeaders.getSetCookie();
+    } else {
+      const raw = responseHeaders.get('set-cookie');
+      if (raw) {
+        setCookieHeaders = raw.split(/,\s*(?=[A-Za-z0-9_%\-]+=[^;]+)/);
+      }
+    }
+
+    const currentMap = new Map();
+    if (this.cookieHeader) {
+      this.cookieHeader.split(';').forEach((pair) => {
+        const [k, v] = pair.split('=').map((s) => s.trim());
+        if (k && v) currentMap.set(k, v);
+      });
+    }
+
+    for (const headerStr of setCookieHeaders) {
+      const firstPair = headerStr.split(';')[0].trim();
+      const eqIdx = firstPair.indexOf('=');
+      if (eqIdx > 0) {
+        const k = firstPair.slice(0, eqIdx).trim();
+        const v = firstPair.slice(eqIdx + 1).trim();
+        if (k && v) currentMap.set(k, v);
+      }
+    }
+
+    const merged = [];
+    currentMap.forEach((v, k) => merged.push(`${k}=${v}`));
+    this.cookieHeader = merged.join('; ');
   }
 
   /**
@@ -75,24 +112,18 @@ export class PmaClient {
       }
 
       this.token = this.extractTokenFromHtml(initHtml);
-
-      // Extract set-cookie if available
-      const setCookie = initRes.headers.get('set-cookie');
-      if (setCookie) {
-        this.cookieHeader = setCookie.split(';')[0];
-      }
+      this.updateCookies(initRes.headers);
 
       // Step 2: If credentials provided, attempt PMA Login POST
       if (this.username) {
-        const loginUrl = this.getEndpoint('index.php?route=/login') || initUrl;
+        const loginUrl = this.getEndpoint('index.php?route=/login') || currentUrl;
         const formData = new URLSearchParams();
         formData.append('pma_username', this.username);
         formData.append('pma_password', this.password);
         formData.append('server', '1');
         formData.append('target', 'index.php');
-        if (this.token) {
-          formData.append('token', this.token);
-        }
+        if (this.database) formData.append('db', this.database);
+        if (this.token) formData.append('token', this.token);
 
         const headers = {
           'Content-Type': 'application/x-www-form-urlencoded',
@@ -102,18 +133,25 @@ export class PmaClient {
           headers['Cookie'] = this.cookieHeader;
         }
 
-        const loginRes = await safeFetch(loginUrl, {
+        let loginRes = await safeFetch(loginUrl, {
           method: 'POST',
           headers,
           body: formData.toString(),
         });
 
-        const loginSetCookie = loginRes.headers.get('set-cookie');
-        if (loginSetCookie) {
-          this.cookieHeader = loginSetCookie.split(';')[0];
+        // Fallback POST to index.php if route=/login fails
+        let loginHtml = await loginRes.text();
+        if (loginHtml.includes('404') || loginHtml.includes('Cannot POST') || !loginRes.ok) {
+          const altLoginUrl = this.getEndpoint('index.php');
+          loginRes = await safeFetch(altLoginUrl, {
+            method: 'POST',
+            headers,
+            body: formData.toString(),
+          });
+          loginHtml = await loginRes.text();
         }
 
-        const loginHtml = await loginRes.text();
+        this.updateCookies(loginRes.headers);
         const newToken = this.extractTokenFromHtml(loginHtml);
         if (newToken) {
           this.token = newToken;
@@ -136,92 +174,146 @@ export class PmaClient {
   extractTokenFromHtml(html) {
     if (!html) return '';
     const tokenMatch = html.match(/name=["']token["']\s+value=["']([^"']+)["']/i) ||
+                       html.match(/value=["']([^"']+)["']\s+name=["']token["']/i) ||
                        html.match(/["']token["']:\s*["']([^"']+)["']/i) ||
+                       html.match(/token=([a-zA-Z0-9_-]{16,})/i) ||
                        html.match(/pma_token\s*=\s*["']([^"']+)["']/i);
     return tokenMatch ? tokenMatch[1] : '';
   }
 
   /**
    * Fetch list of tables existing in remote PMA database.
-   * Tries multiple PMA endpoints/methods to ensure compatibility with different PMA versions.
+   * Uses the structure endpoint as the primary metadata source and falls back to SQL-backed discovery only when needed.
    */
   async fetchTablesList() {
     if (!this.database) {
       throw new Error('Nama database remote PMA belum dikonfigurasi.');
     }
 
-    // Strategy 1: SHOW TABLES via AJAX SQL endpoint
+    // Strict MySQL table name validator: [a-zA-Z_][a-zA-Z0-9_]{1,63}
+    const isValidTableName = (name) => {
+      if (!name || typeof name !== 'string') return false;
+      const n = name.trim();
+      if (n.length < 2 || n.length > 64) return false;
+      if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(n)) return false;
+      const reserved = new Set([
+        'phpmyadmin', 'index', 'true', 'false', 'select', 'structure',
+        'sql', 'export', 'import', 'checkall', 'select_all', 'uncheck_all',
+        'none', 'null', 'yes', 'no', 'ok', 'on', 'off', 'go',
+        'db', 'server', 'action', 'table', 'view', 'all', 'new',
+        'ansi', 'db2', 'maxdb', 'mssql', 'mysql323', 'mysql40', 'oracle',
+        'traditional', 'insert', 'replace', 'update', 'structure_and_data',
+        'texytext', 'textext', 'toon', 'win', 'xml', 'yaml', 'zip',
+        'gzip', 'bzip2', 'codegen', 'csv', 'excel', 'htmldir', 'htmlword',
+        'json', 'latex', 'mediawiki', 'ods', 'odt', 'pdf', 'phparray',
+        'shift_jis', 'sjis', 'utf8', 'utf8mb4', 'latin1', 'ascii',
+        'quick', 'custom', 'quick_export', 'sendit', 'asfile',
+      ]);
+      return !reserved.has(n.toLowerCase());
+    };
+
     let rawRows = [];
-    let lastError = null;
 
-    const sqlQuery = `SHOW TABLES FROM \`${this.database}\``;
+    // Ambil metadata langsung dari MySQL melalui endpoint query PMA.
+    const escapedDb = this.database.replace(/`/g, '``').replace(/'/g, "''");
+    const infoQuery = `SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = '${escapedDb}' ORDER BY TABLE_NAME LIMIT 100000`;
+
     try {
-      rawRows = await this.executePmaAjaxSql(sqlQuery);
-    } catch (err) {
-      lastError = err;
-      console.warn('[fetchTablesList] AJAX SQL failed:', err.message);
-    }
-
-    // Strategy 2: Fallback via database structure route (returns tbl_info JSON in PMA6+)
-    if (!rawRows || rawRows.length === 0) {
-      try {
-        const structUrl = this.getEndpoint(`index.php?route=/database/structure&db=${encodeURIComponent(this.database)}&ajax_request=true`);
-        const headers = {
-          'X-Requested-With': 'XMLHttpRequest',
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-        };
-        if (this.cookieHeader) headers['Cookie'] = this.cookieHeader;
-
-        const res = await safeFetch(structUrl, { method: 'GET', headers });
-        const rawText = await res.text();
-
-        // Try JSON parse
-        let json = null;
-        try { json = JSON.parse(rawText); } catch (_) {}
-
-        if (json) {
-          // PMA6 database/structure returns tbl_group or message with HTML
-          if (json.message) {
-            rawRows = this._extractTablesFromStructureHtml(json.message);
-          } else if (Array.isArray(json.tables)) {
-            rawRows = json.tables.map((t) => ({ table_name: typeof t === 'string' ? t : (t.Name || t.TABLE_NAME || '') }));
+      rawRows = await this.executePmaAjaxSql(infoQuery);
+      if (rawRows && rawRows.length > 0 && rawRows.length % 250 === 0) {
+        let offset = rawRows.length;
+        while (offset % 250 === 0) {
+          const pagedQuery = `SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = '${escapedDb}' ORDER BY TABLE_NAME LIMIT 1000 OFFSET ${offset}`;
+          try {
+            const nextRows = await this.executePmaAjaxSql(pagedQuery);
+            if (!nextRows || nextRows.length === 0) break;
+            const countBefore = rawRows.length;
+            rawRows.push(...nextRows);
+            if (rawRows.length === countBefore) break;
+            offset = rawRows.length;
+          } catch (_) {
+            break;
           }
         }
+      }
+    } catch (err) {
+      console.warn('[fetchTablesList] information_schema query failed:', err.message);
+    }
 
-        if (!rawRows || rawRows.length === 0) {
-          // Try parsing HTML directly
-          rawRows = this._extractTablesFromStructureHtml(rawText);
-        }
+    if (!rawRows || rawRows.length === 0) {
+      try {
+        rawRows = await this.executePmaAjaxSql(`SHOW TABLES FROM \`${escapedDb}\``);
       } catch (err) {
-        console.warn('[fetchTablesList] Structure route failed:', err.message);
+        console.warn('[fetchTablesList] SHOW TABLES query failed:', err.message);
       }
     }
 
-    // Strategy 3: INFORMATION_SCHEMA query as last resort
     if (!rawRows || rawRows.length === 0) {
       try {
-        const infoQuery = `SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = '${this.database}' ORDER BY TABLE_NAME`;
-        rawRows = await this.executePmaAjaxSql(infoQuery);
+        const candidateUrls = [
+          this.getEndpoint(`index.php?route=/database/export&db=${encodeURIComponent(this.database)}`),
+          this.getEndpoint(`export.php?db=${encodeURIComponent(this.database)}`),
+          this.getEndpoint(`index.php?route=/database/structure&db=${encodeURIComponent(this.database)}`),
+          this.getEndpoint(`index.php?db=${encodeURIComponent(this.database)}`),
+        ];
+
+        const headers = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' };
+        if (this.cookieHeader) headers.Cookie = this.cookieHeader;
+
+        const tableNames = new Set();
+        for (const url of candidateUrls) {
+          try {
+            const databaseRes = await safeFetch(url, { method: 'GET', headers });
+            const databaseHtml = await databaseRes.text();
+
+            // Pattern 1: data-table="table_name" — most reliable
+            for (const match of databaseHtml.matchAll(/data-table="([^"]+)"/gi)) {
+              if (isValidTableName(match[1])) tableNames.add(match[1].trim());
+            }
+
+            // Pattern 2: options inside <select name="table_select[]"> block
+            const tableSelectMatch = databaseHtml.match(/<select[^>]*name=["']table_select[^"']*["'][^>]*>([\s\S]*?)<\/select>/i);
+            if (tableSelectMatch && tableSelectMatch[1]) {
+              for (const match of tableSelectMatch[1].matchAll(/value=["']([^"']+)["']/gi)) {
+                if (isValidTableName(match[1])) tableNames.add(match[1].trim());
+              }
+            }
+
+            // Pattern 3: selected_tbl / table_select / table_structure checkboxes
+            for (const match of databaseHtml.matchAll(/(?:selected_tbl|table_select|table_structure|table_data)[^>]*value=["']([^"']+)["']/gi)) {
+              if (isValidTableName(match[1])) tableNames.add(match[1].trim());
+            }
+
+            // Pattern 4: table= in query strings
+            for (const match of databaseHtml.matchAll(/[?&](?:table|dbtable)=([a-zA-Z_][a-zA-Z0-9_]*)/gi)) {
+              if (isValidTableName(match[1])) tableNames.add(match[1].trim());
+            }
+
+            if (tableNames.size > 0) break;
+          } catch (e) {
+            console.warn(`[fetchTablesList] URL ${url} failed:`, e.message);
+          }
+        }
+
+        rawRows = Array.from(tableNames, (table_name) => ({ table_name }));
       } catch (err) {
-        console.warn('[fetchTablesList] information_schema fallback failed:', err.message);
-        if (lastError) throw new Error(`Gagal mengambil daftar tabel: ${lastError.message}`);
+        console.warn('[fetchTablesList] database page fallback failed:', err.message);
       }
     }
 
     if (!rawRows || !Array.isArray(rawRows)) return [];
 
-    // Extract table names from various response shapes
     const tables = [];
     for (const row of rawRows) {
+      let value = null;
       if (typeof row === 'string') {
-        tables.push(row);
+        value = row;
       } else if (row && typeof row === 'object') {
-        // Try all common field names for table names
-        const val = row.TABLE_NAME ?? row.table_name ?? row.Tables_in_db
-          ?? Object.values(row)[0] ?? null;
-        if (val && typeof val === 'string' && val.trim()) {
-          tables.push(val.trim());
-        }
+        value = row.TABLE_NAME ?? row.table_name ?? row.Tables_in_db ?? row.Name ?? row.name ?? null;
+      }
+
+      if (isValidTableName(value)) {
+        tables.push(value.trim());
       }
     }
 
@@ -229,24 +321,129 @@ export class PmaClient {
   }
 
   /**
-   * Extract table names from PMA database structure HTML page
+   * Extract table names from PMA database structure JSON payload.
    */
-  _extractTablesFromStructureHtml(html) {
-    if (!html) return [];
-    const parser = new DOMParser();
-    const doc = parser.parseFromString(html, 'text/html');
+  _extractTablesFromStructureJson(payload) {
     const tables = [];
-
-    // PMA structure page has table links or rows with table names
-    const anchors = doc.querySelectorAll('th.tbl_name a, td a[href*="table="], .tableName');
-    anchors.forEach((a) => {
-      const name = a.textContent.trim();
-      if (name && !name.includes(' ') && name.length > 0) {
-        tables.push(name);
+    const walk = (value) => {
+      if (!value) return;
+      if (Array.isArray(value)) {
+        value.forEach(walk);
+        return;
       }
-    });
+      if (typeof value !== 'object') return;
 
-    return tables.map((t) => ({ table_name: t }));
+      const directName = value.table_name || value.TABLE_NAME || value.Name || value.name || value.Table || value.table || null;
+      if (typeof directName === 'string' && directName.trim()) {
+        tables.push(directName.trim());
+      }
+
+      for (const key of Object.keys(value)) {
+        const nested = value[key];
+        if (key === 'tables' || key === 'tbl_group' || key === 'data' || key === 'rows' || key === 'results' || key === 'items') {
+          walk(nested);
+        } else if (nested && typeof nested === 'object') {
+          walk(nested);
+        }
+      }
+    };
+
+    walk(payload);
+    return Array.from(new Set(tables)).map((t) => ({ table_name: t }));
+  }
+
+  /**
+   * Resolve the actual primary key column for a table from PMA information_schema.
+   * Returns the configured fallback if metadata lookup fails.
+   */
+  async resolvePrimaryKey(tableName) {
+    if (!this.database || !tableName) {
+      return this.primaryKey || null;
+    }
+
+    const escapedDb = this.database.replace(/'/g, "''");
+    const escapedTable = tableName.replace(/'/g, "''");
+    const pkQuery = `SELECT COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA = '${escapedDb}' AND TABLE_NAME = '${escapedTable}' AND CONSTRAINT_NAME = 'PRIMARY' ORDER BY ORDINAL_POSITION ASC LIMIT 1`;
+
+    try {
+      const rows = await this.executePmaAjaxSql(pkQuery);
+      const pk = this._extractPrimaryKeyName(rows);
+      if (pk) return pk;
+    } catch (err) {
+      console.warn('[PMA] resolvePrimaryKey via AJAX failed:', err.message);
+    }
+
+    return this.primaryKey || null;
+  }
+
+  /**
+   * Resolve stable table column names from information_schema to keep SQL fragment explicit and lightweight.
+   */
+  async resolveTableColumns(tableName) {
+    if (!this.database || !tableName) return [];
+
+    const safeTableName = String(tableName).trim();
+    if (this._columnCache.has(safeTableName)) {
+      return this._columnCache.get(safeTableName);
+    }
+
+    const escapedDb = this.database.replace(/'/g, "''");
+    const escapedTable = safeTableName.replace(/'/g, "''");
+    const columnsQuery = `SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = '${escapedDb}' AND TABLE_NAME = '${escapedTable}' ORDER BY ORDINAL_POSITION ASC`;
+    const showColumnsQuery = `SHOW COLUMNS FROM \`${escapedTable}\``;
+
+    let resolvedCols = [];
+
+    try {
+      const rows = await this.executePmaAjaxSql(columnsQuery);
+      const cols = [];
+      for (const row of rows) {
+        const colName = row.COLUMN_NAME ?? row.column_name ?? row.Field ?? row.field ?? row.name ?? null;
+        if (typeof colName === 'string' && colName.trim()) {
+          cols.push(colName.trim());
+        }
+      }
+      if (cols.length > 0) {
+        resolvedCols = cols;
+      }
+    } catch (err) {
+      console.warn('[PMA] resolveTableColumns via information_schema failed:', err.message);
+    }
+
+    if (resolvedCols.length === 0) {
+      try {
+        const rows = await this.executePmaAjaxSql(showColumnsQuery);
+        const cols = [];
+        for (const row of rows) {
+          const colName = row.COLUMN_NAME ?? row.column_name ?? row.Field ?? row.field ?? row.name ?? null;
+          if (typeof colName === 'string' && colName.trim()) {
+            cols.push(colName.trim());
+          }
+        }
+        if (cols.length > 0) {
+          resolvedCols = cols;
+        }
+      } catch (err) {
+        console.warn('[PMA] resolveTableColumns via SHOW COLUMNS failed:', err.message);
+      }
+    }
+
+    if (resolvedCols.length > 0) {
+      this._columnCache.set(safeTableName, resolvedCols);
+    }
+
+    return resolvedCols;
+  }
+
+  _extractPrimaryKeyName(rows) {
+    if (!Array.isArray(rows)) return null;
+    for (const row of rows) {
+      const val = row.COLUMN_NAME ?? row.column_name ?? row.Field ?? row.field ?? row.name ?? null;
+      if (typeof val === 'string' && val.trim()) {
+        return val.trim();
+      }
+    }
+    return null;
   }
 
   /**
@@ -257,31 +454,28 @@ export class PmaClient {
       throw new Error('Nama database dan tabel remote PMA belum dikonfigurasi.');
     }
 
+    const columns = await this.resolveTableColumns(this.table);
+    if (!Array.isArray(columns) || columns.length === 0) {
+      throw new Error(`Tidak dapat mengekstrak metadata kolom tabel '${this.table}' untuk query incremental yang aman.`);
+    }
+
+    const selectClause = columns.map((col) => `\`${col}\``).join(', ');
+
     let sqlQuery = '';
-    if (lastId !== null && lastId !== undefined && lastId !== '') {
-      const formattedLastId = typeof lastId === 'number' ? lastId : `'${lastId}'`;
-      sqlQuery = `SELECT * FROM \`${this.table}\` WHERE \`${this.primaryKey}\` > ${formattedLastId} ORDER BY \`${this.primaryKey}\` ASC LIMIT ${limit}`;
+    if (this.primaryKey && typeof this.primaryKey === 'string' && this.primaryKey.trim()) {
+      if (lastId !== null && lastId !== undefined && lastId !== '') {
+        const formattedLastId = typeof lastId === 'number' ? lastId : `'${lastId}'`;
+        sqlQuery = `SELECT ${selectClause} FROM \`${this.table}\` WHERE \`${this.primaryKey}\` > ${formattedLastId} ORDER BY \`${this.primaryKey}\` ASC LIMIT ${limit}`;
+      } else {
+        sqlQuery = `SELECT ${selectClause} FROM \`${this.table}\` ORDER BY \`${this.primaryKey}\` ASC LIMIT ${limit}`;
+      }
     } else {
-      sqlQuery = `SELECT * FROM \`${this.table}\` ORDER BY \`${this.primaryKey}\` ASC LIMIT ${limit}`;
+      sqlQuery = `SELECT ${selectClause} FROM \`${this.table}\` LIMIT ${limit}`;
     }
 
     console.debug('[PMA] fetchIncrementalData SQL:', sqlQuery);
-
-    // Try Export method first (returns structured JSON directly)
-    try {
-      const jsonExportData = await this.executePmaJsonExport(sqlQuery);
-      if (jsonExportData && Array.isArray(jsonExportData) && jsonExportData.length > 0) {
-        console.debug(`[PMA] fetchIncrementalData via JSON Export: ${jsonExportData.length} rows`);
-        return jsonExportData;
-      }
-      console.debug('[PMA] JSON Export returned empty/null, falling back to AJAX SQL...');
-    } catch (e) {
-      console.warn('[PMA] JSON Export fallback needed, attempting AJAX SQL endpoint:', e.message);
-    }
-
-    // Fallback to AJAX SQL Query execution
     const ajaxResult = await this.executePmaAjaxSql(sqlQuery);
-    console.debug(`[PMA] fetchIncrementalData via AJAX SQL: ${ajaxResult?.length ?? 0} rows`);
+    console.debug(`[PMA] fetchIncrementalData via /sql: ${ajaxResult?.length ?? 0} rows`);
     return ajaxResult;
   }
 
@@ -294,60 +488,27 @@ export class PmaClient {
       throw new Error('Nama database dan tabel remote PMA belum dikonfigurasi.');
     }
 
-    const safeTs = sinceTimestamp.replace(/'/g, "''");
-    const sqlQuery = `SELECT * FROM \`${this.table}\` WHERE \`updated_at\` > '${safeTs}' ORDER BY \`updated_at\` ASC LIMIT ${limit} OFFSET ${offsetRows}`;
-
-    console.debug('[PMA] fetchUpdatedRows SQL:', sqlQuery);
-
-    try {
-      const jsonExportData = await this.executePmaJsonExport(sqlQuery);
-      if (jsonExportData && Array.isArray(jsonExportData) && jsonExportData.length > 0) {
-        return jsonExportData;
-      }
-    } catch (e) {
-      console.warn('[PMA] fetchUpdatedRows JSON Export failed, trying AJAX:', e.message);
+    if (sinceTimestamp === null || sinceTimestamp === undefined || sinceTimestamp === '') {
+      return [];
     }
 
+    const safeTs = String(sinceTimestamp).replace(/'/g, "''");
+    const columns = await this.resolveTableColumns(this.table);
+    if (!Array.isArray(columns) || columns.length === 0) {
+      return [];
+    }
+
+    const selectClause = columns.map((col) => `\`${col}\``).join(', ');
+    const sqlQuery = `SELECT ${selectClause} FROM \`${this.table}\` WHERE \`updated_at\` > '${safeTs}' ORDER BY \`updated_at\` ASC LIMIT ${limit} OFFSET ${offsetRows}`;
+
+    console.debug('[PMA] fetchUpdatedRows SQL:', sqlQuery);
     const ajaxResult = await this.executePmaAjaxSql(sqlQuery);
     return ajaxResult || [];
   }
 
   /**
-   * Execute SQL query via PMA JSON Export route
-   */
-  async executePmaJsonExport(sqlQuery) {
-    const exportUrl = this.getEndpoint('index.php?route=/export') || this.getEndpoint('export.php');
-    
-    const formData = new URLSearchParams();
-    formData.append('db', this.database);
-    formData.append('table', this.table);
-    formData.append('single_table', 'true');
-    formData.append('export_type', 'table');
-    formData.append('export_method', 'quick');
-    formData.append('what', 'json');
-    formData.append('sql_query', sqlQuery);
-    formData.append('knob_sql_query', sqlQuery);
-    if (this.token) formData.append('token', this.token);
-
-    const headers = {
-      'Content-Type': 'application/x-www-form-urlencoded',
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-    };
-    if (this.cookieHeader) headers['Cookie'] = this.cookieHeader;
-
-    const res = await safeFetch(exportUrl, {
-      method: 'POST',
-      headers,
-      body: formData.toString(),
-    });
-
-    const responseText = await res.text();
-    return this.parseJsonExportContent(responseText);
-  }
-
-  /**
    * Execute SQL query via PMA AJAX SQL execution route.
-   * Handles both classic HTML table responses and PMA6+ structured JSON API responses.
+   * Expected response shape is structured JSON from PMA's /sql endpoint.
    */
   async executePmaAjaxSql(sqlQuery) {
     const sqlUrl = this.getEndpoint('index.php?route=/sql');
@@ -355,8 +516,15 @@ export class PmaClient {
     const formData = new URLSearchParams();
     formData.append('db', this.database);
     formData.append('table', this.table || '');
+    formData.append('server', '1');
     formData.append('sql_query', sqlQuery);
+    formData.append('sql_delimiter', ';');
     formData.append('ajax_request', 'true');
+    formData.append('ajax_page_request', 'true');
+    formData.append('submit_query', 'Go');
+    formData.append('session_max_rows', 'all');
+    formData.append('max_rows', '100000');
+    formData.append('limit', '100000');
     formData.append('token', this.token);
 
     const headers = {
@@ -375,177 +543,47 @@ export class PmaClient {
     const rawText = await res.text();
     console.debug('[PMA] executePmaAjaxSql raw response (first 500 chars):', rawText.slice(0, 500));
 
-    // Try parsing as JSON (PMA returns JSON for AJAX calls)
     let resData = null;
     try {
       resData = JSON.parse(rawText);
     } catch (_) {
-      // Not JSON: try to parse HTML table directly
-      return this.parsePmaHtmlTable(rawText);
+      throw new Error('Endpoint /sql PMA tidak mengembalikan format JSON yang didukung untuk query data.');
     }
 
     if (!resData) return [];
 
-    // PMA returns success=false with error message
     if (resData.success === false) {
       const errMsg = resData.error || resData.message || 'Unknown PMA error';
-      // Strip HTML tags from PMA error strings
       const plainErr = errMsg.replace(/<[^>]*>/g, '').trim();
       throw new Error(plainErr);
     }
 
-    // PMA6+ structured API: fields[] + rows[] format (used for SELECT/SHOW queries)
-    if (Array.isArray(resData.fields) && Array.isArray(resData.rows)) {
-      const fieldNames = resData.fields.map((f) => {
-        const raw = typeof f === 'object' ? (f.name || f.Field || String(f)) : String(f);
-        return cleanFieldName(raw);
-      });
-      return resData.rows.map((row) => {
-        const obj = {};
-        fieldNames.forEach((name, idx) => {
-          obj[name] = Array.isArray(row) ? row[idx] : row[name] ?? null;
+    const normalizeRows = (payload) => {
+      if (!payload) return [];
+      if (Array.isArray(payload)) return payload;
+      if (Array.isArray(payload.fields) && Array.isArray(payload.rows)) {
+        const names = payload.fields.map((field) => cleanFieldName(
+          typeof field === 'object' ? (field.name || field.Name || field.Field || '') : String(field)
+        ));
+        return payload.rows.map((row) => {
+          if (!Array.isArray(row)) return row;
+          return Object.fromEntries(names.map((name, index) => [name, row[index] ?? null]));
         });
-        return obj;
-      });
-    }
+      }
+      for (const value of Object.values(payload)) {
+        if (value && typeof value === 'object') {
+          const rows = normalizeRows(value);
+          if (rows.length) return rows;
+        }
+      }
+      return [];
+    };
 
-    // PMA classic: message contains HTML table
-    if (resData.message) {
-      return this.parsePmaHtmlTable(resData.message);
-    }
-
-    // PMA sometimes returns resultset as array directly
-    if (Array.isArray(resData)) return resData;
+    const normalizedRows = normalizeRows(resData);
+    if (normalizedRows.length) return normalizedRows;
 
     console.warn('[PMA] executePmaAjaxSql: unrecognized response shape', Object.keys(resData));
     return [];
   }
 
-  /**
-   * Parse PMA JSON Export response payload
-   */
-  parseJsonExportContent(content) {
-    if (!content) return [];
-    
-    try {
-      const parsed = JSON.parse(content);
-      if (Array.isArray(parsed)) {
-        let rows = [];
-        for (const item of parsed) {
-          if (item && (item.type === 'header' || item.type === 'database')) continue;
-          if (item && item.type === 'table' && Array.isArray(item.data)) {
-            rows.push(...item.data);
-          } else if (item && typeof item === 'object' && !item.type) {
-            rows.push(item);
-          }
-        }
-        return rows.length > 0 ? rows : parsed.filter((i) => !i.type);
-      }
-      if (typeof parsed === 'object') {
-        for (const key of Object.keys(parsed)) {
-          if (Array.isArray(parsed[key])) {
-            return parsed[key];
-          }
-        }
-      }
-    } catch (_) {
-      const match = content.match(/\[\s*\{.*\}\s*\]/s);
-      if (match) {
-        return JSON.parse(match[0]);
-      }
-    }
-    return [];
-  }
-
-  /**
-   * Parse HTML Table from PMA AJAX response into array of JSON objects
-   * Uses direct td data-column-name attributes for precision column matching.
-   */
-  parsePmaHtmlTable(html) {
-    if (!html) return [];
-
-    const parser = new DOMParser();
-    const doc = parser.parseFromString(html, 'text/html');
-
-    const table = doc.querySelector('table.table_results') || doc.querySelector('table');
-    if (!table) return [];
-
-    // Map column names from <thead> th elements
-    const headerColsMap = [];
-    const headerThs = table.querySelectorAll('thead tr th, tr:first-child th');
-    headerThs.forEach((th) => {
-      let colName = th.getAttribute('data-column-name');
-      if (!colName) {
-        const anchor = th.querySelector('a');
-        if (anchor) colName = anchor.textContent.trim();
-      }
-      if (!colName) {
-        const firstText = [...th.childNodes].find((n) => n.nodeType === Node.TEXT_NODE && n.textContent.trim());
-        if (firstText) colName = firstText.textContent.trim();
-      }
-      if (colName) {
-        colName = cleanFieldName(colName);
-      }
-      if (colName && !['Edit', 'Copy', 'Delete', ''].includes(colName)) {
-        headerColsMap.push(colName);
-      } else {
-        headerColsMap.push(null);
-      }
-    });
-
-    const validHeaders = headerColsMap.filter(Boolean);
-    const rows = [];
-    const trElements = table.querySelectorAll('tbody tr, tr.odd, tr.even');
-
-    trElements.forEach((tr) => {
-      const cells = tr.querySelectorAll('td');
-      if (cells.length === 0) return;
-
-      const rowObj = {};
-      let fallbackColIdx = 0;
-
-      cells.forEach((td, cellIdx) => {
-        if (td.classList.contains('edit_row_anchor') ||
-            td.classList.contains('select_row') ||
-            td.classList.contains('del_row')) {
-          return;
-        }
-
-        // Prioritas 1: Ambil nama kolom langsung dari atribut data-column-name sel td!
-        let key = td.getAttribute('data-column-name');
-        if (key) {
-          key = cleanFieldName(key);
-        }
-
-        // Prioritas 2: Pemetaan dari index sel jika data-column-name tidak ada pada td
-        if (!key && cellIdx < headerColsMap.length) {
-          key = headerColsMap[cellIdx];
-        }
-
-        // Prioritas 3: Fallback urutan validHeaders
-        if (!key && fallbackColIdx < validHeaders.length) {
-          key = validHeaders[fallbackColIdx];
-        }
-
-        if (key && !['Edit', 'Copy', 'Delete', ''].includes(key)) {
-          let val = td.innerText.trim();
-          if (val === 'NULL' || val === 'null') {
-            val = null;
-          } else if (/^-?\d+$/.test(val)) {
-            val = parseInt(val, 10);
-          } else if (/^-?\d+\.\d+$/.test(val)) {
-            val = parseFloat(val);
-          }
-          rowObj[key] = val;
-          fallbackColIdx++;
-        }
-      });
-
-      if (Object.keys(rowObj).length > 0) {
-        rows.push(rowObj);
-      }
-    });
-
-    return rows;
-  }
 }

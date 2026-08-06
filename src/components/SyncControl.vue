@@ -1,11 +1,10 @@
 <template>
   <div class="glass-panel sync-control-card">
     <div class="control-grid">
-      <!-- Main Trigger Action -->
       <div class="main-action">
         <button
           v-if="!isSyncing"
-          class="btn btn-primary btn-lg"
+          class="btn btn-primary btn-sm"
           @click="$emit('start-sync')"
         >
           <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
@@ -18,7 +17,7 @@
 
         <button
           v-else
-          class="btn btn-danger btn-lg btn-stop"
+          class="btn btn-danger btn-sm btn-stop"
           title="Klik untuk menghentikan sinkronisasi saat ini. Data yang sudah masuk tetap tersimpan."
           @click="$emit('stop-sync')"
         >
@@ -28,7 +27,6 @@
           <span class="btn-text">Hentikan Sinkronisasi</span>
         </button>
 
-        <!-- Auto Sync Timer Select -->
         <div class="auto-sync-box">
           <label class="auto-sync-label">
             <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
@@ -38,7 +36,7 @@
             :value="autoSyncInterval"
             class="form-select interval-select"
             @change="$emit('update:autoSyncInterval', parseInt($event.target.value, 10))"
-          >
+          > 
             <option :value="0">Non-Aktif (Manual)</option>
             <option :value="5">Setiap 5 Detik</option>
             <option :value="10">Setiap 10 Detik</option>
@@ -49,7 +47,6 @@
         </div>
       </div>
 
-      <!-- Live Sync Statistics -->
       <div class="stats-grid">
         <div class="stat-card" :class="{ 'stat-highlight': isSyncing }">
           <span class="stat-value text-emerald">
@@ -77,19 +74,50 @@
       </div>
     </div>
 
-    <!-- Active Sync Live Progress Status Info -->
+    <div class="sync-settings-box">
+      <div class="sync-settings-row">
+        <div class="option-inline">
+          <span class="option-title">Mode:</span>
+          <label class="radio-label-inline" title="Tarik ID baru yang belum ada di lokal, dan update baris jika updated_at di server lebih baru">
+            <input type="radio" name="syncMode" value="incremental" :checked="syncMode === 'incremental'" @change="$emit('update:syncMode', 'incremental')" />
+            <span>Sync (New &amp; Update)</span>
+          </label>
+          <label class="radio-label-inline warning-radio">
+            <input type="radio" name="syncMode" value="fresh" :checked="syncMode === 'fresh'" @change="$emit('update:syncMode', 'fresh')" />
+            <span>Fresh Sync</span>
+          </label>
+        </div>
+
+        <div class="option-inline">
+          <span class="option-title">Limit:</span>
+          <select
+            :value="rowLimit"
+            class="form-select interval-select"
+            @change="$emit('update:rowLimit', parseInt($event.target.value, 10))"
+          >
+            <option :value="0">Semua Row (Default)</option>
+            <option :value="1000">1.000 Row</option>
+            <option :value="10000">10.000 Row</option>
+            <option :value="100000">100.000 Row</option>
+            <option :value="500000">500.000 Row</option>
+            <option :value="2000000">2.000.000 Row</option>
+          </select>
+        </div>
+      </div>
+    </div>
+
     <div v-if="isSyncing" class="sync-live-banner">
-      <div class="live-indicator">
-        <span class="live-dot"></span>
-        <span class="live-text">
-          Menyinkronkan {{ syncProgress.currentTableIndex }}/{{ syncProgress.totalTables }} tabel
-          <strong v-if="syncProgress.currentTableName">('{{ syncProgress.currentTableName }}')</strong>:
-          <span class="text-emerald">{{ formatNumber(syncProgress.rowsSyncedCurrentTable) }} baris</span> tabel ini dimasukkan (Total Session: <strong>{{ formatNumber(syncProgress.totalSyncedAllTables) }}</strong> baris).
+      <div class="sync-live-content">
+        <span class="pulse-dot"></span>
+        <span class="live-status-text">
+          Menyinkronkan <strong class="badge-accent">{{ syncProgress.currentTableIndex }}/{{ syncProgress.totalTables }}</strong> tabel
+          <strong v-if="syncProgress.currentTableName" class="badge-tableName">'{{ syncProgress.currentTableName }}'</strong>:
+          <span class="text-emerald font-bold">{{ formatNumber(syncProgress.rowsSyncedCurrentTable) }} baris</span> dimasukkan
+          (Total Session: <strong class="text-white">{{ formatNumber(syncProgress.totalSyncedAllTables) }}</strong> baris).
         </span>
       </div>
     </div>
 
-    <!-- Active Sync Progress Bar -->
     <div v-if="isSyncing" class="progress-bar-container">
       <div
         class="progress-bar-fill"
@@ -100,9 +128,11 @@
 </template>
 
 <script setup>
-defineProps({
+const props = defineProps({
   isSyncing: { type: Boolean, default: false },
   autoSyncInterval: { type: Number, default: 0 },
+  syncMode: { type: String, default: 'incremental' },
+  rowLimit: { type: Number, default: 0 },
   stats: {
     type: Object,
     default: () => ({
@@ -124,7 +154,7 @@ defineProps({
   },
 });
 
-defineEmits(['start-sync', 'stop-sync', 'update:autoSyncInterval']);
+const emit = defineEmits(['start-sync', 'stop-sync', 'update:autoSyncInterval', 'update:syncMode', 'update:rowLimit']);
 
 const formatNumber = (val) => {
   if (val === null || val === undefined || isNaN(val)) return '0';
@@ -134,11 +164,11 @@ const formatNumber = (val) => {
 const formatDuration = (ms) => {
   if (!ms || isNaN(ms)) return '-';
   if (ms < 1000) return `${ms}ms`;
-  
+
   const totalSec = Math.floor(ms / 1000);
   const minutes = Math.floor(totalSec / 60);
   const seconds = totalSec % 60;
-  
+
   if (minutes === 0) {
     return `${seconds}d`;
   }
@@ -148,9 +178,13 @@ const formatDuration = (ms) => {
 
 <style scoped>
 .sync-control-card {
-  padding: 18px 24px;
+  padding: 18px 24px 22px;
   position: relative;
   overflow: hidden;
+  min-height: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
 }
 
 .btn-danger {
@@ -172,15 +206,17 @@ const formatDuration = (ms) => {
   justify-content: space-between;
   align-items: center;
   gap: 24px;
+  flex-wrap: wrap;
 }
 
 .main-action {
   display: flex;
   align-items: center;
   gap: 16px;
+  flex-wrap: wrap;
 }
 
-.btn-lg {
+.btn-sm {
   padding: 12px 24px;
   font-size: 0.95rem;
   border-radius: var(--radius-md);
@@ -210,16 +246,87 @@ const formatDuration = (ms) => {
   width: auto;
   border: none;
   background: transparent;
-  color: #111827;
+  color: #edf0f7;
 }
 
 .interval-select option {
   color: #111827;
+  background: #ffffff;
+}
+
+.sync-settings-box {
+  background: rgba(15, 23, 42, 0.5);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  padding: 10px 14px;
+  width: 100%;
+}
+
+.sync-settings-row {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  flex-wrap: wrap;
+}
+
+.option-inline {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.option-title {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.radio-label-inline {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  font-size: 0.82rem;
+  color: var(--text-main);
+  padding: 5px 10px;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.04);
+  white-space: nowrap;
+  transition: all 0.15s ease;
+}
+
+.radio-label-inline:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.radio-label-inline.warning-radio {
+  border-color: rgba(245, 158, 11, 0.3);
+}
+
+.limit-select {
+  padding: 6px 12px;
+  font-size: 0.8rem;
+  width: auto;
+  min-width: 160px;
+  max-width: 260px;
+  color: #edf0f7;
+  background: rgba(16, 18, 23, 0.8);
+}
+
+.limit-select option {
+  color: #111827;
+  background: #ffffff;
 }
 
 .stats-grid {
   display: flex;
-  gap: 16px;
+  gap: 14px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  align-items: stretch;
 }
 
 .stat-card {
@@ -259,39 +366,58 @@ const formatDuration = (ms) => {
 .text-emerald { color: var(--accent-emerald); }
 .text-cyan { color: var(--accent-cyan); }
 .text-amber { color: var(--accent-amber); }
-
-.spin-lg {
-  width: 18px;
-  height: 18px;
-  border: 3px solid rgba(255, 255, 255, 0.3);
-  border-top-color: white;
-  border-radius: 50%;
-  animation: spin 0.8s linear infinite;
-}
+.text-white { color: #ffffff; }
+.font-bold { font-weight: 600; }
 
 .sync-live-banner {
-  margin-top: 12px;
-  padding: 8px 12px;
-  background: rgba(15, 23, 42, 0.7);
+  width: 100%;
+  padding: 10px 14px;
+  background: rgba(15, 23, 42, 0.75);
   border-radius: var(--radius-md);
-  border: 1px solid rgba(6, 182, 212, 0.3);
+  border: 1px solid rgba(6, 182, 212, 0.35);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
 }
 
-.live-indicator {
+.sync-live-content {
   display: flex;
   align-items: center;
-  gap: 8px;
-  font-size: 0.82rem;
-  color: var(--text-main);
+  gap: 10px;
+  width: 100%;
+  min-width: 0;
 }
 
-.live-dot {
-  width: 8px;
-  height: 8px;
+.live-status-text {
+  font-size: 0.83rem;
+  color: var(--text-main);
+  line-height: 1.4;
+  word-break: break-word;
+  flex: 1;
+}
+
+.badge-accent {
+  color: var(--accent-cyan);
+  background: rgba(6, 182, 212, 0.15);
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-weight: 600;
+}
+
+.badge-tableName {
+  color: #a7f3d0;
+  background: rgba(16, 185, 129, 0.15);
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-family: 'JetBrains Mono', monospace;
+}
+
+.pulse-dot {
+  width: 9px;
+  height: 9px;
+  flex: 0 0 9px;
   border-radius: 50%;
   background: #10b981;
-  box-shadow: 0 0 8px #10b981;
-  animation: pulse 1.5s infinite;
+  box-shadow: 0 0 10px #10b981;
+  animation: pulse-glow 1.5s infinite;
 }
 
 .progress-bar-container {
@@ -310,13 +436,22 @@ const formatDuration = (ms) => {
   transition: width 0.3s ease;
 }
 
-@keyframes pulse {
-  0%, 100% { opacity: 1; transform: scale(1); }
-  50% { opacity: 0.4; transform: scale(0.85); }
+@keyframes pulse-glow {
+  0%, 100% { opacity: 1; transform: scale(1); box-shadow: 0 0 10px #10b981; }
+  50% { opacity: 0.4; transform: scale(0.85); box-shadow: 0 0 3px #10b981; }
 }
 
-@keyframes spin {
-  100% { transform: rotate(360deg); }
+@media (max-width: 768px) {
+  .control-grid {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .stats-grid {
+    justify-content: space-between;
+  }
+  .stat-card {
+    flex: 1;
+    min-width: 100px;
+  }
 }
 </style>
-
