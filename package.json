@@ -7,7 +7,8 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "release": "node -e \"const v=process.argv[1]; if(!/^\\d+\\.\\d+\\.\\d+$/.test(v||'')){console.error('Usage: npm run release -- 1.0.1'); process.exit(1)}; const {execSync}=require('child_process'); execSync('git tag -a v'+v+' -m \\\"Release v'+v+'\\\" && git push origin v'+v,{stdio:'inherit'})\""
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",

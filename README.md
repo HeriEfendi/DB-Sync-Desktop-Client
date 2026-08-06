@@ -108,17 +108,31 @@ npm run tauri dev
 > **Catatan Mode Browser:**
 > Jika Anda menjalankan `npm run dev`, aplikasi akan terbuka di Web Browser. Namun fitur koneksi native port 3306 MySQL lokal hanya dapat diakses saat dijalankan menggunakan perintah `npm run tauri dev`.
 
-### 3. Build Aplikasi Production Binary
+### 4. Rilis Otomatis Windows & Linux
 
-Untuk membuat file *executable* production (.appImage, .deb, .exe, atau .msi tergantung OS):
+Push tag versi untuk memicu GitHub Actions:
+
+```bash
+npm run release -- 1.0.1
+```
+
+Workflow [release.yml](file:///home/lenovo/www/DB-Sync-Desktop-Client/.github/workflows/release.yml) otomatis:
+
+- Build Linux (`.deb`, `.AppImage` bila didukung runner)
+- Build Windows (`.msi`, `.exe` sesuai konfigurasi Tauri)
+- Membuat GitHub Release
+- Melampirkan installer ke release
+
+GitHub Actions membutuhkan permission repository `Contents: write`.
+
+## Build Lokal
 
 ```bash
 npm run tauri build
 ```
 
-Hasil build executable dapat ditemukan di folder `src-tauri/target/release/bundle/`.
+Hasil build lokal ada di `src-tauri/target/release/bundle/`.
 
----
 
 ## 📁 Struktur Proyek
 
