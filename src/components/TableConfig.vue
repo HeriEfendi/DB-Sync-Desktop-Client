@@ -52,7 +52,22 @@
             :checked="selectedTables.includes(tableName)"
             @change="toggleTableSelection(tableName)"
           />
-          <span class="table-name-text" :title="tableName">{{ tableName }}</span>
+          <div class="table-card-body">
+            <span class="table-name-text" :title="tableName">{{ tableName }}</span>
+            <div class="table-card-meta">
+              <template v-if="getTableState(tableName)">
+                <span class="meta-item">
+                  <span class="meta-label">Last ID:</span>
+                  <strong class="text-amber">{{ getTableState(tableName).lastSyncedId !== null && getTableState(tableName).lastSyncedId !== undefined ? getTableState(tableName).lastSyncedId : '-' }}</strong>
+                </span>
+                <span class="meta-item">
+                  <span class="meta-label">Sync:</span>
+                  <span class="text-muted">{{ formatDate(getTableState(tableName).lastSyncTime) }}</span>
+                </span>
+              </template>
+              <span v-else class="meta-item text-dim">Belum pernah sync</span>
+            </div>
+          </div>
         </label>
       </div>
     </div>
@@ -66,6 +81,7 @@ const props = defineProps({
   selectedTables: { type: Array, default: () => [] },
   availableTables: { type: Array, default: () => [] },
   fetchingTables: { type: Boolean, default: false },
+  syncTableStates: { type: Array, default: () => [] },
 });
 
 const emit = defineEmits([
@@ -73,6 +89,21 @@ const emit = defineEmits([
   'update:availableTables',
   'fetch-tables',
 ]);
+
+const getTableState = (tableName) => {
+  if (!props.syncTableStates || !Array.isArray(props.syncTableStates)) return null;
+  return props.syncTableStates.find((st) => st.table === tableName) || null;
+};
+
+const formatDate = (isoString) => {
+  if (!isoString) return '-';
+  try {
+    const d = new Date(isoString);
+    return d.toLocaleString('id-ID', { dateStyle: 'short', timeStyle: 'short' });
+  } catch {
+    return isoString;
+  }
+};
 
 const tableSearchQuery = ref('');
 const manualTableName = ref('');
@@ -332,15 +363,20 @@ const deleteTableTemplate = () => {
 
 .table-checkbox-card {
   display: flex;
-  align-items: center;
-  gap: 8px;
+  align-items: flex-start;
+  gap: 10px;
   background: rgba(255, 255, 255, 0.04);
   border: 1px solid rgba(255, 255, 255, 0.08);
-  padding: 8px 10px;
+  padding: 10px 12px;
   border-radius: 6px;
   cursor: pointer;
   transition: all 0.15s ease;
   user-select: none;
+}
+
+.table-checkbox-card input[type="checkbox"] {
+  margin-top: 3px;
+  flex-shrink: 0;
 }
 
 .table-checkbox-card:hover {
@@ -353,16 +389,45 @@ const deleteTableTemplate = () => {
   border-color: rgba(56, 189, 248, 0.35);
 }
 
+.table-card-body {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  flex: 1;
+}
+
 .table-name-text {
   display: block;
   font-size: 0.82rem;
+  font-weight: 600;
   font-family: 'JetBrains Mono', monospace;
   color: var(--text-main);
-  white-space: normal;
-  overflow: visible;
-  text-overflow: clip;
   word-break: break-word;
 }
+
+.table-card-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 0.69rem;
+  flex-wrap: wrap;
+}
+
+.meta-item {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.meta-label {
+  color: var(--text-dim);
+  font-size: 0.65rem;
+}
+
+.text-amber { color: var(--accent-amber); }
+.text-muted { color: var(--text-muted); }
+.text-dim { color: var(--text-dim); }
 
 .spin-sm {
   width: 12px;

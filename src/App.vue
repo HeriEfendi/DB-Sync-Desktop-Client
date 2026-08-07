@@ -30,6 +30,7 @@
               v-model:selected-tables="selectedTables"
               v-model:available-tables="availableTables"
               :fetching-tables="fetchingTables"
+              :sync-table-states="tableStates"
               @fetch-tables="fetchTablesFromPma"
             />
 
