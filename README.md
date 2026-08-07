@@ -110,10 +110,10 @@ npm run tauri dev
 
 ### 4. Rilis Otomatis Windows & Linux
 
-Push tag versi untuk memicu GitHub Actions:
+Build lokal lalu push tag versi untuk memicu GitHub Actions:
 
 ```bash
-npm run release -- 1.0.1
+npm run release 0.6.2
 ```
 
 Workflow [release.yml](file:///home/lenovo/www/DB-Sync-Desktop-Client/.github/workflows/release.yml) otomatis:
@@ -126,6 +126,14 @@ Workflow [release.yml](file:///home/lenovo/www/DB-Sync-Desktop-Client/.github/wo
 GitHub Actions membutuhkan permission repository `Contents: write`.
 
 ## Build Lokal
+
+Release otomatis build dulu sebelum membuat tag:
+
+```bash
+npm run release 0.6.2
+```
+
+Build manual tetap tersedia:
 
 ```bash
 npm run tauri build
