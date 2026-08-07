@@ -1,6 +1,6 @@
 [package]
 name = "db-sync-desktop-client"
-version = "0.6.2"
+version = "0.6.4"
 description = "DB-Sync Desktop Client - PMA to Local MySQL/MariaDB"
 authors = ["DB-Sync Team"]
 edition = "2021"

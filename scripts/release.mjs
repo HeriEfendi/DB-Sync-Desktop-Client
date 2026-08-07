@@ -23,7 +23,10 @@ writeFileSync('src-tauri/tauri.conf.json', `${JSON.stringify(tauri, null, 2)}\n`
 const cargoPath = 'src-tauri/Cargo.toml';
 writeFileSync(cargoPath, readFileSync(cargoPath, 'utf8').replace(/^(version\s*=\s*")[^"]+(")/m, `$1${version}$2`));
 process.env.APPIMAGE_EXTRACT_AND_RUN = '1';
-run('npm', ['run', 'tauri', '--', 'build']);
+const buildArgs = process.platform === 'linux'
+  ? ['run', 'tauri', '--', 'build', '--bundles', 'deb,rpm,pacman']
+  : ['run', 'tauri', '--', 'build'];
+run('npm', buildArgs);
 const remotes = execFileSync('git', ['remote'], { encoding: 'utf8' }).trim().split(/\s+/).filter(Boolean);
 const remote = remotes.includes('origin') ? 'origin' : remotes[0];
 if (!remote) throw new Error('No Git remote configured');
