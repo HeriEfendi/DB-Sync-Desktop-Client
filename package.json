@@ -8,7 +8,9 @@
     "build": "vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "release": "node scripts/release.mjs"
+    "release": "node scripts/release.mjs",
+    "build:pacman": "makepkg -sf",
+    "install:pacman": "makepkg -si"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",

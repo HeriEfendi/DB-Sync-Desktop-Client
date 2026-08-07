@@ -22,6 +22,12 @@ tauri.version = version;
 writeFileSync('src-tauri/tauri.conf.json', `${JSON.stringify(tauri, null, 2)}\n`);
 const cargoPath = 'src-tauri/Cargo.toml';
 writeFileSync(cargoPath, readFileSync(cargoPath, 'utf8').replace(/^(version\s*=\s*")[^"]+(")/m, `$1${version}$2`));
+const pkgbuildPath = 'PKGBUILD';
+try {
+  const content = readFileSync(pkgbuildPath, 'utf8');
+  writeFileSync(pkgbuildPath, content.replace(/^(pkgver=)[^\n]+/m, `$1${version}`));
+} catch (e) {}
+
 process.env.APPIMAGE_EXTRACT_AND_RUN = '1';
 const buildArgs = process.platform === 'linux'
   ? ['run', 'tauri', '--', 'build', '--bundles', 'deb,rpm']
@@ -30,7 +36,7 @@ run('npm', buildArgs);
 const remotes = execFileSync('git', ['remote'], { encoding: 'utf8' }).trim().split(/\s+/).filter(Boolean);
 const remote = remotes.includes('origin') ? 'origin' : remotes[0];
 if (!remote) throw new Error('No Git remote configured');
-run('git', ['add', 'package.json', 'package-lock.json', 'src-tauri/tauri.conf.json', 'src-tauri/Cargo.toml', 'src-tauri/Cargo.lock']);
+run('git', ['add', 'package.json', 'package-lock.json', 'src-tauri/tauri.conf.json', 'src-tauri/Cargo.toml', 'src-tauri/Cargo.lock', 'PKGBUILD']);
 run('git', ['commit', '-m', `Release v${version}`]);
 run('git', ['tag', '-a', `v${version}`, '-m', `Release v${version}`]);
 run('git', ['push', remote, 'HEAD']);
