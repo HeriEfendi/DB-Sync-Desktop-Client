@@ -63,3 +63,15 @@ jobs:
           releaseBody: Automatic Windows and Linux build for ${{ github.ref_name }}.
           releaseDraft: false
           prerelease: false
+
+      - name: Create and upload Arch Linux package (.pkg.tar.zst)
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          sudo apt-get install -y zstd
+          VERSION="${GITHUB_REF_NAME#v}"
+          node scripts/create-arch-pkg.mjs "$VERSION"
+          gh release upload "${GITHUB_REF_NAME}" db-sync-desktop-client-*.pkg.tar.zst --clobber
+

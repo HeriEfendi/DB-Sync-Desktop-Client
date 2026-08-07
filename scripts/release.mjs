@@ -28,11 +28,6 @@ try {
   writeFileSync(pkgbuildPath, content.replace(/^(pkgver=)[^\n]+/m, `$1${version}`));
 } catch (e) {}
 
-process.env.APPIMAGE_EXTRACT_AND_RUN = '1';
-const buildArgs = process.platform === 'linux'
-  ? ['run', 'tauri', '--', 'build', '--bundles', 'deb,rpm']
-  : ['run', 'tauri', '--', 'build'];
-run('npm', buildArgs);
 const remotes = execFileSync('git', ['remote'], { encoding: 'utf8' }).trim().split(/\s+/).filter(Boolean);
 const remote = remotes.includes('origin') ? 'origin' : remotes[0];
 if (!remote) throw new Error('No Git remote configured');

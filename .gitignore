@@ -10,6 +10,9 @@ dist-ssr/
 # Tauri & Rust build artifacts
 src-tauri/target/
 src-tauri/gen/
+src/target/
+pkg/
+*.pkg.tar.zst
 
 # Logs & temporary files
 *.log

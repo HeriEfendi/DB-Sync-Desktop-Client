@@ -14,6 +14,7 @@ conflicts=('db-sync-desktop-client')
 build() {
   cd "$startdir"
   npm run build
+  export CARGO_TARGET_DIR="$srcdir/target"
   cargo build --manifest-path src-tauri/Cargo.toml --release
 }
 
@@ -21,7 +22,7 @@ package() {
   cd "$startdir"
   
   # Install binary
-  install -Dm755 "src-tauri/target/release/db-sync-desktop-client" "$pkgdir/usr/bin/db-sync-desktop-client"
+  install -Dm755 "$srcdir/target/release/db-sync-desktop-client" "$pkgdir/usr/bin/db-sync-desktop-client"
   
   # Install desktop application launcher
   install -d "$pkgdir/usr/share/applications"
