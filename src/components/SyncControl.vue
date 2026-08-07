@@ -110,6 +110,45 @@
         class="progress-bar-fill"
         :style="{ width: syncProgress.totalTables > 0 ? `${Math.min(100, (syncProgress.currentTableIndex / syncProgress.totalTables) * 100)}%` : '0%' }"
       ></div>
+    <div v-if="syncTableStates && syncTableStates.length > 0" class="sync-states-card">
+      <div class="states-header">
+        <div class="states-title-wrap">
+          <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 8v4l3 3"></path><circle cx="12" cy="12" r="9"></circle></svg>
+          <span class="states-title">State &amp; ID Sync Terakhir per Tabel</span>
+        </div>
+        <button class="btn btn-ghost btn-xs text-rose" title="Reset semua riwayat sync state" @click="$emit('reset-all-table-states')">
+          Reset Semua State
+        </button>
+      </div>
+      <div class="states-table-wrapper">
+        <table class="states-table">
+          <thead>
+            <tr>
+              <th>Server / DB</th>
+              <th>Tabel</th>
+              <th>Last Synced ID</th>
+              <th>Waktu Sync Terakhir</th>
+              <th>Aksi</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="st in syncTableStates" :key="st.key">
+              <td class="font-mono text-dim">{{ st.server }} / {{ st.database }}</td>
+              <td class="font-mono text-emerald"><strong>{{ st.table }}</strong></td>
+              <td class="font-mono text-amber">
+                <strong>{{ st.lastSyncedId !== null && st.lastSyncedId !== undefined ? st.lastSyncedId : '-' }}</strong>
+                <small v-if="st.primaryKey" class="text-dim"> ({{ st.primaryKey }})</small>
+              </td>
+              <td class="text-muted">{{ formatDate(st.lastSyncTime) }}</td>
+              <td>
+                <button class="btn btn-danger btn-xs" title="Reset state tabel ini" @click="$emit('reset-table-state', st)">
+                  Reset
+                </button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
     </div>
   </div>
 </template>
@@ -128,20 +167,31 @@ const props = defineProps({
       lastSyncTime: '',
     }),
   },
-  syncProgress: {
-    type: Object,
-    default: () => ({
-      currentTableIndex: 0,
-      totalTables: 0,
-      currentTableName: '',
-      rowsSyncedCurrentTable: 0,
-      totalSyncedAllTables: 0,
-      status: 'idle',
-    }),
+  syncTableStates: {
+    type: Array,
+    default: () => [],
   },
 });
 
-const emit = defineEmits(['start-sync', 'stop-sync', 'update:autoSyncInterval', 'update:sync-mode', 'update:row-limit']);
+const emit = defineEmits([
+  'start-sync',
+  'stop-sync',
+  'update:autoSyncInterval',
+  'update:sync-mode',
+  'update:row-limit',
+  'reset-table-state',
+  'reset-all-table-states',
+]);
+
+const formatDate = (isoString) => {
+  if (!isoString) return '-';
+  try {
+    const d = new Date(isoString);
+    return d.toLocaleString('id-ID', { dateStyle: 'short', timeStyle: 'medium' });
+  } catch {
+    return isoString;
+  }
+};
 
 const formatNumber = (val) => {
   if (val === null || val === undefined || isNaN(val)) return '0';
@@ -432,6 +482,67 @@ const formatDuration = (ms) => {
 @keyframes pulse-glow {
   0%, 100% { opacity: 1; transform: scale(1); box-shadow: 0 0 10px #10b981; }
   50% { opacity: 0.4; transform: scale(0.85); box-shadow: 0 0 3px #10b981; }
+}
+
+.sync-states-card {
+  margin-top: 8px;
+  background: rgba(15, 23, 42, 0.6);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: var(--radius-md);
+  padding: 12px 14px;
+}
+
+.states-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.states-title-wrap {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-muted);
+}
+
+.states-title {
+  font-size: 0.78rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.text-rose { color: var(--accent-rose); }
+
+.states-table-wrapper {
+  overflow-x: auto;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.states-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.76rem;
+  text-align: left;
+}
+
+.states-table th,
+.states-table td {
+  padding: 6px 10px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.states-table th {
+  color: var(--text-dim);
+  font-weight: 600;
+  text-transform: uppercase;
+  font-size: 0.68rem;
+}
+
+.states-table tr:hover {
+  background: rgba(255, 255, 255, 0.03);
 }
 
 @media (max-width: 768px) {

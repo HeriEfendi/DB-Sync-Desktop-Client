@@ -1,12 +1,16 @@
 import { isTauriEnvironment, safeInvoke, safeListen } from './tauriHelper.js';
 import { PmaClient } from './pmaClient.js';
+import { getTableState, saveTableState, clearTableState } from './syncStateStore.js';
 
 export class SyncEngine {
   constructor(pmaConfig, localDbConfig, options = {}) {
     this.pmaConfig = pmaConfig;
     this.localDbConfig = localDbConfig;
+    this.serverHost = pmaConfig.url || '';
+    this.database = pmaConfig.database || '';
     this.onLog = options.onLog || (() => {});
     this.onProgress = options.onProgress || (() => {});
+    this.onTableSynced = options.onTableSynced || (() => {});
     this.isSyncing = false;
     this.shouldStop = false;
   }
@@ -253,7 +257,8 @@ export class SyncEngine {
               () => safeInvoke('truncate_local_table', { config: dbConfigObj, tableName }),
               `Mengosongkan tabel '${tableName}'`
             );
-            this.log('success', `[Tabel '${tableName}'] Tabel lokal berhasil dikosongkan (TRUNCATE).`);
+            clearTableState(this.serverHost, this.database, tableName);
+            this.log('success', `[Tabel '${tableName}'] Tabel lokal berhasil dikosongkan (TRUNCATE) & state direset.`);
           } catch (tErr) {
             this.log('error', `[Tabel '${tableName}'] Gagal mengosongkan tabel lokal: ${tErr.message || tErr}`);
             throw tErr;
@@ -262,14 +267,22 @@ export class SyncEngine {
 
         let lastId = null;
         if (syncMode === 'incremental' && pk) {
-          try {
-            lastId = await withRetry(
-              () => safeInvoke('get_last_local_id', { config: dbConfigObj, tableName, primaryKey: pk }),
-              `Mengecek ID lokal '${tableName}'`
-            );
-            this.log('info', `[Tabel '${tableName}'] State ID lokal saat ini (${pk}): ${lastId !== null && lastId !== undefined ? lastId : 'Kosong'}`);
-          } catch (e) {
-            this.log('warning', `[Tabel '${tableName}'] Tidak dapat mengecek ID lokal (${e.message || e}), mulai dari awal.`);
+          // Prioritaskan lastSyncedId dari store agar data manual lokal tidak tertimpa
+          const storedState = getTableState(this.serverHost, this.database, tableName);
+          if (storedState && storedState.lastSyncedId !== null && storedState.lastSyncedId !== undefined) {
+            lastId = storedState.lastSyncedId;
+            this.log('info', `[Tabel '${tableName}'] Menggunakan last synced ID dari riwayat: ${lastId} (sync terakhir: ${storedState.lastSyncTime || '-'})`);
+          } else {
+            // Fallback: ambil MAX(id) dari tabel lokal jika belum pernah sync
+            try {
+              lastId = await withRetry(
+                () => safeInvoke('get_last_local_id', { config: dbConfigObj, tableName, primaryKey: pk }),
+                `Mengecek ID lokal '${tableName}'`
+              );
+              this.log('info', `[Tabel '${tableName}'] Belum ada riwayat sync, menggunakan MAX(${pk}) lokal: ${lastId !== null && lastId !== undefined ? lastId : 'Kosong'}`);
+            } catch (e) {
+              this.log('warning', `[Tabel '${tableName}'] Tidak dapat mengecek ID lokal (${e.message || e}), mulai dari awal.`);
+            }
           }
         } else if (syncMode === 'incremental' && !pk) {
           this.log('warning', `[Tabel '${tableName}'] Tidak memiliki primary key. Sinkronisasi incremental akan memakai fallback full scan tanpa filter PK.`);
@@ -381,6 +394,19 @@ export class SyncEngine {
 
         this.log('success', `✅ [Tabel '${tableName}'] Phase 1 selesai! ${totalFetchedForTable} baris baru berhasil ditarik.`);
 
+        // Simpan state sync terakhir untuk tabel ini
+        if (lastId !== null && lastId !== undefined) {
+          saveTableState(this.serverHost, this.database, tableName, {
+            _server: this.serverHost,
+            _database: this.database,
+            _table: tableName,
+            lastSyncedId: lastId,
+            lastSyncTime: new Date().toISOString(),
+            rowsSynced: totalFetchedForTable,
+            primaryKey: pk,
+          });
+        }
+
         if (syncMode === 'incremental' && !this.shouldStop) {
           let localMaxUpdatedAt = null;
           try {
@@ -448,6 +474,19 @@ export class SyncEngine {
         }
 
         this.log('success', `✅ [Tabel '${tableName}'] Selesai! Total ${totalFetchedForTable} baris data berhasil disinkronkan.`);
+
+        // Update state sync terakhir (termasuk Phase 2 updated_at)
+        saveTableState(this.serverHost, this.database, tableName, {
+          _server: this.serverHost,
+          _database: this.database,
+          _table: tableName,
+          lastSyncedId: lastId,
+          lastSyncTime: new Date().toISOString(),
+          rowsSynced: totalFetchedForTable,
+          primaryKey: pk,
+        });
+        this.onTableSynced(tableName);
+
         return { tableName, totalFetchedForTable, fetchedRows: fetchedRowsForThisTable };
       };
 

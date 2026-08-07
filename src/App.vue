@@ -40,10 +40,13 @@
               :row-limit="rowLimit"
               :stats="stats"
               :sync-progress="syncProgress"
+              :sync-table-states="tableStates"
               @start-sync="handleStartSync"
               @stop-sync="handleStopSync"
               @update:sync-mode="syncMode = $event"
               @update:row-limit="rowLimit = Number.isFinite(Number($event)) ? Number($event) : 0"
+              @reset-table-state="handleResetTableState"
+              @reset-all-table-states="handleResetAllTableStates"
             />
           </div>
 
@@ -68,9 +71,11 @@ import LogConsole from './components/LogConsole.vue';
 import { PmaClient } from './services/pmaClient.js';
 import { SyncEngine } from './services/syncEngine.js';
 import { isTauriEnvironment, safeInvoke } from './services/tauriHelper.js';
+import { getAllTableStates, clearTableState, clearAllTableStates } from './services/syncStateStore.js';
 
 const isTauri = ref(isTauriEnvironment());
 const activeNav = ref('connections');
+const tableStates = ref([]);
 
 const selectNav = (item) => {
   activeNav.value = item;
@@ -150,6 +155,30 @@ const addLog = (entry) => {
   }
 };
 
+const refreshTableStates = () => {
+  tableStates.value = getAllTableStates(pmaConfig.value.url, pmaConfig.value.database);
+};
+
+const handleResetTableState = (st) => {
+  clearTableState(st.server, st.database, st.table);
+  refreshTableStates();
+  addLog({
+    type: 'info',
+    message: `State sync tabel '${st.table}' di-reset. Sync berikutnya akan mengecek dari awal.`,
+    timestamp: new Date().toLocaleTimeString(),
+  });
+};
+
+const handleResetAllTableStates = () => {
+  clearAllTableStates();
+  refreshTableStates();
+  addLog({
+    type: 'warning',
+    message: `Semua riwayat sync state tabel berhasil di-reset.`,
+    timestamp: new Date().toLocaleTimeString(),
+  });
+};
+
 onMounted(() => {
   try {
     const savedPma = localStorage.getItem('db_sync_pma_config');
@@ -178,6 +207,8 @@ onMounted(() => {
     console.error('Failed reading saved config:', e);
   }
 
+  refreshTableStates();
+
   if (isTauri.value) {
     addLog({
       type: 'success',
@@ -199,7 +230,10 @@ onMounted(() => {
   });
 });
 
-watch(pmaConfig, (val) => localStorage.setItem('db_sync_pma_config', JSON.stringify(val)), { deep: true });
+watch(pmaConfig, (val) => {
+  localStorage.setItem('db_sync_pma_config', JSON.stringify(val));
+  refreshTableStates();
+}, { deep: true });
 watch(localConfig, (val) => localStorage.setItem('db_sync_local_config', JSON.stringify(val)), { deep: true });
 watch(availableTables, (val) => localStorage.setItem('db_sync_available_tables', JSON.stringify(val)), { deep: true });
 watch(selectedTables, (val) => localStorage.setItem('db_sync_selected_tables', JSON.stringify(val)), { deep: true });
@@ -210,6 +244,7 @@ watch(stats, (val) => localStorage.setItem('db_sync_stats', JSON.stringify(val))
 const handlePresetChanged = () => {
   pmaStatus.value.connected = false;
   localStatus.value.connected = false;
+  refreshTableStates();
 };
 
 watch(autoSyncInterval, (sec) => {
@@ -470,6 +505,7 @@ const handleStartSync = async () => {
 
   const engine = new SyncEngine(pmaConfig.value, localConfig.value, {
     onLog: addLog,
+    onTableSynced: refreshTableStates,
     onProgress: (p) => {
       const rowsCount = p.rowsSyncedCurrentTable ?? p.rowsSyncedForCurrentTable ?? 0;
       syncProgress.value = {
@@ -512,6 +548,7 @@ const handleStartSync = async () => {
   } finally {
     activeEngineInstance = null;
     isSyncing.value = false;
+    refreshTableStates();
   }
 };
 </script>
