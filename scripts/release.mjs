@@ -24,7 +24,7 @@ const cargoPath = 'src-tauri/Cargo.toml';
 writeFileSync(cargoPath, readFileSync(cargoPath, 'utf8').replace(/^(version\s*=\s*")[^"]+(")/m, `$1${version}$2`));
 process.env.APPIMAGE_EXTRACT_AND_RUN = '1';
 const buildArgs = process.platform === 'linux'
-  ? ['run', 'tauri', '--', 'build', '--bundles', 'deb,rpm,pacman']
+  ? ['run', 'tauri', '--', 'build', '--bundles', 'deb,rpm']
   : ['run', 'tauri', '--', 'build'];
 run('npm', buildArgs);
 const remotes = execFileSync('git', ['remote'], { encoding: 'utf8' }).trim().split(/\s+/).filter(Boolean);
