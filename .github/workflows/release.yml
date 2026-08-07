@@ -14,13 +14,14 @@ env:
 jobs:
   build-tauri:
     name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: Linux
             os: ubuntu-22.04
-            bundles: deb,rpm,appimage,pacman
+            bundles: deb,rpm,appimage
           - name: Windows
             os: windows-latest
             bundles: nsis,msi
