@@ -69,7 +69,11 @@
 
         <div v-if="!isSyncing" class="stat-card">
           <span class="stat-value text-amber">{{ (stats.lastSyncTime || '-') }}</span>
-          <span class="stat-label">{{ 'Waktu Sinkron Terakhir' }}</span>
+          <span class="stat-label">Waktu Sinkron Terakhir</span>
+        </div>
+        <div v-else class="stat-card stat-live">
+          <span class="stat-value text-amber">{{ elapsedDisplay }}</span>
+          <span class="stat-label">Waktu Berjalan</span>
         </div>
       </div>
     </div>
@@ -155,6 +159,7 @@
 </template>
 
 <script setup>
+import { ref, watch, computed, onUnmounted } from 'vue';
 const props = defineProps({
   isSyncing: { type: Boolean, default: false },
   autoSyncInterval: { type: Number, default: 0 },
@@ -193,6 +198,33 @@ const emit = defineEmits([
   'reset-table-state',
   'reset-all-table-states',
 ]);
+
+// --- Realtime elapsed timer ---
+const elapsedSeconds = ref(0);
+let elapsedTimer = null;
+
+watch(() => props.isSyncing, (syncing) => {
+  if (syncing) {
+    elapsedSeconds.value = 0;
+    elapsedTimer = setInterval(() => { elapsedSeconds.value++; }, 1000);
+  } else {
+    clearInterval(elapsedTimer);
+    elapsedTimer = null;
+  }
+});
+
+onUnmounted(() => { clearInterval(elapsedTimer); });
+
+const elapsedDisplay = computed(() => {
+  const s = elapsedSeconds.value;
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  if (h > 0) return `${h}j ${m}m ${sec}d`;
+  if (m > 0) return `${m}m ${sec}d`;
+  return `${sec}d`;
+});
+// --- End timer ---
 
 const formatDate = (isoString) => {
   if (!isoString) return '-';

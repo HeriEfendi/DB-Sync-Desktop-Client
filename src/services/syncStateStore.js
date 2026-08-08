@@ -66,7 +66,14 @@ export function saveTableState(serverHost, database, tableName, state) {
   try {
     const key = buildKey(serverHost, database, tableName);
     const existing = getTableState(serverHost, database, tableName) || {};
-    const merged = { ...existing, ...state };
+    const merged = {
+      ...existing,
+      ...state,
+      // Always persist metadata so getAllTableStates can read them reliably
+      _server: normalizeHost(serverHost),
+      _database: sanitizeSegment(database),
+      _table: tableName,
+    };
     localStorage.setItem(key, JSON.stringify(merged));
   } catch (e) {
     console.warn('[syncStateStore] Failed to save state:', e);

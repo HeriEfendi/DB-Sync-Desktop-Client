@@ -92,7 +92,9 @@ const emit = defineEmits([
 
 const getTableState = (tableName) => {
   if (!props.syncTableStates || !Array.isArray(props.syncTableStates)) return null;
-  return props.syncTableStates.find((st) => st.table === tableName) || null;
+  return props.syncTableStates.find(
+    (st) => st._table === tableName || st.table === tableName
+  ) || null;
 };
 
 const formatDate = (isoString) => {
