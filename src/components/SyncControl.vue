@@ -168,6 +168,16 @@ const props = defineProps({
       lastSyncTime: '',
     }),
   },
+  syncProgress: {
+    type: Object,
+    default: () => ({
+      currentTableIndex: 0,
+      totalTables: 0,
+      currentTableName: '',
+      rowsSyncedCurrentTable: 0,
+      totalSyncedAllTables: 0,
+    }),
+  },
   syncTableStates: {
     type: Array,
     default: () => [],

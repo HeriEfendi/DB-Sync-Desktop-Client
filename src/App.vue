@@ -7,7 +7,7 @@
 
     <div class="desktop-frame">
       <section class="desktop-content">
-        <Navbar :pma-status="pmaStatus" :local-status="localStatus" :is-syncing="isSyncing" @trigger-sync="handleStartSync" />
+        <Navbar :pma-status="pmaStatus" :local-status="localStatus" :is-syncing="isSyncing" :app-version="appVersion" @trigger-sync="handleStartSync" />
 
         <main class="dashboard-body">
           <div class="workspace-heading">
@@ -55,7 +55,7 @@
             <LogConsole :logs="logs" @clear-logs="logs = []" />
           </div>
         </main>
-        <footer class="status-bar"><span><i class="status-dot"></i> Ready</span><span>Local workspace</span><span class="status-spacer"></span><span>UTF-8</span><span>v1.0.0</span></footer>
+        <footer class="status-bar"><span><i class="status-dot"></i> Ready</span><span>Local workspace</span><span class="status-spacer"></span><span>UTF-8</span><span>v{{ appVersion }}</span></footer>
       </section>
     </div>
   </div>
@@ -73,8 +73,11 @@ import { PmaClient } from './services/pmaClient.js';
 import { SyncEngine } from './services/syncEngine.js';
 import { isTauriEnvironment, safeInvoke } from './services/tauriHelper.js';
 import { getAllTableStates, clearTableState, clearAllTableStates } from './services/syncStateStore.js';
+import packageJson from '../package.json';
+import { getVersion } from '@tauri-apps/api/app';
 
 const isTauri = ref(isTauriEnvironment());
+const appVersion = ref(packageJson.version);
 const activeNav = ref('connections');
 const tableStates = ref([]);
 
@@ -180,7 +183,7 @@ const handleResetAllTableStates = () => {
   });
 };
 
-onMounted(() => {
+onMounted(async () => {
   try {
     const savedPma = localStorage.getItem('db_sync_pma_config');
     const savedLocal = localStorage.getItem('db_sync_local_config');
@@ -211,6 +214,10 @@ onMounted(() => {
   refreshTableStates();
 
   if (isTauri.value) {
+    try {
+      const tauriVer = await getVersion();
+      if (tauriVer) appVersion.value = tauriVer;
+    } catch (e) {}
     addLog({
       type: 'success',
       message: 'Runtime Desktop Tauri terdeteksi dan aktif.',
