@@ -110,6 +110,7 @@
         class="progress-bar-fill"
         :style="{ width: syncProgress.totalTables > 0 ? `${Math.min(100, (syncProgress.currentTableIndex / syncProgress.totalTables) * 100)}%` : '0%' }"
       ></div>
+    </div>
     <div v-if="syncTableStates && syncTableStates.length > 0" class="sync-states-card">
       <div class="states-header">
         <div class="states-title-wrap">
