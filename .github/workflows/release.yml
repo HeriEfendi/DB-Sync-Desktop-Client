@@ -21,7 +21,7 @@ jobs:
         include:
           - name: Linux
             os: ubuntu-22.04
-            bundles: deb,rpm,appimage
+            bundles: deb,rpm
           - name: Windows
             os: windows-latest
             bundles: nsis,msi
