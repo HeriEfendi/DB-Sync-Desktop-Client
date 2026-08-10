@@ -1,6 +1,7 @@
 use crate::commands::LocalDbConfig;
 use flate2::read::MultiGzDecoder;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -16,6 +17,10 @@ pub struct PmaExportConfig {
     pub sync_mode: Option<String>,
     pub row_limit: Option<usize>,
     pub throttle_ms: Option<u64>,
+    /// Map nama_tabel -> nama_kolom_primary_key (opsional, per tabel)
+    pub table_primary_keys: Option<HashMap<String, String>>,
+    /// Fallback primary key global (dipakai kalau tabel tidak ada di table_primary_keys)
+    pub primary_key: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -793,6 +798,176 @@ pub async fn fetch_pma_tables(
     ))
 }
 
+/// Fetch primary key column names for all tables in the database in a single INFORMATION_SCHEMA query.
+/// Returns a map of table_name -> primary_key_column. Tables without a PK are omitted.
+async fn fetch_all_primary_keys(
+    client: &reqwest::Client,
+    base_url: &str,
+    csrf_token: &str,
+    db: &str,
+    app: &tauri::AppHandle,
+) -> HashMap<String, String> {
+    let mut pk_map: HashMap<String, String> = HashMap::new();
+
+    let safe_db = db.replace('\'', "''");
+    let query = format!(
+        "SELECT TABLE_NAME, COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE \
+         WHERE TABLE_SCHEMA = '{}' AND CONSTRAINT_NAME = 'PRIMARY' \
+         ORDER BY TABLE_NAME, ORDINAL_POSITION LIMIT 10000",
+        safe_db
+    );
+
+    let sql_endpoints = vec![
+        format!("{}/index.php?route=/sql", base_url),
+        format!("{}/sql.php", base_url),
+    ];
+
+    for sql_url in &sql_endpoints {
+        let mut form_data: Vec<(&str, String)> = vec![
+            ("db", db.to_string()),
+            ("table", String::new()),
+            ("server", "1".to_string()),
+            ("sql_query", query.clone()),
+            ("sql_delimiter", ";".to_string()),
+            ("ajax_request", "true".to_string()),
+            ("ajax_page_request", "true".to_string()),
+            ("submit_query", "Go".to_string()),
+            ("session_max_rows", "all".to_string()),
+            ("max_rows", "100000".to_string()),
+        ];
+        if !csrf_token.is_empty() {
+            form_data.push(("token", csrf_token.to_string()));
+        }
+
+        let resp = match client
+            .post(sql_url)
+            .header("X-Requested-With", "XMLHttpRequest")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .form(&form_data)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                emit_log(app, "warn", format!("[PK detect] Request ke {} gagal: {}", sql_url, e));
+                continue;
+            }
+        };
+
+        let raw_text = match resp.text().await {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+
+        emit_log(app, "info", format!("[PK detect] Response preview ({}): {}", sql_url, &raw_text[..raw_text.len().min(400)]));
+
+        let json_val = match serde_json::from_str::<serde_json::Value>(&raw_text) {
+            Ok(v) => v,
+            Err(_) => {
+                emit_log(app, "warn", "[PK detect] Response bukan JSON valid, skip.");
+                continue;
+            }
+        };
+
+        let success = json_val
+            .get("success")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if !success {
+            let err = json_val.get("error").or_else(|| json_val.get("message"))
+                .and_then(|v| v.as_str()).unwrap_or("unknown");
+            emit_log(app, "warn", format!("[PK detect] PMA mengembalikan success=false: {}", err));
+            continue;
+        }
+
+        // --- Format 1: fields + rows (paling umum di PMA modern) ---
+        // fields: [{name: "TABLE_NAME"}, {name: "COLUMN_NAME"}]
+        // rows: [["users", "id"], ["orders", "order_id"], ...]  -- array atau object
+        if let (Some(fields), Some(rows)) = (
+            json_val.get("fields").and_then(|v| v.as_array()),
+            json_val.get("rows").and_then(|v| v.as_array()),
+        ) {
+            // Cari index kolom TABLE_NAME dan COLUMN_NAME dari fields
+            let col_names: Vec<String> = fields.iter().map(|f| {
+                f.get("name").or_else(|| f.get("Name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("").to_uppercase()
+            }).collect();
+
+            let tbl_idx = col_names.iter().position(|c| c == "TABLE_NAME");
+            let col_idx = col_names.iter().position(|c| c == "COLUMN_NAME");
+
+            emit_log(app, "info", format!("[PK detect] fields+rows format, tbl_idx={:?} col_idx={:?} rows={}", tbl_idx, col_idx, rows.len()));
+
+            if let (Some(ti), Some(ci)) = (tbl_idx, col_idx) {
+                for row in rows {
+                    let (tbl, col) = if let Some(arr) = row.as_array() {
+                        let t = arr.get(ti).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let c = arr.get(ci).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        (t, c)
+                    } else if let Some(obj) = row.as_object() {
+                        // row bisa juga object keyed by field name
+                        let t = obj.get("TABLE_NAME").or_else(|| obj.get("table_name"))
+                            .and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let c = obj.get("COLUMN_NAME").or_else(|| obj.get("column_name"))
+                            .and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        (t, c)
+                    } else {
+                        continue;
+                    };
+                    if !tbl.is_empty() && !col.is_empty() {
+                        pk_map.entry(tbl).or_insert(col);
+                    }
+                }
+            }
+        }
+
+        // --- Format 2: data array (PMA lama) ---
+        if pk_map.is_empty() {
+            let try_keys = ["data", "dataset", "results", "query_data"];
+            'fmt2: for key in &try_keys {
+                if let Some(rows) = json_val.get(key).and_then(|v| v.as_array()) {
+                    emit_log(app, "info", format!("[PK detect] Mencoba format '{}' dengan {} rows", key, rows.len()));
+                    for row in rows {
+                        let (tbl, col) = if let Some(arr) = row.as_array() {
+                            let t = arr.first().and_then(|v| v.as_str()
+                                .or_else(|| v.get("v").and_then(|x| x.as_str()))).unwrap_or("").to_string();
+                            let c = arr.get(1).and_then(|v| v.as_str()
+                                .or_else(|| v.get("v").and_then(|x| x.as_str()))).unwrap_or("").to_string();
+                            (t, c)
+                        } else if let Some(obj) = row.as_object() {
+                            let t = obj.get("TABLE_NAME").or_else(|| obj.get("table_name"))
+                                .and_then(|v| v.as_str()
+                                    .or_else(|| v.get("v").and_then(|x| x.as_str()))).unwrap_or("").to_string();
+                            let c = obj.get("COLUMN_NAME").or_else(|| obj.get("column_name"))
+                                .and_then(|v| v.as_str()
+                                    .or_else(|| v.get("v").and_then(|x| x.as_str()))).unwrap_or("").to_string();
+                            (t, c)
+                        } else {
+                            continue;
+                        };
+                        if !tbl.is_empty() && !col.is_empty() {
+                            pk_map.entry(tbl).or_insert(col);
+                        }
+                    }
+                    if !pk_map.is_empty() {
+                        break 'fmt2;
+                    }
+                }
+            }
+        }
+
+        if !pk_map.is_empty() {
+            emit_log(app, "success", format!("[PK detect] Berhasil! {} tabel punya primary key.", pk_map.len()));
+            break;
+        } else {
+            emit_log(app, "warn", format!("[PK detect] Endpoint {} tidak menghasilkan PK, coba endpoint lain.", sql_url));
+        }
+    }
+
+    pk_map
+}
+
 /// Extract table names from PMA AJAX SQL JSON response
 fn extract_tables_from_json(json_val: &serde_json::Value, db: &str) -> Vec<String> {
     let mut tables = Vec::new();
@@ -1155,9 +1330,8 @@ async fn stream_export_single_table(
                 ("single_table".to_string(), "true".to_string()),
                 ("what".to_string(), "sql".to_string()),
                 ("export_type".to_string(), "table".to_string()),
-                ("export_method".to_string(), "quick".to_string()),
-                ("quick_or_custom".to_string(), "quick".to_string()),
-                ("quick_export".to_string(), "true".to_string()),
+                ("export_method".to_string(), "custom".to_string()),
+                ("quick_or_custom".to_string(), "custom".to_string()),
                 ("output_format".to_string(), "sendit".to_string()),
                 ("compression".to_string(), compression_mode.to_string()),
                 ("asfile".to_string(), "sendit".to_string()),
@@ -1177,7 +1351,22 @@ async fn stream_export_single_table(
 
             if let Some(limit) = pma_config.row_limit.filter(|limit| *limit > 0) {
                 let safe_table = table_name.replace('`', "``");
-                let limited_query = format!("SELECT * FROM `{}` LIMIT {}", safe_table, limit);
+                // Cari PK: 1) per-tabel map, 2) global fallback, 3) `id`.
+                // Limit tanpa ORDER BY tidak deterministik dan dapat mengimpor baris lama.
+                let pk_col = pma_config
+                    .table_primary_keys
+                    .as_ref()
+                    .and_then(|m| m.get(table_name))
+                    .map(|s| s.trim())
+                    .filter(|pk| !pk.is_empty())
+                    .or_else(|| pma_config.primary_key.as_deref().map(str::trim).filter(|pk| !pk.is_empty()))
+                    .unwrap_or("id");
+                let safe_pk = pk_col.replace('`', "``");
+                let limited_query = format!(
+                    "SELECT * FROM `{}` ORDER BY `{}` DESC LIMIT {}",
+                    safe_table, safe_pk, limit
+                );
+                emit_log(app, "info", format!("[Tabel '{}'] Query export: {}", table_name, limited_query));
                 form.push(("sql_query".to_string(), limited_query));
                 form.push(("query_type".to_string(), "table".to_string()));
                 form.push(("sql_query_input".to_string(), "true".to_string()));
@@ -1600,6 +1789,38 @@ pub async fn export_pma_database(
         pma_config.tables.clone()
     };
 
+    let mut pma_config = pma_config;
+    pma_config.primary_key = pma_config
+        .primary_key
+        .take()
+        .map(|key| key.trim().to_string())
+        .filter(|key| !key.is_empty());
+    if let Some(keys) = pma_config.table_primary_keys.as_mut() {
+        keys.retain(|_, key| {
+            *key = key.trim().to_string();
+            !key.is_empty()
+        });
+    }
+    if pma_config.row_limit.map(|l| l > 0).unwrap_or(false) {
+        emit_log(&app, "info", "Mendeteksi primary key tiap tabel dari INFORMATION_SCHEMA...");
+        let server_pk_map = fetch_all_primary_keys(&client, &base_url, &csrf_token, &pma_config.database, &app).await;
+        if !server_pk_map.is_empty() {
+            emit_log(&app, "info", format!("Primary key terdeteksi untuk {} tabel.", server_pk_map.len()));
+            // Merge: server_pk_map jadi base, lalu override dengan data dari JS (lebih spesifik)
+            let mut merged = server_pk_map;
+            if let Some(js_pks) = pma_config.table_primary_keys.take() {
+                for (tbl, col) in js_pks {
+                    if !col.is_empty() {
+                        merged.insert(tbl, col);
+                    }
+                }
+            }
+            pma_config.table_primary_keys = Some(merged);
+        } else {
+            emit_log(&app, "warn", "Primary key server tidak terdeteksi; memakai Primary Key konfigurasi atau fallback `id`.");
+        }
+    }
+
     let total_tables = tables.len();
     emit_log(
         &app,
@@ -1607,86 +1828,37 @@ pub async fn export_pma_database(
         format!("Total {} tabel akan disinkronkan berurutan.", total_tables),
     );
 
-    use futures_util::stream::{self, StreamExt};
+    emit_log(&app, "info", format!("Menjalankan ekspor berurutan untuk {} tabel.", total_tables));
 
-    const WORKER_COUNT: usize = 3;
-    emit_log(
-        &app,
-        "info",
-        format!(
-            "Menjalankan {} worker async untuk {} tabel.",
-            WORKER_COUNT, total_tables
-        ),
-    );
+    let mut completed_tables = 0usize;
+    let mut total_rows = 0usize;
+    for table_name in tables {
+        emit_progress(&app, completed_tables, total_tables, &table_name, 0, total_rows, "syncing");
+        let imported_rows = stream_export_single_table(
+            &client,
+            &base_url,
+            &csrf_token,
+            &pma_config,
+            &local_config,
+            &table_name,
+            &app,
+        ).await?;
+        completed_tables += 1;
+        total_rows += imported_rows;
+        emit_progress(&app, completed_tables, total_tables, &table_name, imported_rows, total_rows, "syncing");
 
-    use std::sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    };
-    let completed_tables = Arc::new(AtomicUsize::new(0));
-    let total_rows = Arc::new(AtomicUsize::new(0));
-
-    let results = stream::iter(tables.iter().cloned().map(|table_name| {
-        let client = client.clone();
-        let base_url = base_url.clone();
-        let csrf_token = csrf_token.clone();
-        let pma_config = pma_config.clone();
-        let local_config = local_config.clone();
-        let app = app.clone();
-        let completed_tables = completed_tables.clone();
-        let total_rows = total_rows.clone();
-        async move {
-            emit_progress(
-                &app,
-                completed_tables.load(Ordering::Relaxed),
-                total_tables,
-                &table_name,
-                0,
-                total_rows.load(Ordering::Relaxed),
-                "syncing",
-            );
-            let imported_rows = stream_export_single_table(
-                &client,
-                &base_url,
-                &csrf_token,
-                &pma_config,
-                &local_config,
-                &table_name,
-                &app,
-            )
-            .await?;
-            let done = completed_tables.fetch_add(1, Ordering::Relaxed) + 1;
-            let rows = total_rows.fetch_add(imported_rows, Ordering::Relaxed) + imported_rows;
-            emit_progress(
-                &app,
-                done,
-                total_tables,
-                &table_name,
-                imported_rows,
-                rows,
-                "syncing",
-            );
-            Ok::<(), String>(())
-        }
-    }))
-    .buffer_unordered(WORKER_COUNT)
-    .collect::<Vec<Result<(), String>>>()
-    .await;
-
-    for result in results {
-        if let Err(e) = result {
-            emit_log(&app, "error", format!("Gagal memproses tabel: {}", e));
-            return Err(format!("Sinkronisasi async gagal: {}", e));
+        if completed_tables < total_tables {
+            tokio::time::sleep(Duration::from_millis(pma_config.throttle_ms.unwrap_or(400))).await;
         }
     }
 
     emit_progress(
         &app,
-        completed_tables.load(Ordering::Relaxed),
+        completed_tables,
         total_tables,
         "",
         0,
-        total_rows.load(Ordering::Relaxed),
+        total_rows,
         "finished",
     );
     emit_log(

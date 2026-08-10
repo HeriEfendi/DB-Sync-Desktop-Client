@@ -99,13 +99,18 @@ export class SyncEngine {
     });
 
     if (isTauriEnvironment()) {
-      this.log('info', `[Tauri Native Engine] Memulai Direct SQL/GZIP Stream export.php (${tables.length} tabel)...`);
-
       let latestTotalSyncedRows = 0;
+      const hiddenLogPrefixes = [
+        'Primary key server tidak terdeteksi;',
+        '[PK detect] Response bukan JSON valid, skip.',
+        '[PK detect] Endpoint ',
+      ];
 
       const unlistenLog = await safeListen('pma-log', (event) => {
-        if (event.payload) {
-          this.log(event.payload.type, event.payload.message);
+        const payload = event.payload;
+        const showFreshCleanup = payload?.type === 'info' && payload.message.includes('Mode Fresh Sync');
+        if (payload && (showFreshCleanup || (payload.type !== 'info' && !hiddenLogPrefixes.some((prefix) => payload.message.startsWith(prefix))))) {
+          this.log(payload.type, payload.message);
         }
       });
 
@@ -129,6 +134,13 @@ export class SyncEngine {
 
       try {
         const tableNames = tables.map((t) => (typeof t === 'string' ? t : t.name));
+        // Buat map nama_tabel → primary_key (hanya yang punya primary key)
+        const tablePrimaryKeys = {};
+        tables.forEach((t) => {
+          if (typeof t === 'object' && t.name && t.primaryKey) {
+            tablePrimaryKeys[t.name] = t.primaryKey;
+          }
+        });
         const exportResult = await safeInvoke('export_pma_database', {
           pmaConfig: {
             url: this.pmaConfig.url,
@@ -139,6 +151,8 @@ export class SyncEngine {
             sync_mode: syncMode,
             row_limit: totalRowLimit,
             throttle_ms: 400,
+            table_primary_keys: Object.keys(tablePrimaryKeys).length > 0 ? tablePrimaryKeys : null,
+            primary_key: this.pmaConfig.primaryKey?.trim() || 'id',
           },
           localConfig: {
             host: this.localDbConfig.host || '127.0.0.1',
