@@ -50,3 +50,17 @@ export async function safeFetch(url, options = {}) {
   }
   return await fetch(url, options);
 }
+
+export async function safeListen(eventName, handler) {
+  if (!isTauriEnvironment()) {
+    return () => {};
+  }
+  try {
+    const { listen } = await import('@tauri-apps/api/event');
+    return await listen(eventName, handler);
+  } catch (e) {
+    console.warn(`[Tauri Event] Gagal mendaftarkan listener '${eventName}':`, e);
+    return () => {};
+  }
+}
+

@@ -75,7 +75,8 @@ const currentFilter = ref('all');
 const searchQuery = ref('');
 
 const filteredLogs = computed(() => {
-  const list = props.logs.filter((log) => {
+  const recentLogs = props.logs.length > 300 ? props.logs.slice(-300) : props.logs;
+  const list = recentLogs.filter((log) => {
     const matchesLevel = currentFilter.value === 'all' || log.type === currentFilter.value;
     const matchesSearch = !searchQuery.value || log.message.toLowerCase().includes(searchQuery.value.toLowerCase());
     return matchesLevel && matchesSearch;
@@ -105,8 +106,8 @@ const copyLogs = () => {
 .log-console-card {
   display: flex;
   flex-direction: column;
-  flex: 1;
-  min-height: 250px;
+  min-height: 290px;
+  max-height: 48vh;
   overflow: hidden;
 }
 
@@ -178,6 +179,7 @@ const copyLogs = () => {
 }
 
 .log-window {
+  min-height: 220px;
   flex: 1;
   padding: 12px 16px;
   overflow-y: auto;

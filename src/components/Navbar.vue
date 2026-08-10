@@ -9,7 +9,7 @@
         </svg>
       </div>
       <div class="brand-text">
-        <h1 class="brand-title">DB-Sync <span class="badge-tag">v1.0</span></h1>
+        <h1 class="brand-title">DB-Sync <span class="badge-tag">v{{ displayVersion }}</span></h1>
         <p class="brand-subtitle">PMA Remote &rarr; Local MySQL Port</p>
       </div>
     </div>
@@ -52,7 +52,10 @@
 </template>
 
 <script setup>
-defineProps({
+import { computed } from 'vue';
+import packageJson from '../../package.json';
+
+const props = defineProps({
   pmaStatus: {
     type: Object,
     default: () => ({ connected: false }),
@@ -65,7 +68,13 @@ defineProps({
     type: Boolean,
     default: false,
   },
+  appVersion: {
+    type: String,
+    default: '',
+  },
 });
+
+const displayVersion = computed(() => props.appVersion || packageJson.version);
 
 defineEmits(['trigger-sync']);
 </script>

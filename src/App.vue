@@ -1,77 +1,103 @@
 <template>
-  <div class="app-layout">
-    <!-- Environment Mode Warning Banner if opened in Web Browser -->
+  <div class="app-layout desktop-shell">
     <div v-if="!isTauri" class="browser-banner">
-      <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path><line x1="12" y1="9" x2="12" y2="13"></line><line x1="12" y1="17" x2="12.01" y2="17"></line></svg>
-      <span>Mode Pratinjau Web Browser terdeteksi. Untuk mengaktifkan koneksi port native MySQL Local, buka aplikasi desktop Tauri dengan perintah: <code>npm run tauri dev</code></span>
+      <span class="banner-dot"></span>
+      <span>Mode browser aktif. Jalankan <code>npm run tauri dev</code> untuk akses MySQL lokal.</span>
     </div>
 
-    <!-- Navbar Header -->
-    <Navbar
-      :pma-status="pmaStatus"
-      :local-status="localStatus"
-      :is-syncing="isSyncing"
-      @trigger-sync="handleStartSync"
-    />
+    <div class="desktop-frame">
+      <section class="desktop-content">
+        <Navbar :pma-status="pmaStatus" :local-status="localStatus" :is-syncing="isSyncing" :app-version="appVersion" @trigger-sync="handleStartSync" />
 
-    <!-- Main Dashboard Content -->
-    <main class="dashboard-body">
-      <!-- Top Grid: Config & Controls -->
-      <div class="grid-top">
-        <ConnectionConfig
-          v-model:pma-config="pmaConfig"
-          v-model:local-config="localConfig"
-          v-model:selected-tables="selectedTables"
-          v-model:available-tables="availableTables"
-          v-model:sync-mode="syncMode"
-          v-model:row-limit="rowLimit"
-          :testing-pma="testingPma"
-          :testing-local="testingLocal"
-          :fetching-tables="fetchingTables"
-          @test-pma="testPmaConnection"
-          @test-local="testLocalConnection"
-          @fetch-tables="fetchTablesFromPma"
-          @preset-changed="handlePresetChanged"
-        />
+        <main class="dashboard-body">
+          <div class="workspace-heading">
+            <div><span class="eyebrow">WORKSPACE / OVERVIEW</span><h1>Database sync workspace</h1><p>Kelola koneksi, tabel, dan proses sinkronisasi dari satu tempat.</p></div>
+            <div class="heading-meta"><span class="live-indicator"></span> Live workspace</div>
+          </div>
 
-        <SyncControl
-          :is-syncing="isSyncing"
-          v-model:auto-sync-interval="autoSyncInterval"
-          :stats="stats"
-          :sync-progress="syncProgress"
-          @start-sync="handleStartSync"
-          @stop-sync="handleStopSync"
-        />
-      </div>
+          <div class="config-stack">
+            <ConnectionConfigSection
+              v-model:pma-config="pmaConfig"
+              v-model:local-config="localConfig"
+              :testing-pma="testingPma"
+              :testing-local="testingLocal"
+              @test-pma="testPmaConnection"
+              @test-local="testLocalConnection"
+              @preset-changed="handlePresetChanged"
+            />
 
-      <!-- Bottom Grid: Log Console & Data Inspector -->
-      <div class="grid-bottom">
-        <LogConsole
-          :logs="logs"
-          @clear-logs="logs = []"
-        />
+            <TableConfig
+              v-model:selected-tables="selectedTables"
+              v-model:available-tables="availableTables"
+              :fetching-tables="fetchingTables"
+              :sync-table-states="tableStates"
+              @fetch-tables="fetchTablesFromPma"
+            />
 
-        <!-- <DataPreview
-          :rows="previewRows"
-          @refresh-local-preview="fetchLocalPreview"
-        /> -->
-      </div>
-    </main>
+            <SyncControl
+              :is-syncing="isSyncing"
+              v-model:auto-sync-interval="autoSyncInterval"
+              :sync-mode="syncMode"
+              :row-limit="rowLimit"
+              :stats="stats"
+              :sync-progress="syncProgress"
+              :sync-table-states="tableStates"
+              @start-sync="handleStartSync"
+              @stop-sync="handleStopSync"
+              @update:sync-mode="syncMode = $event"
+              @update:row-limit="rowLimit = Number.isFinite(Number($event)) ? Number($event) : 0"
+              @reset-table-state="handleResetTableState"
+              @reset-all-table-states="handleResetAllTableStates"
+            />
+          </div>
+
+          <div class="grid-bottom">
+            <LogConsole :logs="logs" @clear-logs="logs = []" />
+          </div>
+        </main>
+        <footer class="status-bar"><span><i class="status-dot"></i> Ready</span><span>Local workspace</span><span class="status-spacer"></span><span>UTF-8</span><span>v{{ appVersion }}</span></footer>
+      </section>
+    </div>
   </div>
 </template>
 
 <script setup>
 import { ref, watch, onMounted, onUnmounted } from 'vue';
 import Navbar from './components/Navbar.vue';
-import ConnectionConfig from './components/ConnectionConfig.vue';
+import ConnectionConfigSection from './components/ConnectionConfigSection.vue';
+import TableConfig from './components/TableConfig.vue';
 import SyncControl from './components/SyncControl.vue';
 import LogConsole from './components/LogConsole.vue';
 // import DataPreview from './components/DataPreview.vue';
 import { PmaClient } from './services/pmaClient.js';
 import { SyncEngine } from './services/syncEngine.js';
 import { isTauriEnvironment, safeInvoke } from './services/tauriHelper.js';
+import { getAllTableStates, clearTableState, clearAllTableStates } from './services/syncStateStore.js';
+import packageJson from '../package.json';
+import { getVersion } from '@tauri-apps/api/app';
 
 const isTauri = ref(isTauriEnvironment());
+const appVersion = ref(packageJson.version);
+const activeNav = ref('connections');
+const tableStates = ref([]);
+
+const selectNav = (item) => {
+  activeNav.value = item;
+
+  if (item === 'connections') {
+    document.querySelector('[data-tab="remote"]')?.click();
+    document.querySelector('.grid-top')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    return;
+  }
+
+  if (item === 'tables') {
+    document.querySelector('[data-tab="tables"]')?.click();
+    document.querySelector('.grid-top')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    return;
+  }
+
+  document.querySelector('.sync-control-card')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+};
 
 // Connection state
 const pmaConfig = ref({
@@ -104,13 +130,11 @@ const testingPma = ref(false);
 const testingLocal = ref(false);
 const fetchingTables = ref(false);
 
-// Sync execution state
 const isSyncing = ref(false);
 const autoSyncInterval = ref(0);
 let timerId = null;
 
 const logs = ref([]);
-const previewRows = ref([]);
 
 const stats = ref({
   totalSynced: 0,
@@ -118,11 +142,48 @@ const stats = ref({
   lastSyncTime: '',
 });
 
+let logSaveTimer = null;
+
 const addLog = (entry) => {
   logs.value.push(entry);
+  if (logs.value.length > 300) {
+    logs.value.shift();
+  }
+  if (!logSaveTimer) {
+    logSaveTimer = setTimeout(() => {
+      try {
+        localStorage.setItem('db_sync_logs', JSON.stringify(logs.value.slice(-100)));
+      } catch (e) {}
+      logSaveTimer = null;
+    }, 2500);
+  }
 };
 
-onMounted(() => {
+const refreshTableStates = () => {
+  tableStates.value = getAllTableStates(pmaConfig.value.url, pmaConfig.value.database);
+};
+
+const handleResetTableState = (st) => {
+  clearTableState(st.server, st.database, st.table);
+  refreshTableStates();
+  addLog({
+    type: 'info',
+    message: `State sync tabel '${st.table}' di-reset. Sync berikutnya akan mengecek dari awal.`,
+    timestamp: new Date().toLocaleTimeString(),
+  });
+};
+
+const handleResetAllTableStates = () => {
+  clearAllTableStates();
+  refreshTableStates();
+  addLog({
+    type: 'warning',
+    message: `Semua riwayat sync state tabel berhasil di-reset.`,
+    timestamp: new Date().toLocaleTimeString(),
+  });
+};
+
+onMounted(async () => {
   try {
     const savedPma = localStorage.getItem('db_sync_pma_config');
     const savedLocal = localStorage.getItem('db_sync_local_config');
@@ -130,6 +191,8 @@ onMounted(() => {
     const savedAvailable = localStorage.getItem('db_sync_available_tables');
     const savedMode = localStorage.getItem('db_sync_mode');
     const savedLimit = localStorage.getItem('db_sync_row_limit');
+    const savedStats = localStorage.getItem('db_sync_stats');
+    const savedLogs = localStorage.getItem('db_sync_logs');
 
     if (savedPma) Object.assign(pmaConfig.value, JSON.parse(savedPma));
     if (savedLocal) Object.assign(localConfig.value, JSON.parse(savedLocal));
@@ -137,11 +200,24 @@ onMounted(() => {
     if (savedTables) selectedTables.value = JSON.parse(savedTables);
     if (savedMode) syncMode.value = savedMode;
     if (savedLimit !== null && savedLimit !== undefined) rowLimit.value = parseInt(savedLimit, 10);
+    if (savedStats) Object.assign(stats.value, JSON.parse(savedStats));
+    if (savedLogs) {
+      try {
+        const parsed = JSON.parse(savedLogs);
+        if (Array.isArray(parsed) && parsed.length > 0) logs.value = parsed;
+      } catch (e) {}
+    }
   } catch (e) {
     console.error('Failed reading saved config:', e);
   }
 
+  refreshTableStates();
+
   if (isTauri.value) {
+    try {
+      const tauriVer = await getVersion();
+      if (tauriVer) appVersion.value = tauriVer;
+    } catch (e) {}
     addLog({
       type: 'success',
       message: 'Runtime Desktop Tauri terdeteksi dan aktif.',
@@ -162,20 +238,23 @@ onMounted(() => {
   });
 });
 
-watch(pmaConfig, (val) => localStorage.setItem('db_sync_pma_config', JSON.stringify(val)), { deep: true });
+watch(pmaConfig, (val) => {
+  localStorage.setItem('db_sync_pma_config', JSON.stringify(val));
+  refreshTableStates();
+}, { deep: true });
 watch(localConfig, (val) => localStorage.setItem('db_sync_local_config', JSON.stringify(val)), { deep: true });
 watch(availableTables, (val) => localStorage.setItem('db_sync_available_tables', JSON.stringify(val)), { deep: true });
 watch(selectedTables, (val) => localStorage.setItem('db_sync_selected_tables', JSON.stringify(val)), { deep: true });
 watch(syncMode, (val) => localStorage.setItem('db_sync_mode', val));
 watch(rowLimit, (val) => localStorage.setItem('db_sync_row_limit', String(val)));
+watch(stats, (val) => localStorage.setItem('db_sync_stats', JSON.stringify(val)), { deep: true });
 
 const handlePresetChanged = () => {
   pmaStatus.value.connected = false;
   localStatus.value.connected = false;
+  refreshTableStates();
 };
 
-
-// Auto-sync scheduler
 watch(autoSyncInterval, (sec) => {
   if (timerId) clearInterval(timerId);
 
@@ -213,10 +292,48 @@ const fetchTablesFromPma = async () => {
     timestamp: new Date().toLocaleTimeString(),
   });
 
+  let pmaLogUnlisten = null;
+
   try {
-    const client = new PmaClient(pmaConfig.value);
-    await client.authenticate();
-    const tables = await client.fetchTablesList();
+    let tables = [];
+    if (isTauri.value) {
+      // Listen to pma-log events from Rust so diagnostics appear in the app console
+      try {
+        pmaLogUnlisten = await safeListen('pma-log', (event) => {
+          const { type: t, message } = event.payload || {};
+          addLog({ type: t || 'info', message: `[PMA] ${message}`, timestamp: new Date().toLocaleTimeString() });
+        });
+      } catch (_) {}
+
+      try {
+        tables = await safeInvoke('get_pma_tables', {
+          pmaConfig: {
+            url: pmaConfig.value.url,
+            username: pmaConfig.value.username,
+            password: pmaConfig.value.password,
+            database: pmaConfig.value.database,
+            tables: [],
+          },
+        });
+      } catch (e) {
+        addLog({
+          type: 'warning',
+          message: `Engine native Rust gagal ekstraksi tabel (${e.message || e}), mencoba fallback client JS...`,
+          timestamp: new Date().toLocaleTimeString(),
+        });
+      }
+    }
+
+    if (!tables || tables.length === 0) {
+      addLog({ type: 'info', message: 'Mencoba fallback JS PmaClient...', timestamp: new Date().toLocaleTimeString() });
+      try {
+        const client = new PmaClient(pmaConfig.value);
+        await client.authenticate();
+        tables = await client.fetchTablesList();
+      } catch (jsErr) {
+        addLog({ type: 'warning', message: `JS PmaClient fallback gagal: ${jsErr.message}`, timestamp: new Date().toLocaleTimeString() });
+      }
+    }
 
     if (tables && tables.length > 0) {
       availableTables.value = tables;
@@ -244,8 +361,10 @@ const fetchTablesFromPma = async () => {
     });
   } finally {
     fetchingTables.value = false;
+    if (pmaLogUnlisten) pmaLogUnlisten();
   }
 };
+
 
 // Test PMA Remote connection
 const testPmaConnection = async () => {
@@ -394,96 +513,56 @@ const handleStartSync = async () => {
 
   const engine = new SyncEngine(pmaConfig.value, localConfig.value, {
     onLog: addLog,
+    onTableSynced: refreshTableStates,
     onProgress: (p) => {
+      const rowsCount = p.rowsSyncedCurrentTable ?? p.rowsSyncedForCurrentTable ?? 0;
       syncProgress.value = {
-        currentTableIndex: p.currentTableIndex,
-        totalTables: p.totalTables,
-        currentTableName: p.currentTableName,
-        rowsSyncedCurrentTable: p.rowsSyncedForCurrentTable,
-        totalSyncedAllTables: p.totalSyncedAllTables,
-        status: p.status,
+        currentTableIndex: p.currentTableIndex || 0,
+        totalTables: p.totalTables || 0,
+        currentTableName: p.currentTableName || '',
+        rowsSyncedCurrentTable: rowsCount,
+        rowsSyncedForCurrentTable: rowsCount,
+        totalSyncedAllTables: p.totalSyncedAllTables || 0,
+        status: p.status || 'idle',
       };
     },
   });
   activeEngineInstance = engine;
 
-  const res = await engine.runMultiTableSync({
-    tables: tablesToSync,
-    syncMode: syncMode.value,
-    rowLimit: rowLimit.value,
-    batchSize: 2000,
-  });
+  try {
+    const res = await engine.runMultiTableSync({
+      tables: tablesToSync,
+      syncMode: syncMode.value,
+      rowLimit: rowLimit.value,
+      batchSize: 2000,
+    });
 
-  const countSynced = (res && res.count) || syncProgress.value.totalSyncedAllTables || 0;
-  if (countSynced > 0) {
-    stats.value.totalSynced += countSynced;
-  }
-  if (res && res.durationMs) {
-    stats.value.lastDuration = res.durationMs;
-  }
-  stats.value.lastSyncTime = new Date().toLocaleTimeString();
+    const countSynced = (res && res.totalRowsSynced !== undefined ? res.totalRowsSynced : res?.count) || syncProgress.value.totalSyncedAllTables || 0;
+    if (countSynced > 0) stats.value.totalSynced += countSynced;
+    if (res && res.durationMs) stats.value.lastDuration = res.durationMs;
+    stats.value.lastSyncTime = new Date().toLocaleTimeString();
 
-  if (res && res.success) {
-    pmaStatus.value.connected = true;
-    localStatus.value.connected = true;
-
-    if (res.fetchedRows && res.fetchedRows.length > 0) {
-      previewRows.value = res.fetchedRows;
+    if (res && res.success) {
+      pmaStatus.value.connected = true;
+      localStatus.value.connected = true;
+      if (res.fetchedRows && res.fetchedRows.length > 0) previewRows.value = res.fetchedRows;
     }
+  } catch (err) {
+    addLog({
+      type: 'error',
+      message: `Sinkronisasi gagal: ${err?.message || err}`,
+      timestamp: new Date().toLocaleTimeString(),
+    });
+  } finally {
+    activeEngineInstance = null;
+    isSyncing.value = false;
+    refreshTableStates();
   }
-
-  activeEngineInstance = null;
-  isSyncing.value = false;
 };
 </script>
 
-<style scoped>
-.app-layout {
-  display: flex;
-  flex-direction: column;
-  height: 100vh;
-  overflow: hidden;
-}
+.app-layout { display:flex; flex-direction:column; width:100%; height:100vh; min-width:0; overflow:hidden; }
+.desktop-frame { flex:1 1 auto; width:100%; min-width:0; }
+.desktop-content { width:100%; min-width:0; }
+.browser-banner { flex:0 0 auto; }
 
-.browser-banner {
-  background: rgba(245, 158, 11, 0.18);
-  color: var(--accent-amber);
-  border-bottom: 1px solid rgba(245, 158, 11, 0.3);
-  padding: 8px 16px;
-  font-size: 0.8rem;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  justify-content: center;
-}
-
-.browser-banner code {
-  background: rgba(0, 0, 0, 0.4);
-  padding: 2px 6px;
-  border-radius: 4px;
-  font-family: 'JetBrains Mono', monospace;
-  color: white;
-}
-
-.dashboard-body {
-  flex: 1;
-  padding: 20px 24px;
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-  overflow-y: auto;
-}
-
-.grid-top {
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-}
-
-.grid-bottom {
-  display: grid;
-  grid-template-columns: 1fr;
-  gap: 16px;
-  flex: 1;
-}
-</style>

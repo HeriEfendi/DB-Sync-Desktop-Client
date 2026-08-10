@@ -1,13 +1,16 @@
 {
   "name": "db-sync-desktop-client",
   "private": true,
-  "version": "1.0.0",
+  "version": "0.9.2",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "release": "node scripts/release.mjs",
+    "build:pacman": "makepkg -sf",
+    "install:pacman": "makepkg -si"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",
