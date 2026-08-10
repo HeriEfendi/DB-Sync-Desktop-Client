@@ -6,30 +6,31 @@
 ![Rust](https://img.shields.io/badge/Rust-2021-orange?logo=rust)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
-**DB-Sync Desktop Client** adalah aplikasi desktop modern dan efisien berbasis **Tauri v2 (Rust)** dan **Vue 3** yang dirancang untuk melakukan **sinkronisasi data incremental & bulk upsert** dari server web **PhpMyAdmin (PMA) Remote** langsung ke **Database MySQL / MariaDB Lokal** (Port 3306).
+**DB-Sync Desktop Client** adalah aplikasi desktop **Tauri v2 (Rust)** + **Vue 3** untuk menyalin data dari **PhpMyAdmin (PMA) Remote** ke **MySQL/MariaDB lokal**. Remote PMA dipakai sebagai sumber data **read-only**: aplikasi login lalu menjalankan export `SELECT`; seluruh `DROP`, `DELETE`, pembuatan tabel, dan import berjalan hanya di database lokal.
 
-Aplikasi ini mempermudah pengembang dan *database administrator* dalam menyinkronkan data transaksi, master data, atau log dari server produksi/staging ke lingkungan pengujian/pengembangan lokal secara real-time, otomatis, atau terjadwal tanpa perlu melakukan export-import database manual secara berulang.
+Aplikasi cocok untuk membuat salinan data produksi/staging ke lingkungan pengembangan atau pengujian lokal tanpa export-import dump manual. Transfer memakai export SQL/GZIP phpMyAdmin lalu dipipe langsung ke MySQL CLI lokal.
 
 ---
 
 ## ✨ Fitur Utama
 
-- 🔄 **Incremental & Fresh Sync Modes**:
-  - **Incremental Sync**: Menarik baris data baru atau yang diperbarui secara bertahap berdasarkan *Primary Key* (`WHERE primary_key > last_local_id`) atau timestamp `updated_at`.
-  - **Fresh Sync**: Sinkronisasi ulang data dari awal dengan opsi reset state atau pembersihan data lokal.
-- ⚡ **Native Rust Bulk Upsert Engine (`sqlx` & Tokio)**: Eksekusi pengolahan batch data berkecepatan tinggi ke database lokal yang ditangani langsung oleh *native engine* Rust menggunakan query `ON DUPLICATE KEY UPDATE` dan *connection pool* `sqlx`.
-- 📡 **Native PMA Exporter & HTTP Client (`pma_export.rs`)**: Penanganan HTTP request, manajemen cookie sesi, ekstraksi CSRF token, gzip decompression streaming, dan otomatisasi ekstraksi tabel remote langsung melalui layer backend Rust.
-- 📋 **Multi-Table & Column Configuration**: Mendukung pemilihan beberapa tabel remote sekaligus, pemetaan kolom, dan penyesuaian nama *Primary Key* per tabel.
-- ⏱️ **Auto-Sync Scheduler**: Penjadwalan otomatis dengan pilihan interval fleksibel (Non-Aktif/Manual, 5 Detik, 10 Detik, 30 Detik, 1 Menit, 5 Menit).
-- 🛑 **Graceful Sync Stop & Live Progress**:
-  - Tombol **Hentikan Sinkronisasi** yang aman (*graceful stop*) tanpa merusak data yang sedang dimasukkan.
-  - **Live Banner & Progress Bar**: Visualisasi status tabel aktif, jumlah baris dimasukkan, dan total baris ter-sync per sesi.
-- 💾 **Per-Table Sync State Tracking**: Pencatatan otomatis `lastSyncedId` dan `lastSyncTime` per tabel. Dilengkapi kontrol untuk **Reset State per Tabel** maupun **Reset Semua State**.
-- 🧪 **Dual Connection Tester**: Fitur pengujian independen untuk memvalidasi akses koneksi ke **Remote PhpMyAdmin** (HTTP/HTTPS) dan **MySQL Lokal** (Port 3306).
-- 📊 **Data Inspector & Local Table Truncate**: Pratinjau sampel data hasil sinkronisasi lokal secara interaktif dan modal konfirmasi pembersihan (*Truncate*) tabel lokal.
-- 🖥️ **Live Log Console**: Console monitor aktivitas sinkronisasi real-time dengan tingkatan badge (Success, Info, Warning, Error) serta opsi pembersihan log (*Clear Console*).
-- 🛡️ **SQL Injection Protection & Sanitization**: Sanitasi *SQL Identifiers* (nama tabel dan kolom) dilakukan di layer Rust untuk menjamin keamanan query.
-- 📦 **Automated Multi-Format Packaging**: Skrip otomatisasi rilis untuk paket rilis Linux (`.deb`, `.rpm`, `.pkg.tar.zst` Arch Linux) dan Windows (`.msi`, `.exe`).
+- 🔒 **Remote PMA Read-Only**: Tidak ada `INSERT`, `UPDATE`, `DELETE`, `DROP`, atau `TRUNCATE` yang dikirim ke PMA remote. PMA hanya menerima login dan query `SELECT` untuk export.
+- 🚀 **Direct SQL/GZIP Export**: Rust autentikasi PMA dengan cookie + CSRF token, meminta export SQL lewat endpoint PMA, mendekompresi GZIP, lalu mengirim SQL ke stdin `mysql` lokal. Tidak menyimpan dump besar di disk.
+- 🔄 **Dua Mode Sync Server**:
+  - **Sync Server (New & Update)**: Menggunakan `Last ID` dan waktu sync tersimpan sebagai watermark. Sebelum export, baris **lokal** dengan `id > Last ID` dihapus. Lalu aplikasi mengambil data remote `id > Last ID` atau `updated_at > Last Sync`, sehingga data lokal kembali mengikuti server.
+  - **Fresh Sync**: Menjalankan `DROP TABLE IF EXISTS` **hanya di MySQL lokal**, lalu import ulang struktur dan data export dari remote. Cocok untuk penggantian penuh tabel lokal.
+- 🧾 **Per-Table Sync State**: Menyimpan `Last ID`, waktu sync terakhir, primary key, dan metadata tabel di `localStorage`. Riwayat dapat di-reset per tabel atau seluruhnya.
+- 📋 **Multi-Table Selection & Templates**: Pilih banyak tabel, cari tabel, centang massal, dan simpan template pilihan tabel.
+- 🎚️ **Row Limit Terbaru**: Saat limit aktif, Fresh Sync mengambil baris terbaru dengan `ORDER BY primary_key DESC LIMIT N`. Default primary key adalah `id`, dapat diubah dari konfigurasi.
+- ⏱️ **Auto Sync, Progress, dan Stop**: Interval otomatis, progres tabel/baris, penghentian aman, serta log ringkas untuk success/warning/error.
+- 🧪 **Dual Connection Tester**: Uji koneksi PMA remote dan MySQL lokal terpisah.
+- 🛡️ **Identifier Safety**: Nama tabel/kolom dikutip dan disanitasi di Rust; nilai watermark delete lokal memakai parameter query.
+
+> [!WARNING]
+> **Sync Server (New & Update) menghapus data lokal dengan ID di atas `Last ID`.** Mode ini dibuat saat server adalah sumber data utama. Jangan gunakan untuk tabel yang menyimpan data lokal-only yang ingin dipertahankan.
+
+> [!NOTE]
+> Deteksi update pada ID lama membutuhkan kolom `updated_at` di tabel remote. Tabel tanpa `updated_at` tetap bisa mengambil ID baru, tetapi perubahan server pada ID lama tidak dapat dideteksi otomatis.
 
 ---
 
@@ -63,12 +64,25 @@ Aplikasi ini mempermudah pengembang dan *database administrator* dalam menyinkro
                                          +-----------------------------+
 ```
 
-### Langkah Kerja Sync Engine:
-1. **Check Local State**: Engine mengambil nilai *Primary Key* maksimum (`MAX(primary_key)`) atau state terakhir (`lastSyncedId`) dari tabel MySQL lokal via Rust `sqlx`.
-2. **Authenticate & Stream PMA**: Inisialisasi sesi HTTP ke PhpMyAdmin remote, ekstraksi cookie sesi dan CSRF token, kemudian membaca daftar tabel atau mengekspor data.
-3. **Fetch Incremental Rows**: Mengeksekusi query incremental (`SELECT * FROM table WHERE pk > last_id ORDER BY pk ASC LIMIT N`) dari PMA remote.
-4. **Native Bulk Upsert**: Batch data dikirim ke backend Rust untuk disisipkan/diperbarui (*Upsert*) ke MySQL lokal menggunakan `ON DUPLICATE KEY UPDATE`.
-5. **Update State**: State `lastSyncedId` dan `lastSyncTime` disimpan ke `LocalStorage` per tabel.
+### Alur Kerja Sync Engine
+
+1. **Baca State Lokal**: UI membaca `Last ID` dan `Last Sync Time` per tabel dari `localStorage`.
+2. **Login PMA Read-Only**: Rust membuat sesi HTTP PMA, menyimpan cookie, mengambil token CSRF, dan mengakses endpoint export.
+3. **Pilih Mode**:
+   - **Fresh Sync**: tabel lokal dihapus dengan `DROP TABLE IF EXISTS`, kemudian struktur + data hasil export diimport kembali ke lokal.
+   - **Sync Server**: bila state ada, lokal menjalankan `DELETE ... WHERE primary_key > Last ID`. Data remote lalu difilter dengan `primary_key > Last ID OR updated_at > Last Sync Time`.
+4. **Stream Export ke Lokal**: PMA mengirim dump SQL/GZIP; Rust mendekompresi dan pipe SQL langsung ke `mysql` CLI database lokal.
+5. **Simpan Watermark Baru**: setelah export sukses, aplikasi mengambil `MAX(primary_key)` dari lokal dan menyimpan ID/waktu baru ke `localStorage`.
+
+### Contoh Sync Server
+
+State tersimpan `Last ID = 100`. Lokal memiliki data uji `101..105`, sementara server hanya memiliki `101..103`.
+
+1. Aplikasi menghapus lokal `101..105`.
+2. Aplikasi mengexport remote `101..103` dan baris lama yang `updated_at`-nya berubah.
+3. Lokal berakhir di ID `103`, kembali konsisten dengan remote.
+
+Tidak ada perubahan data pada PMA remote selama proses ini.
 
 ---
 
@@ -172,29 +186,26 @@ DB-Sync-Desktop-Client/
 │   └── release.mjs              # Skrip otomasi rilis versi & Git tagging
 ├── src/                         # Frontend Layer (Vue 3)
 │   ├── components/              # Komponen UI Modular
-│   │   ├── ConnectionConfig.vue # Form Master Konfigurasi Remote & Local Database
-│   │   ├── ConnectionConfigSection.vue # Komponen Sub-section Input Koneksi
-│   │   ├── TableConfig.vue      # Pilihan Tabel Remote & Konfigurasi Kolom
-│   │   ├── SyncControl.vue      # Panel Kontrol Sync, Progress, & State Table History
-│   │   ├── LogConsole.vue       # Console Monitor Log Activity Real-Time
-│   │   ├── DataPreview.vue      # Data Inspector & Table Preview / Truncate Modal
-│   │   └── Navbar.vue           # Header Navigation & Indicator Status Badges
-│   ├── services/                # Business Logic Services
-│   │   ├── pmaClient.js         # HTTP Client untuk Authenticate & Query Remote PMA
-│   │   ├── syncEngine.js        # Engine Koordinasi Incremental Sync & Scheduling
-│   │   ├── syncStateStore.js    # Per-Table Sync State Persistence (LocalStorage)
-│   │   └── tauriHelper.js       # Helper Bridge IPC (Tauri Invoke & Native Call)
-│   ├── styles/                  # Styling Tokens & Custom Global CSS
-│   ├── App.vue                  # Main Layout & State Aggregator
-│   └── main.js                  # Vue Entry Point
-├── src-tauri/                   # Backend Layer (Rust Engine)
+│   │   ├── ConnectionConfigSection.vue # Form konfigurasi PMA remote dan MySQL lokal
+│   │   ├── TableConfig.vue      # Pilihan tabel, pencarian, dan template tabel
+│   │   ├── SyncControl.vue      # Mode Fresh/Sync Server, limit, progress, dan riwayat state
+│   │   ├── LogConsole.vue       # Console aktivitas sync
+│   │   └── Navbar.vue           # Header dan indikator koneksi
+│   ├── services/
+│   │   ├── pmaClient.js         # Client browser fallback
+│   │   ├── syncEngine.js        # Orkestrasi state, prune lokal, dan command Tauri
+│   │   ├── syncStateStore.js    # Watermark per tabel di LocalStorage
+│   │   └── tauriHelper.js       # Bridge IPC Tauri
+│   ├── App.vue                  # Layout dan state aplikasi
+│   └── main.js                  # Vue entry point
+├── src-tauri/
 │   ├── src/
-│   │   ├── commands.rs          # Tauri IPC Commands (MySQL Pool, Bulk Upsert, Preview)
-│   │   ├── pma_export.rs        # Native Rust Exporter (Gzip Stream & PMA Auth)
-│   │   ├── lib.rs               # Registrasi Command Handler & Tauri Plugin
-│   │   └── main.rs              # Entrypoint Binary Tauri
-│   ├── Cargo.toml               # Dependensi & Manifest Crate Rust
-│   └── tauri.conf.json          # Konfigurasi Window & Build Tauri App
+│   │   ├── commands.rs          # Command MySQL lokal, MAX ID, delete watermark
+│   │   ├── pma_export.rs        # Login PMA dan direct SQL/GZIP stream
+│   │   ├── lib.rs               # Registrasi command Tauri
+│   │   └── main.rs              # Entrypoint binary
+│   ├── Cargo.toml
+│   └── tauri.conf.json          # Konfigurasi window dan build Tauri
 ├── PKGBUILD                     # Resep Paket Arch Linux
 ├── index.html                   # HTML Entrypoint
 ├── vite.config.js               # Konfigurasi Build Vite
@@ -209,17 +220,25 @@ Di dalam antarmuka aplikasi, Anda dapat mengonfigurasi parameter berikut:
 
 | Parameter | Deskripsi | Contoh Nilai |
 | :--- | :--- | :--- |
-| **URL PMA Remote** | URL basis web PhpMyAdmin remote | `http://192.168.1.100/phpmyadmin` |
-| **PMA Kredensial** | Username & Password login PhpMyAdmin | `root` / `******` |
-| **Database Remote** | Nama database target di server remote | `db_store` |
-| **Table List & PK** | Pilih tabel remote & atur *Primary Key* masing-masing | `orders` (`id`), `users` (`user_id`) |
-| **Local MySQL Host** | Host database MySQL / MariaDB lokal | `127.0.0.1` |
-| **Local MySQL Port** | Port database MySQL / MariaDB lokal | `3306` |
-| **Local Kredensial** | Username & Password MySQL lokal | `root` / `******` |
-| **Local Database** | Nama database lokal penerima data | `db_store_local` |
-| **Mode Sinkronisasi** | `incremental` (New & Update) / `fresh` (Resync) | `incremental` |
-| **Row Limit** | Batas maksimum baris per sesi sync (0 = Semua Row) | `0`, `10000`, `100000` |
-| **Interval Auto-Sync**| Interval otomatisasi sync (0 = Manual) | `0` (Manual), `10` (10s), `60` (1m) |
+| **URL PMA Remote** | URL basis web PhpMyAdmin remote | `https://server.example.com/phpmyadmin` |
+| **PMA Kredensial** | Username dan password login PhpMyAdmin | `root` / `******` |
+| **Database Remote** | Nama database sumber di server remote | `db_store` |
+| **Primary Key Default** | Kolom urutan/watermark default untuk export | `id` |
+| **Tabel Dipilih** | Tabel remote yang akan disalin | `orders`, `users` |
+| **MySQL Lokal** | Host, port, kredensial, dan database penerima data | `127.0.0.1:3306`, `db_store_local` |
+| **Mode Sinkronisasi** | `Sync Server` atau `Fresh Sync` | `incremental` |
+| **Row Limit** | Jumlah maksimum row per tabel. Saat limit aktif, Fresh memakai row terbaru berdasarkan primary key | `0`, `1000`, `100000` |
+| **Interval Auto-Sync** | Interval otomatisasi | `0` (Manual), `10` (10s), `60` (1m) |
+
+### Pilih Mode dengan Aman
+
+| Mode | Aksi di MySQL Lokal | Aksi di PMA Remote | Gunakan Saat |
+| :--- | :--- | :--- | :--- |
+| **Sync Server (New & Update)** | Hapus row lokal di atas `Last ID`, import row baru dan row yang berubah | `SELECT` / export saja | Server sumber data utama; ingin menjaga tabel lokal konsisten tanpa full refresh |
+| **Fresh Sync** | `DROP TABLE IF EXISTS`, lalu import ulang struktur dan data | `SELECT` / export saja | Perlu mengganti penuh salinan tabel lokal |
+
+> [!CAUTION]
+> Kedua mode dapat menghapus atau mengganti data **lokal**. Tidak satu pun mode menulis ke PMA remote.
 
 ---
 
