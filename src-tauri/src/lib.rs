@@ -11,6 +11,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::test_local_connection,
             commands::get_last_local_id,
+            commands::delete_local_rows_after_id,
             commands::get_local_max_updated_at,
             commands::sync_to_local_db,
             commands::get_local_table_preview,

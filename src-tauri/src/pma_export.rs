@@ -21,6 +21,14 @@ pub struct PmaExportConfig {
     pub table_primary_keys: Option<HashMap<String, String>>,
     /// Fallback primary key global (dipakai kalau tabel tidak ada di table_primary_keys)
     pub primary_key: Option<String>,
+    /// Riwayat per tabel: ID dan waktu terakhir yang sudah dikonfirmasi dari server.
+    pub incremental_watermarks: Option<HashMap<String, IncrementalWatermark>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct IncrementalWatermark {
+    pub last_synced_id: serde_json::Value,
+    pub last_sync_time: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -711,10 +719,7 @@ pub async fn fetch_pma_tables(
                 "{}/index.php?route=/database/structure&db={}{}",
                 base_url, db_encoded, token_param
             ),
-            format!(
-                "{}/db_structure.php?db={}{}",
-                base_url, db_encoded, token_param
-            ),
+            format!("{}/db_structure.php?db={}{}", base_url, db_encoded, token_param),
             format!("{}/index.php?db={}{}", base_url, db_encoded, token_param),
         ];
 
@@ -1349,7 +1354,11 @@ async fn stream_export_single_table(
                 ("sql_type".to_string(), sql_type_val.to_string()),
             ];
 
-            if let Some(limit) = pma_config.row_limit.filter(|limit| *limit > 0) {
+            let has_incremental_watermark = pma_config.sync_mode.as_deref() == Some("incremental")
+                && pma_config.incremental_watermarks.as_ref()
+                    .is_some_and(|watermarks| watermarks.contains_key(table_name));
+            if pma_config.row_limit.filter(|limit| *limit > 0).is_some() || has_incremental_watermark {
+                let limit = pma_config.row_limit.filter(|limit| *limit > 0).unwrap_or(usize::MAX);
                 let safe_table = table_name.replace('`', "``");
                 // Cari PK: 1) per-tabel map, 2) global fallback, 3) `id`.
                 // Limit tanpa ORDER BY tidak deterministik dan dapat mengimpor baris lama.
@@ -1362,10 +1371,28 @@ async fn stream_export_single_table(
                     .or_else(|| pma_config.primary_key.as_deref().map(str::trim).filter(|pk| !pk.is_empty()))
                     .unwrap_or("id");
                 let safe_pk = pk_col.replace('`', "``");
-                let limited_query = format!(
-                    "SELECT * FROM `{}` ORDER BY `{}` DESC LIMIT {}",
-                    safe_table, safe_pk, limit
-                );
+                let limited_query = if let Some(watermark) = pma_config
+                    .incremental_watermarks
+                    .as_ref()
+                    .and_then(|watermarks| watermarks.get(table_name))
+                    .filter(|_| pma_config.sync_mode.as_deref() == Some("incremental"))
+                {
+                    let last_id = match &watermark.last_synced_id {
+                        serde_json::Value::Number(value) => value.to_string(),
+                        serde_json::Value::String(value) => format!("'{}'", value.replace('\'', "''")),
+                        _ => return Err(format!("Last ID tabel '{}' tidak valid.", table_name)),
+                    };
+                    let last_sync = watermark.last_sync_time.replace('\'', "''");
+                    format!(
+                        "SELECT * FROM `{}` WHERE `{}` > {} OR `updated_at` > '{}' ORDER BY `{}` ASC LIMIT {}",
+                        safe_table, safe_pk, last_id, last_sync, safe_pk, limit
+                    )
+                } else {
+                    format!(
+                        "SELECT * FROM `{}` ORDER BY `{}` DESC LIMIT {}",
+                        safe_table, safe_pk, limit
+                    )
+                };
                 emit_log(app, "info", format!("[Tabel '{}'] Query export: {}", table_name, limited_query));
                 form.push(("sql_query".to_string(), limited_query));
                 form.push(("query_type".to_string(), "table".to_string()));

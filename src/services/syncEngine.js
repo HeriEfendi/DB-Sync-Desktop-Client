@@ -141,6 +141,25 @@ export class SyncEngine {
             tablePrimaryKeys[t.name] = t.primaryKey;
           }
         });
+        const incrementalWatermarks = {};
+        if (syncMode === 'incremental') {
+          for (const tableName of tableNames) {
+            const state = getTableState(this.serverHost, this.database, tableName);
+            const primaryKey = tablePrimaryKeys[tableName] || this.pmaConfig.primaryKey?.trim() || 'id';
+            if (state?.lastSyncedId === null || state?.lastSyncedId === undefined || !state.lastSyncTime) continue;
+            const removedRows = await safeInvoke('delete_local_rows_after_id', {
+              config: this.localDbConfig,
+              tableName,
+              primaryKey,
+              lastSyncedId: state.lastSyncedId,
+            });
+            incrementalWatermarks[tableName] = {
+              last_synced_id: state.lastSyncedId,
+              last_sync_time: state.lastSyncTime,
+            };
+            if (removedRows > 0) this.log('warning', `[Tabel '${tableName}'] ${removedRows} data lokal di atas Last ID ${state.lastSyncedId} dihapus untuk sinkron dengan server.`);
+          }
+        }
         const exportResult = await safeInvoke('export_pma_database', {
           pmaConfig: {
             url: this.pmaConfig.url,
@@ -153,6 +172,7 @@ export class SyncEngine {
             throttle_ms: 400,
             table_primary_keys: Object.keys(tablePrimaryKeys).length > 0 ? tablePrimaryKeys : null,
             primary_key: this.pmaConfig.primaryKey?.trim() || 'id',
+            incremental_watermarks: Object.keys(incrementalWatermarks).length ? incrementalWatermarks : null,
           },
           localConfig: {
             host: this.localDbConfig.host || '127.0.0.1',
@@ -162,6 +182,34 @@ export class SyncEngine {
             database: this.localDbConfig.database || '',
           },
         });
+
+        const lastSyncTime = new Date().toISOString();
+        await Promise.all(tableNames.map(async (tableName) => {
+          const primaryKey = tablePrimaryKeys[tableName] || this.pmaConfig.primaryKey?.trim() || 'id';
+          let lastSyncedId = null;
+          try {
+            lastSyncedId = await safeInvoke('get_last_local_id', {
+              config: {
+                host: this.localDbConfig.host || '127.0.0.1',
+                port: parseInt(this.localDbConfig.port || 3306, 10),
+                username: this.localDbConfig.username || 'root',
+                password: this.localDbConfig.password || '',
+                database: this.localDbConfig.database || '',
+              },
+              tableName,
+              primaryKey,
+            });
+          } catch (error) {
+            console.warn(`[Sync state] Gagal membaca MAX(${primaryKey}) untuk '${tableName}':`, error);
+          }
+          saveTableState(this.serverHost, this.database, tableName, {
+            lastSyncedId,
+            lastSyncTime,
+            rowsSynced: 0,
+            primaryKey,
+          });
+          this.onTableSynced(tableName);
+        }));
 
         const elapsed = Math.round(performance.now() - startTime);
         this.log('success', `🎉 Sinkronisasi Selesai! (Waktu: ${elapsed}ms)`);

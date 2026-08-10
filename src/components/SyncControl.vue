@@ -81,7 +81,7 @@
       <div class="options-row">
         <div class="option-inline">
           <span class="option-title">Mode:</span>
-          <label class="radio-label-inline"><input type="radio" name="syncMode" value="incremental" :checked="syncMode === 'incremental'" @change="$emit('update:sync-mode', 'incremental')" /> <span>Sync (New &amp; Update)</span></label>
+          <label class="radio-label-inline" title="Server sumber data utama. Menghapus data lokal di atas Last ID, lalu mengambil ID baru dan data updated_at terbaru dari server."><input type="radio" name="syncMode" value="incremental" :checked="syncMode === 'incremental'" @change="$emit('update:sync-mode', 'incremental')" /> <span>Sync Server (New &amp; Update)</span></label>
           <label class="radio-label-inline warning-radio"><input type="radio" name="syncMode" value="fresh" :checked="syncMode === 'fresh'" @change="$emit('update:sync-mode', 'fresh')" /> <span>Fresh Sync</span></label>
         </div>
         <div class="option-inline">
@@ -117,15 +117,19 @@
     </div>
     <div v-if="syncTableStates && syncTableStates.length > 0" class="sync-states-card">
       <div class="states-header">
-        <div class="states-title-wrap">
-          <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 8v4l3 3"></path><circle cx="12" cy="12" r="9"></circle></svg>
-          <span class="states-title">State &amp; ID Sync Terakhir per Tabel</span>
-        </div>
-        <button class="btn btn-ghost btn-xs text-rose" title="Reset semua riwayat sync state" @click="$emit('reset-all-table-states')">
+        <button class="states-toggle" type="button" :aria-expanded="showSyncStates" aria-controls="sync-states-table" @click="showSyncStates = !showSyncStates">
+          <span class="states-title-wrap">
+            <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 8v4l3 3"></path><circle cx="12" cy="12" r="9"></circle></svg>
+            <span class="states-title">State &amp; ID Sync Terakhir per Tabel</span>
+            <span class="state-count">{{ syncTableStates.length }}</span>
+          </span>
+          <svg class="toggle-chevron" :class="{ open: showSyncStates }" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"></path></svg>
+        </button>
+        <button v-if="showSyncStates" class="btn btn-ghost btn-xs text-rose" title="Reset semua riwayat sync state" @click="$emit('reset-all-table-states')">
           Reset Semua State
         </button>
       </div>
-      <div class="states-table-wrapper">
+      <div v-show="showSyncStates" id="sync-states-table" class="states-table-wrapper">
         <table class="states-table">
           <thead>
             <tr>
@@ -201,6 +205,7 @@ const emit = defineEmits([
 
 // --- Realtime elapsed timer ---
 const elapsedSeconds = ref(0);
+const showSyncStates = ref(false);
 let elapsedTimer = null;
 
 watch(() => props.isSyncing, (syncing) => {
@@ -539,7 +544,27 @@ const formatDuration = (ms) => {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  margin-bottom: 8px;
+}
+
+.states-toggle {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+  padding: 2px 0;
+  color: var(--text-muted);
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  text-align: left;
+}
+
+.states-toggle:focus-visible {
+  outline: 2px solid var(--accent-cyan);
+  outline-offset: 3px;
+  border-radius: 4px;
 }
 
 .states-title-wrap {
@@ -547,6 +572,24 @@ const formatDuration = (ms) => {
   align-items: center;
   gap: 6px;
   color: var(--text-muted);
+}
+
+.state-count {
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: rgba(56, 189, 248, 0.12);
+  color: var(--accent-cyan);
+  font-size: 0.7rem;
+  font-weight: 700;
+}
+
+.toggle-chevron {
+  flex: 0 0 auto;
+  transition: transform 0.2s ease;
+}
+
+.toggle-chevron.open {
+  transform: rotate(180deg);
 }
 
 .states-title {

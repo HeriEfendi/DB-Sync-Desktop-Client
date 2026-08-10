@@ -288,6 +288,9 @@ pub async fn get_last_local_id(
     pool.close().await;
 
     if let Some(r) = row {
+        if let Ok(val) = r.try_get::<u64, _>(0) {
+            return Ok(Some(serde_json::Value::Number(val.into())));
+        }
         if let Ok(val) = r.try_get::<i64, _>(0) {
             return Ok(Some(serde_json::Value::Number(val.into())));
         }
@@ -302,6 +305,34 @@ pub async fn get_last_local_id(
     }
 
     Ok(None)
+}
+
+/// Delete local rows newer than the last server-confirmed primary key.
+#[tauri::command]
+pub async fn delete_local_rows_after_id(
+    config: LocalDbConfig,
+    table_name: String,
+    primary_key: String,
+    last_synced_id: serde_json::Value,
+) -> Result<u64, String> {
+    let safe_table = sanitize_identifier(&table_name)?;
+    let safe_pk = sanitize_identifier(&primary_key)?;
+    let conn_str = build_connection_string(&config);
+    let pool = MySqlPoolOptions::new()
+        .max_connections(2)
+        .connect(&conn_str)
+        .await
+        .map_err(|e| format!("Koneksi ke MySQL lokal gagal: {}", e))?;
+
+    let query = format!("DELETE FROM {} WHERE {} > ?", safe_table, safe_pk);
+    let result = match last_synced_id {
+        serde_json::Value::Number(value) => sqlx::query(&query).bind(value.to_string()).execute(&pool).await,
+        serde_json::Value::String(value) => sqlx::query(&query).bind(value).execute(&pool).await,
+        _ => return Err("Last synced ID harus angka atau teks".to_string()),
+    }.map_err(|e| format!("Gagal menghapus data lokal setelah {}: {}", primary_key, e))?;
+
+    pool.close().await;
+    Ok(result.rows_affected())
 }
 
 /// Get the maximum updated_at timestamp from a local table.
