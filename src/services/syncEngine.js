@@ -100,17 +100,10 @@ export class SyncEngine {
 
     if (isTauriEnvironment()) {
       let latestTotalSyncedRows = 0;
-      const hiddenLogPrefixes = [
-        'Primary key server tidak terdeteksi;',
-        '[PK detect] Response bukan JSON valid, skip.',
-        '[PK detect] Endpoint ',
-      ];
-
       const unlistenLog = await safeListen('pma-log', (event) => {
         const payload = event.payload;
-        const showFreshCleanup = payload?.type === 'info' && payload.message.includes('Mode Fresh Sync');
-        if (payload && (showFreshCleanup || (payload.type !== 'info' && !hiddenLogPrefixes.some((prefix) => payload.message.startsWith(prefix))))) {
-          this.log(payload.type, payload.message);
+        if (payload && payload.message) {
+          this.log(payload.type || 'info', payload.message);
         }
       });
 
@@ -297,11 +290,8 @@ export class SyncEngine {
           const resolvedPk = await pma.resolvePrimaryKey(tableName);
           pk = resolvedPk || null;
         } catch (e) {
-          this.log('warning', `[Tabel '${tableName}'] Tidak dapat memastikan primary key metadata, memakai fallback tanpa PK.`);
           pk = null;
         }
-
-        this.log('info', `➡️ [Tabel ${idx + 1}/${tables.length}] Memproses tabel '${tableName}'${pk ? ` (PK: ${pk})` : ' (Tanpa PK, mode fallback)'}...`);
 
         this.onProgress({
           currentTableIndex: idx + 1,
@@ -313,7 +303,6 @@ export class SyncEngine {
         });
 
         if (syncMode === 'fresh') {
-          this.log('warning', `[Tabel '${tableName}'] Mengosongkan (TRUNCATE) tabel lokal untuk mode Fresh Sync...`);
           try {
             await withRetry(
               () => safeInvoke('truncate_local_table', { config: dbConfigObj, tableName }),
@@ -333,7 +322,6 @@ export class SyncEngine {
           const storedState = getTableState(this.serverHost, this.database, tableName);
           if (storedState && storedState.lastSyncedId !== null && storedState.lastSyncedId !== undefined) {
             lastId = storedState.lastSyncedId;
-            this.log('info', `[Tabel '${tableName}'] Menggunakan last synced ID dari riwayat: ${lastId} (sync terakhir: ${storedState.lastSyncTime || '-'})`);
           } else {
             // Fallback: ambil MAX(id) dari tabel lokal jika belum pernah sync
             try {
@@ -341,7 +329,6 @@ export class SyncEngine {
                 () => safeInvoke('get_last_local_id', { config: dbConfigObj, tableName, primaryKey: pk }),
                 `Mengecek ID lokal '${tableName}'`
               );
-              this.log('info', `[Tabel '${tableName}'] Belum ada riwayat sync, menggunakan MAX(${pk}) lokal: ${lastId !== null && lastId !== undefined ? lastId : 'Kosong'}`);
             } catch (e) {
               this.log('warning', `[Tabel '${tableName}'] Tidak dapat mengecek ID lokal (${e.message || e}), mulai dari awal.`);
             }
@@ -373,20 +360,15 @@ export class SyncEngine {
             }
           }
 
-          this.log('info', `[Tabel '${tableName}'] Mengambil batch data dari PMA (${pk} > ${lastId !== null ? lastId : 0}, limit: ${currentBatchSize})...`);
-
           const newRows = await withRetry(
             () => pma.fetchIncrementalData(lastId, currentBatchSize),
             `Penarikan data '${tableName}' (PMA)`
           );
 
           if (!newRows || newRows.length === 0) {
-            this.log('info', `[Tabel '${tableName}'] Tidak ada lagi data baru untuk ditarik.`);
             hasMoreData = false;
             break;
           }
-
-          this.log('success', `[Tabel '${tableName}'] Mengekstrak ${newRows.length} baris dari PMA, mengirim ke MySQL lokal...`);
 
           const syncResult = await withRetry(
             () => safeInvoke('sync_to_local_db', {
@@ -402,8 +384,6 @@ export class SyncEngine {
           totalFetchedForTable += actualProcessed;
           totalSyncedAllTables += actualProcessed;
           fetchedRowsForThisTable.push(...newRows);
-
-          this.log('success', `[Tabel '${tableName}'] Berhasil menyimpan ${actualProcessed} baris ke database lokal.`);
 
           this.onProgress({
             currentTableIndex: idx + 1,
@@ -423,7 +403,6 @@ export class SyncEngine {
           const lastObj = newRows[newRows.length - 1];
           const detectedPk = this.detectPrimaryKey(lastObj, pk);
           if (detectedPk !== pk) {
-            this.log('info', `[Tabel '${tableName}'] Primary key terdeteksi dari data: '${detectedPk}' (sebelumnya '${pk}')`);
             pk = detectedPk;
             pma.primaryKey = pk;
           }
@@ -433,13 +412,11 @@ export class SyncEngine {
 
           if (nextLastId !== undefined && nextLastId !== null) {
             if (String(nextLastId) === String(previousLastId)) {
-              this.log('warning', `[Tabel '${tableName}'] Primary key '${pk}' nilainya tidak bertambah (${nextLastId}). Menghentikan perulangan untuk mencegah infinite loop.`);
               hasMoreData = false;
               break;
             }
             lastId = nextLastId;
           } else {
-            this.log('warning', `[Tabel '${tableName}'] Primary key '${pk}' tidak ditemukan pada baris data. Menghentikan perulangan batch.`);
             hasMoreData = false;
             break;
           }
@@ -449,12 +426,9 @@ export class SyncEngine {
           }
 
           if (totalRowLimit > 0 && totalFetchedForTable >= totalRowLimit) {
-            this.log('info', `[Tabel '${tableName}'] Batas limit row (${totalRowLimit}) telah tercapai.`);
             hasMoreData = false;
           }
         }
-
-        this.log('success', `✅ [Tabel '${tableName}'] Phase 1 selesai! ${totalFetchedForTable} baris baru berhasil ditarik.`);
 
         // Simpan state sync terakhir untuk tabel ini
         if (lastId !== null && lastId !== undefined) {
@@ -481,7 +455,6 @@ export class SyncEngine {
           }
 
           if (localMaxUpdatedAt !== null && localMaxUpdatedAt !== undefined && localMaxUpdatedAt !== '') {
-            this.log('info', `[Tabel '${tableName}'] Phase 2 — Mencari baris yang diperbarui di server sejak: ${localMaxUpdatedAt}...`);
             let updateOffset = 0;
             let hasMoreUpdates = true;
 
@@ -495,8 +468,6 @@ export class SyncEngine {
                 hasMoreUpdates = false;
                 break;
               }
-
-              this.log('info', `[Tabel '${tableName}'] Phase 2 — Mengekstrak ${updatedRows.length} baris yang diperbarui, mengirim ke MySQL lokal...`);
 
               const updateResult = await withRetry(
                 () => safeInvoke('sync_to_local_db', {
@@ -513,8 +484,6 @@ export class SyncEngine {
               totalSyncedAllTables += updatedProcessed;
               updateOffset += updatedRows.length;
 
-              this.log('success', `[Tabel '${tableName}'] Phase 2 — ${updatedProcessed} baris berhasil di-update.`);
-
               this.onProgress({
                 currentTableIndex: idx + 1,
                 totalTables: tables.length,
@@ -527,12 +496,7 @@ export class SyncEngine {
               if (updatedRows.length < batchSize) hasMoreUpdates = false;
             }
 
-            if (!this.shouldStop) {
-              this.log('success', `[Tabel '${tableName}'] Phase 2 selesai.`);
-            }
-          } else {
-            this.log('info', `[Tabel '${tableName}'] Tabel tidak memiliki kolom updated_at, Phase 2 dilewati.`);
-          }
+          } 
         }
 
         this.log('success', `✅ [Tabel '${tableName}'] Selesai! Total ${totalFetchedForTable} baris data berhasil disinkronkan.`);

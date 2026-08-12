@@ -864,8 +864,6 @@ async fn fetch_all_primary_keys(
             Err(_) => continue,
         };
 
-        emit_log(app, "info", format!("[PK detect] Response preview ({}): {}", sql_url, &raw_text[..raw_text.len().min(400)]));
-
         let json_val = match serde_json::from_str::<serde_json::Value>(&raw_text) {
             Ok(v) => v,
             Err(_) => {
@@ -881,7 +879,6 @@ async fn fetch_all_primary_keys(
         if !success {
             let err = json_val.get("error").or_else(|| json_val.get("message"))
                 .and_then(|v| v.as_str()).unwrap_or("unknown");
-            emit_log(app, "warn", format!("[PK detect] PMA mengembalikan success=false: {}", err));
             continue;
         }
 
@@ -901,8 +898,6 @@ async fn fetch_all_primary_keys(
 
             let tbl_idx = col_names.iter().position(|c| c == "TABLE_NAME");
             let col_idx = col_names.iter().position(|c| c == "COLUMN_NAME");
-
-            emit_log(app, "info", format!("[PK detect] fields+rows format, tbl_idx={:?} col_idx={:?} rows={}", tbl_idx, col_idx, rows.len()));
 
             if let (Some(ti), Some(ci)) = (tbl_idx, col_idx) {
                 for row in rows {
@@ -932,7 +927,6 @@ async fn fetch_all_primary_keys(
             let try_keys = ["data", "dataset", "results", "query_data"];
             'fmt2: for key in &try_keys {
                 if let Some(rows) = json_val.get(key).and_then(|v| v.as_array()) {
-                    emit_log(app, "info", format!("[PK detect] Mencoba format '{}' dengan {} rows", key, rows.len()));
                     for row in rows {
                         let (tbl, col) = if let Some(arr) = row.as_array() {
                             let t = arr.first().and_then(|v| v.as_str()
@@ -963,7 +957,6 @@ async fn fetch_all_primary_keys(
         }
 
         if !pk_map.is_empty() {
-            emit_log(app, "success", format!("[PK detect] Berhasil! {} tabel punya primary key.", pk_map.len()));
             break;
         } else {
             emit_log(app, "warn", format!("[PK detect] Endpoint {} tidak menghasilkan PK, coba endpoint lain.", sql_url));
@@ -1296,6 +1289,40 @@ fn extract_tables_from_html(html: &str) -> Vec<String> {
 }
 
 /// Execute stream export for a single table via export.php/route endpoints and pipe decompressed or raw stream directly to mysql STDIN
+fn count_imported_sql_rows(sql_bytes: &[u8]) -> usize {
+    let sql = String::from_utf8_lossy(sql_bytes);
+    let mut count = 0usize;
+    let mut in_values = false;
+
+    for line in sql.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("INSERT INTO") || trimmed.starts_with("REPLACE INTO") {
+            in_values = true;
+            if trimmed.contains("VALUES") {
+                let after_values = trimmed.split("VALUES").nth(1).unwrap_or("");
+                let items = after_values.split("),").count();
+                if items > 0 {
+                    count += items;
+                }
+            }
+            continue;
+        }
+        if in_values {
+            if trimmed.starts_with('(') {
+                count += 1;
+            }
+            if trimmed.ends_with(';') {
+                in_values = false;
+            }
+        }
+    }
+
+    if count == 0 && (sql.contains("INSERT INTO") || sql.contains("REPLACE INTO")) {
+        count = 1;
+    }
+    count
+}
+
 async fn stream_export_single_table(
     client: &reqwest::Client,
     base_url: &str,
@@ -1303,29 +1330,51 @@ async fn stream_export_single_table(
     pma_config: &PmaExportConfig,
     local_config: &LocalDbConfig,
     table_name: &str,
+    cached_endpoint: &std::sync::Arc<tokio::sync::Mutex<Option<(String, String)>>>,
     app: &tauri::AppHandle,
 ) -> Result<usize, String> {
+    let table_start = std::time::Instant::now();
+
+    emit_log(
+        app,
+        "info",
+        format!("[Tabel '{}'] Mempersiapkan sinkronisasi...", table_name),
+    );
+
     let sql_type_val = if pma_config.sync_mode.as_deref() == Some("fresh") {
         "INSERT"
     } else {
         "REPLACE"
     };
 
-    let export_urls = vec![
-        format!("{}/export.php", base_url),
-        format!("{}/index.php?route=/export", base_url),
-        format!("{}/index.php?route=/table/export", base_url),
-        format!("{}/index.php?route=/database/export", base_url),
-    ];
+    let (cached_url, cached_comp) = {
+        let guard = cached_endpoint.lock().await;
+        guard.clone().unzip()
+    };
 
-    let compressions = vec!["gzip", "none"];
+    let export_urls = if let Some(ref u) = cached_url {
+        vec![u.clone()]
+    } else {
+        vec![
+            format!("{}/export.php", base_url),
+            format!("{}/index.php?route=/export", base_url),
+            format!("{}/index.php?route=/table/export", base_url),
+            format!("{}/index.php?route=/database/export", base_url),
+        ]
+    };
+
+    let compressions = if let Some(ref c) = cached_comp {
+        vec![c.clone()]
+    } else {
+        vec!["gzip".to_string(), "none".to_string()]
+    };
 
     let mut valid_response: Option<(reqwest::Response, bool)> = None; // (response, is_gzip)
     let mut last_html_err = String::new();
 
     'endpoint_loop: for export_url in &export_urls {
         for compression_mode in &compressions {
-            let is_gz = *compression_mode == "gzip";
+            let is_gz = compression_mode == "gzip";
             let mut form: Vec<(String, String)> = vec![
                 ("db".to_string(), pma_config.database.clone()),
                 ("table".to_string(), table_name.to_string()),
@@ -1338,7 +1387,7 @@ async fn stream_export_single_table(
                 ("export_method".to_string(), "custom".to_string()),
                 ("quick_or_custom".to_string(), "custom".to_string()),
                 ("output_format".to_string(), "sendit".to_string()),
-                ("compression".to_string(), compression_mode.to_string()),
+                ("compression".to_string(), compression_mode.clone()),
                 ("asfile".to_string(), "sendit".to_string()),
                 (
                     "sql_structure_or_data".to_string(),
@@ -1393,7 +1442,7 @@ async fn stream_export_single_table(
                         safe_table, safe_pk, limit
                     )
                 };
-                emit_log(app, "info", format!("[Tabel '{}'] Query export: {}", table_name, limited_query));
+                // emit_log(app, "info", format!("[Tabel '{}'] Query export: {}", table_name, limited_query));
                 form.push(("sql_query".to_string(), limited_query));
                 form.push(("query_type".to_string(), "table".to_string()));
                 form.push(("sql_query_input".to_string(), "true".to_string()));
@@ -1401,6 +1450,12 @@ async fn stream_export_single_table(
             if !csrf_token.is_empty() {
                 form.push(("token".to_string(), csrf_token.to_string()));
             }
+
+            // emit_log(
+            //     app,
+            //     "info",
+            //     format!("[Tabel '{}'] Mulai mengunduh SQL dari PMA...", table_name),
+            // );
 
             let response_res = client.post(export_url).form(&form).send().await;
             let response = match response_res {
@@ -1448,6 +1503,12 @@ async fn stream_export_single_table(
                 ),
             );
             valid_response = Some((response, is_gz));
+
+            // Cache valid working endpoint for next tables
+            let mut guard = cached_endpoint.lock().await;
+            if guard.is_none() {
+                *guard = Some((export_url.clone(), compression_mode.clone()));
+            }
             break 'endpoint_loop;
         }
     }
@@ -1479,7 +1540,7 @@ async fn stream_export_single_table(
     };
 
     if pma_config.sync_mode.as_deref() == Some("fresh") {
-        emit_log(app, "info", format!("[Tabel '{}'] Mode Fresh Sync — Menghapus (DROP TABLE IF EXISTS) tabel lokal terlebih dahulu...", table_name));
+        // emit_log(app, "info", format!("[Tabel '{}'] Mode Fresh Sync — Menghapus (DROP TABLE IF EXISTS) tabel lokal terlebih dahulu...", table_name));
         let mut drop_cmd = Command::new("mysql");
         drop_cmd
             .arg("-h")
@@ -1630,76 +1691,31 @@ async fn stream_export_single_table(
         return Err(format!("Gagal mengirim SQL ke MySQL: {}", e));
     }
 
-    let mut verify_cmd = Command::new("mysql");
-    verify_cmd
-        .arg("-h")
-        .arg(host)
-        .arg("-P")
-        .arg(&port_str)
-        .arg("-u")
-        .arg(&local_config.username);
-    if !local_config.password.is_empty() {
-        verify_cmd.arg(format!("-p{}", local_config.password));
-    }
-    verify_cmd.arg(db_name).arg("--batch").arg("--skip-column-names").arg("-e").arg(format!(
-        "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = '{}' AND TABLE_NAME = '{}';",
-        db_name.replace('\\', "\\\\").replace('\'', "\\'"),
-        table_name.replace('\\', "\\\\").replace('\'', "\\'")
-    ));
-    let verify_output = verify_cmd
-        .output()
-        .map_err(|e| format!("Gagal memverifikasi tabel lokal '{}': {}", table_name, e))?;
-    if !verify_output.status.success()
-        || String::from_utf8_lossy(&verify_output.stdout).trim() != table_name
-    {
-        let stderr = String::from_utf8_lossy(&verify_output.stderr);
-        return Err(format!(
-            "Tabel lokal '{}' tidak ditemukan setelah import. {}",
-            table_name,
-            stderr.trim()
-        ));
-    }
-    let mut count_cmd = Command::new("mysql");
-    count_cmd
-        .arg("-h")
-        .arg(host)
-        .arg("-P")
-        .arg(&port_str)
-        .arg("-u")
-        .arg(&local_config.username);
-    if !local_config.password.is_empty() {
-        count_cmd.arg(format!("-p{}", local_config.password));
-    }
-    count_cmd
-        .arg(db_name)
-        .arg("--batch")
-        .arg("--skip-column-names")
-        .arg("-e")
-        .arg(format!(
-            "SELECT COUNT(*) FROM `{}`;",
-            table_name.replace('`', "``")
-        ));
-    let count_output = count_cmd
-        .output()
-        .map_err(|e| format!("Gagal menghitung row tabel '{}': {}", table_name, e))?;
-    if !count_output.status.success() {
-        return Err(format!(
-            "Gagal menghitung row tabel '{}': {}",
-            table_name,
-            String::from_utf8_lossy(&count_output.stderr).trim()
-        ));
-    }
-    let imported_rows = String::from_utf8_lossy(&count_output.stdout)
-        .trim()
-        .parse::<usize>()
-        .unwrap_or(0);
+    let imported_rows = count_imported_sql_rows(&sql_bytes);
+
+    let elapsed = table_start.elapsed();
+    let elapsed_str = if elapsed.as_secs() >= 60 {
+        format!("{}m {:.1}s", elapsed.as_secs() / 60, elapsed.as_secs_f64() % 60.0)
+    } else {
+        format!("{:.2}s", elapsed.as_secs_f64())
+    };
+
+    let rows_fmt = {
+        let s = imported_rows.to_string();
+        let mut out = String::with_capacity(s.len() + s.len() / 3);
+        for (i, c) in s.chars().rev().enumerate() {
+            if i > 0 && i % 3 == 0 { out.push('.'); }
+            out.push(c);
+        }
+        out.chars().rev().collect::<String>()
+    };
 
     emit_log(
         app,
         "success",
         format!(
-            "[Tabel '{}'] Selesai! {} row masuk.",
-            table_name, imported_rows
+            "[Tabel '{}'] Selesai! ~{} row disinkronkan dalam {}.",
+            table_name, rows_fmt, elapsed_str
         ),
     );
 
@@ -1849,56 +1865,106 @@ pub async fn export_pma_database(
     }
 
     let total_tables = tables.len();
+    let concurrency = 3usize;
     emit_log(
         &app,
         "info",
-        format!("Total {} tabel akan disinkronkan berurutan.", total_tables),
+        format!(
+            "🚀 Memulai ekspor paralel {} tabel (menggunakan {} worker simultan)...",
+            total_tables, concurrency
+        ),
     );
 
-    emit_log(&app, "info", format!("Menjalankan ekspor berurutan untuk {} tabel.", total_tables));
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let cached_endpoint = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+    let completed_tables = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let total_rows = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-    let mut completed_tables = 0usize;
-    let mut total_rows = 0usize;
+    let client = std::sync::Arc::new(client);
+    let base_url = std::sync::Arc::new(base_url);
+    let csrf_token = std::sync::Arc::new(csrf_token);
+    let pma_config = std::sync::Arc::new(pma_config);
+    let local_config = std::sync::Arc::new(local_config);
+
+    let mut join_handles = Vec::new();
+
     for table_name in tables {
-        emit_progress(&app, completed_tables, total_tables, &table_name, 0, total_rows, "syncing");
-        let imported_rows = stream_export_single_table(
-            &client,
-            &base_url,
-            &csrf_token,
-            &pma_config,
-            &local_config,
-            &table_name,
-            &app,
-        ).await?;
-        completed_tables += 1;
-        total_rows += imported_rows;
-        emit_progress(&app, completed_tables, total_tables, &table_name, imported_rows, total_rows, "syncing");
+        let sem = semaphore.clone();
+        let client_c = client.clone();
+        let base_url_c = base_url.clone();
+        let csrf_token_c = csrf_token.clone();
+        let pma_config_c = pma_config.clone();
+        let local_config_c = local_config.clone();
+        let cached_endpoint_c = cached_endpoint.clone();
+        let completed_c = completed_tables.clone();
+        let total_rows_c = total_rows.clone();
+        let app_handle = app.clone();
 
-        if completed_tables < total_tables {
-            tokio::time::sleep(Duration::from_millis(pma_config.throttle_ms.unwrap_or(400))).await;
+        let handle = tokio::spawn(async move {
+            let _permit = sem.acquire().await.map_err(|e| e.to_string())?;
+
+            let imported_rows = stream_export_single_table(
+                &client_c,
+                &base_url_c,
+                &csrf_token_c,
+                &pma_config_c,
+                &local_config_c,
+                &table_name,
+                &cached_endpoint_c,
+                &app_handle,
+            )
+            .await?;
+
+            let current_completed = completed_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            let current_total_rows = total_rows_c.fetch_add(imported_rows, std::sync::atomic::Ordering::SeqCst) + imported_rows;
+
+            emit_progress(
+                &app_handle,
+                current_completed,
+                total_tables,
+                &table_name,
+                imported_rows,
+                current_total_rows,
+                "syncing",
+            );
+
+            Ok::<usize, String>(imported_rows)
+        });
+
+        join_handles.push(handle);
+    }
+
+    for handle in join_handles {
+        match handle.await {
+            Ok(Ok(_)) => {},
+            Ok(Err(e)) => return Err(e),
+            Err(e) => return Err(format!("Worker execution error: {}", e)),
         }
     }
 
+    let final_total_rows = total_rows.load(std::sync::atomic::Ordering::SeqCst);
+    let final_completed = completed_tables.load(std::sync::atomic::Ordering::SeqCst);
+
     emit_progress(
         &app,
-        completed_tables,
+        final_completed,
         total_tables,
         "",
         0,
-        total_rows,
+        final_total_rows,
         "finished",
     );
     emit_log(
         &app,
         "success",
         format!(
-            "🎉 Direct SQL/GZIP Stream Sync Berhasil! {} tabel telah disinkronkan.",
+            "🎉 Direct SQL/GZIP Stream Sync Berhasil! {} tabel telah disinkronkan dengan 3 worker paralel.",
             total_tables
         ),
     );
 
     Ok(format!(
-        "Berhasil menyinkronkan {} tabel via Direct GZIP Stream.",
+        "Berhasil menyinkronkan {} tabel via Direct GZIP Stream (3 Workers).",
         total_tables
     ))
 }

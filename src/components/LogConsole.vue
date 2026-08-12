@@ -75,13 +75,18 @@ const currentFilter = ref('all');
 const searchQuery = ref('');
 
 const filteredLogs = computed(() => {
-  const recentLogs = props.logs.length > 300 ? props.logs.slice(-300) : props.logs;
-  const list = recentLogs.filter((log) => {
-    const matchesLevel = currentFilter.value === 'all' || log.type === currentFilter.value;
-    const matchesSearch = !searchQuery.value || log.message.toLowerCase().includes(searchQuery.value.toLowerCase());
-    return matchesLevel && matchesSearch;
-  });
-  return list.slice().reverse();
+  if (!props.logs || props.logs.length === 0) return [];
+  const query = searchQuery.value ? searchQuery.value.toLowerCase().trim() : '';
+  const filter = currentFilter.value;
+  const result = [];
+
+  for (let i = props.logs.length - 1; i >= 0 && result.length < 100; i--) {
+    const log = props.logs[i];
+    if (filter !== 'all' && log.type !== filter) continue;
+    if (query && !log.message.toLowerCase().includes(query)) continue;
+    result.push(log);
+  }
+  return result;
 });
 
 // Auto-scroll to top on new log entry (since newest logs are at the top)
@@ -186,6 +191,7 @@ const copyLogs = () => {
   font-size: 0.81rem;
   line-height: 1.6;
   background: #090d16;
+  overscroll-behavior: contain;
 }
 
 .empty-log {

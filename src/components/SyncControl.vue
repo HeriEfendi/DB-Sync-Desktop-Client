@@ -605,6 +605,7 @@ const formatDuration = (ms) => {
   overflow-x: auto;
   max-height: 200px;
   overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .states-table {
