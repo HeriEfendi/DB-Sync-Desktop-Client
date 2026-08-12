@@ -238,16 +238,27 @@ onMounted(async () => {
   });
 });
 
+const saveTimerMap = {};
+const debounceStorageSave = (key, value) => {
+  if (saveTimerMap[key]) clearTimeout(saveTimerMap[key]);
+  saveTimerMap[key] = setTimeout(() => {
+    try {
+      localStorage.setItem(key, typeof value === 'string' ? value : JSON.stringify(value));
+    } catch (e) {}
+    delete saveTimerMap[key];
+  }, 300);
+};
+
 watch(pmaConfig, (val) => {
-  localStorage.setItem('db_sync_pma_config', JSON.stringify(val));
+  debounceStorageSave('db_sync_pma_config', val);
   refreshTableStates();
 }, { deep: true });
-watch(localConfig, (val) => localStorage.setItem('db_sync_local_config', JSON.stringify(val)), { deep: true });
-watch(availableTables, (val) => localStorage.setItem('db_sync_available_tables', JSON.stringify(val)), { deep: true });
-watch(selectedTables, (val) => localStorage.setItem('db_sync_selected_tables', JSON.stringify(val)), { deep: true });
-watch(syncMode, (val) => localStorage.setItem('db_sync_mode', val));
-watch(rowLimit, (val) => localStorage.setItem('db_sync_row_limit', String(val)));
-watch(stats, (val) => localStorage.setItem('db_sync_stats', JSON.stringify(val)), { deep: true });
+watch(localConfig, (val) => debounceStorageSave('db_sync_local_config', val), { deep: true });
+watch(availableTables, (val) => debounceStorageSave('db_sync_available_tables', val), { deep: true });
+watch(selectedTables, (val) => debounceStorageSave('db_sync_selected_tables', val), { deep: true });
+watch(syncMode, (val) => debounceStorageSave('db_sync_mode', val));
+watch(rowLimit, (val) => debounceStorageSave('db_sync_row_limit', String(val)));
+watch(stats, (val) => debounceStorageSave('db_sync_stats', val), { deep: true });
 
 const handlePresetChanged = () => {
   pmaStatus.value.connected = false;

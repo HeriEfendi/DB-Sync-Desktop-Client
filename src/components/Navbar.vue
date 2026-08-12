@@ -99,13 +99,13 @@ defineEmits(['trigger-sync']);
 .logo-icon {
   width: 40px;
   height: 40px;
-  border-radius: var(--radius-md);
-  background: linear-gradient(135deg, var(--primary) 0%, var(--accent-cyan) 100%);
+  border-radius: 12px;
+  background: linear-gradient(135deg, #6b74ff 0%, #42c3ec 100%);
   display: flex;
   align-items: center;
   justify-content: center;
   color: white;
-  box-shadow: var(--shadow-glow);
+  box-shadow: 0 4px 14px rgba(107, 116, 255, 0.3);
 }
 
 .brand-title {

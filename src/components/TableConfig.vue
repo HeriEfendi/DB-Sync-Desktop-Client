@@ -39,43 +39,54 @@
         </div>
       </div>
 
-      <div v-else class="table-checkbox-grid">
-        <label
-          v-for="tableName in filteredTables"
-          :key="tableName"
-          class="table-checkbox-card"
-          :class="{ selected: selectedTables.includes(tableName) }"
-        >
-          <input
-            type="checkbox"
-            :value="tableName"
-            :checked="selectedTables.includes(tableName)"
-            @change="toggleTableSelection(tableName)"
-          />
-          <div class="table-card-body">
-            <span class="table-name-text" :title="tableName">{{ tableName }}</span>
-            <div class="table-card-meta">
-              <template v-if="getTableState(tableName)">
-                <span class="meta-item">
-                  <span class="meta-label">Last ID:</span>
-                  <strong class="text-amber">{{ getTableState(tableName).lastSyncedId !== null && getTableState(tableName).lastSyncedId !== undefined ? getTableState(tableName).lastSyncedId : '-' }}</strong>
-                </span>
-                <span class="meta-item">
-                  <span class="meta-label">Sync:</span>
-                  <span class="text-muted">{{ formatDate(getTableState(tableName).lastSyncTime) }}</span>
-                </span>
-              </template>
-              <span v-else class="meta-item text-dim">Belum pernah sync</span>
+      <div v-else class="table-checkbox-grid-wrap">
+        <div class="table-checkbox-grid">
+          <label
+            v-for="tableName in displayedTables"
+            :key="tableName"
+            class="table-checkbox-card"
+            :class="{ selected: selectedTablesSet.has(tableName) }"
+          >
+            <input
+              type="checkbox"
+              :value="tableName"
+              :checked="selectedTablesSet.has(tableName)"
+              @change="toggleTableSelection(tableName)"
+            />
+            <div class="table-card-body">
+              <span class="table-name-text" :title="tableName">{{ tableName }}</span>
+              <div class="table-card-meta">
+                <template v-if="tableStateMap.get(tableName)">
+                  <span class="meta-item">
+                    <span class="meta-label">Last ID:</span>
+                    <strong class="text-amber">{{ tableStateMap.get(tableName).lastSyncedId !== null && tableStateMap.get(tableName).lastSyncedId !== undefined ? tableStateMap.get(tableName).lastSyncedId : '-' }}</strong>
+                  </span>
+                  <span class="meta-item">
+                    <span class="meta-label">Sync:</span>
+                    <span class="text-muted">{{ formatDate(tableStateMap.get(tableName).lastSyncTime) }}</span>
+                  </span>
+                </template>
+                <span v-else class="meta-item text-dim">Belum pernah sync</span>
+              </div>
             </div>
-          </div>
-        </label>
+          </label>
+        </div>
+
+        <div v-if="filteredTables.length > displayLimit" class="show-more-tables">
+          <button type="button" class="btn btn-ghost btn-xs" @click="displayLimit += 60">
+            + Tampilkan {{ Math.min(60, filteredTables.length - displayLimit) }} tabel lagi (sisa {{ filteredTables.length - displayLimit }})
+          </button>
+          <button type="button" class="btn btn-ghost btn-xs" @click="displayLimit = filteredTables.length">
+            Tampilkan Semua ({{ filteredTables.length }})
+          </button>
+        </div>
       </div>
     </div>
   </div>
 </template>
 
 <script setup>
-import { ref, computed, onMounted } from 'vue';
+import { ref, computed, watch, onMounted } from 'vue';
 
 const props = defineProps({
   selectedTables: { type: Array, default: () => [] },
@@ -90,11 +101,22 @@ const emit = defineEmits([
   'fetch-tables',
 ]);
 
+const selectedTablesSet = computed(() => new Set(props.selectedTables));
+
+const tableStateMap = computed(() => {
+  const map = new Map();
+  if (Array.isArray(props.syncTableStates)) {
+    for (let i = 0; i < props.syncTableStates.length; i++) {
+      const st = props.syncTableStates[i];
+      const key = st._table || st.table;
+      if (key) map.set(key, st);
+    }
+  }
+  return map;
+});
+
 const getTableState = (tableName) => {
-  if (!props.syncTableStates || !Array.isArray(props.syncTableStates)) return null;
-  return props.syncTableStates.find(
-    (st) => st._table === tableName || st.table === tableName
-  ) || null;
+  return tableStateMap.value.get(tableName) || null;
 };
 
 const formatDate = (isoString) => {
@@ -111,6 +133,11 @@ const tableSearchQuery = ref('');
 const manualTableName = ref('');
 const selectedTemplateName = ref('');
 const tableTemplates = ref({});
+const displayLimit = ref(60);
+
+watch(tableSearchQuery, () => {
+  displayLimit.value = 60;
+});
 
 onMounted(() => {
   loadTableTemplateList();
@@ -120,6 +147,10 @@ const filteredTables = computed(() => {
   if (!tableSearchQuery.value) return props.availableTables;
   const q = tableSearchQuery.value.toLowerCase().trim();
   return props.availableTables.filter((t) => t.toLowerCase().includes(q));
+});
+
+const displayedTables = computed(() => {
+  return filteredTables.value.slice(0, displayLimit.value);
 });
 
 const toggleTableSelection = (tableName) => {
@@ -337,6 +368,7 @@ const deleteTableTemplate = () => {
   box-sizing: border-box;
   overflow-x: hidden;
   overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .empty-tables-hint {
@@ -363,6 +395,13 @@ const deleteTableTemplate = () => {
   gap: 8px;
 }
 
+.show-more-tables {
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+  margin-top: 10px;
+}
+
 .table-checkbox-card {
   display: flex;
   align-items: flex-start;
@@ -372,7 +411,7 @@ const deleteTableTemplate = () => {
   padding: 10px 12px;
   border-radius: 6px;
   cursor: pointer;
-  transition: all 0.15s ease;
+  transition: background-color 0.12s ease, border-color 0.12s ease;
   user-select: none;
 }
 
