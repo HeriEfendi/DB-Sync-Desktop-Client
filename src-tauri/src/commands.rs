@@ -262,28 +262,51 @@ pub async fn test_local_connection(config: LocalDbConfig) -> Result<String, Stri
 }
 
 /// Get latest ID or maximum value of primary key from local table
+/// Get latest ID or maximum value of primary key from local table
 #[tauri::command]
 pub async fn get_last_local_id(
     config: LocalDbConfig,
     table_name: String,
     primary_key: String,
 ) -> Result<Option<serde_json::Value>, String> {
-    let safe_table = sanitize_identifier(&table_name)?;
-    let safe_pk = sanitize_identifier(&primary_key)?;
     let conn_str = build_connection_string(&config);
-
     let pool = MySqlPoolOptions::new()
         .max_connections(2)
         .connect(&conn_str)
         .await
         .map_err(|e| format!("Koneksi ke MySQL lokal gagal: {}", e))?;
 
+    if !table_exists(&pool, &table_name).await.unwrap_or(false) {
+        pool.close().await;
+        return Ok(None);
+    }
+
+    let cols = get_local_table_columns(&pool, &table_name).await.unwrap_or_default();
+    if cols.is_empty() {
+        pool.close().await;
+        return Ok(None);
+    }
+
+    // Auto-detect kolom ID jika primary_key yang dikirim tidak ditemukan di tabel
+    let effective_pk = if cols.iter().any(|c| c.eq_ignore_ascii_case(&primary_key)) {
+        primary_key.clone()
+    } else if let Some(found_pk) = cols.iter().find(|c| c.eq_ignore_ascii_case("id") || c.to_ascii_lowercase().ends_with("_id") || c.to_ascii_lowercase().starts_with("id_")).cloned() {
+        found_pk
+    } else if let Some(first_col) = cols.first().cloned() {
+        first_col
+    } else {
+        pool.close().await;
+        return Ok(None);
+    };
+
+    let safe_table = sanitize_identifier(&table_name)?;
+    let safe_pk = sanitize_identifier(&effective_pk)?;
     let query = format!("SELECT MAX({}) AS max_id FROM {}", safe_pk, safe_table);
 
     let row = sqlx::query(&query)
         .fetch_optional(&pool)
         .await
-        .map_err(|e| format!("Gagal query MAX({}): {}", primary_key, e))?;
+        .map_err(|e| format!("Gagal query MAX({}): {}", effective_pk, e))?;
 
     pool.close().await;
 
@@ -315,8 +338,23 @@ pub async fn delete_local_rows_after_id(
     primary_key: String,
     last_synced_id: serde_json::Value,
 ) -> Result<u64, String> {
-    let safe_table = sanitize_identifier(&table_name)?;
-    let safe_pk = sanitize_identifier(&primary_key)?;
+    // Proteksi ketat: Jangan hapus jika last_synced_id bernilai 0, "0", kosong, atau non-positif
+    let is_valid_id = match &last_synced_id {
+        serde_json::Value::Number(num) => {
+            num.as_i64().map(|n| n > 0).unwrap_or(false)
+                || num.as_f64().map(|f| f > 0.0).unwrap_or(false)
+        }
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim();
+            !trimmed.is_empty() && trimmed != "0"
+        }
+        _ => false,
+    };
+
+    if !is_valid_id {
+        return Ok(0);
+    }
+
     let conn_str = build_connection_string(&config);
     let pool = MySqlPoolOptions::new()
         .max_connections(2)
@@ -324,11 +362,28 @@ pub async fn delete_local_rows_after_id(
         .await
         .map_err(|e| format!("Koneksi ke MySQL lokal gagal: {}", e))?;
 
+    if !table_exists(&pool, &table_name).await.unwrap_or(false) {
+        pool.close().await;
+        return Ok(0);
+    }
+
+    let cols = get_local_table_columns(&pool, &table_name).await.unwrap_or_default();
+    let pk_exists = cols.iter().any(|c| c.eq_ignore_ascii_case(&primary_key));
+    if !pk_exists {
+        pool.close().await;
+        return Ok(0);
+    }
+
+    let safe_table = sanitize_identifier(&table_name)?;
+    let safe_pk = sanitize_identifier(&primary_key)?;
     let query = format!("DELETE FROM {} WHERE {} > ?", safe_table, safe_pk);
     let result = match last_synced_id {
         serde_json::Value::Number(value) => sqlx::query(&query).bind(value.to_string()).execute(&pool).await,
         serde_json::Value::String(value) => sqlx::query(&query).bind(value).execute(&pool).await,
-        _ => return Err("Last synced ID harus angka atau teks".to_string()),
+        _ => {
+            pool.close().await;
+            return Err("Last synced ID harus angka atau teks".to_string());
+        }
     }.map_err(|e| format!("Gagal menghapus data lokal setelah {}: {}", primary_key, e))?;
 
     pool.close().await;

@@ -2,6 +2,12 @@ import { isTauriEnvironment, safeInvoke, safeListen } from './tauriHelper.js';
 import { PmaClient } from './pmaClient.js';
 import { getTableState, saveTableState, clearTableState } from './syncStateStore.js';
 
+function formatMySQLDateTime(date = new Date()) {
+  const d = new Date(date);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
 export class SyncEngine {
   constructor(pmaConfig, localDbConfig, options = {}) {
     this.pmaConfig = pmaConfig;
@@ -139,7 +145,7 @@ export class SyncEngine {
           for (const tableName of tableNames) {
             const state = getTableState(this.serverHost, this.database, tableName);
             const primaryKey = tablePrimaryKeys[tableName] || this.pmaConfig.primaryKey?.trim() || 'id';
-            if (state?.lastSyncedId === null || state?.lastSyncedId === undefined || !state.lastSyncTime) continue;
+            if (!state || state.lastSyncedId === null || state.lastSyncedId === undefined || state.lastSyncedId === 0 || state.lastSyncedId === '0' || !state.lastSyncTime) continue;
             const removedRows = await safeInvoke('delete_local_rows_after_id', {
               config: this.localDbConfig,
               tableName,
@@ -176,9 +182,10 @@ export class SyncEngine {
           },
         });
 
-        const lastSyncTime = new Date().toISOString();
+        const lastSyncTime = formatMySQLDateTime();
         await Promise.all(tableNames.map(async (tableName) => {
           const primaryKey = tablePrimaryKeys[tableName] || this.pmaConfig.primaryKey?.trim() || 'id';
+          const existingState = getTableState(this.serverHost, this.database, tableName);
           let lastSyncedId = null;
           try {
             lastSyncedId = await safeInvoke('get_last_local_id', {
@@ -195,8 +202,12 @@ export class SyncEngine {
           } catch (error) {
             console.warn(`[Sync state] Gagal membaca MAX(${primaryKey}) untuk '${tableName}':`, error);
           }
+
+          const isValidNewId = lastSyncedId !== null && lastSyncedId !== undefined && lastSyncedId !== 0 && lastSyncedId !== '0';
+          const finalLastSyncedId = isValidNewId ? lastSyncedId : (existingState?.lastSyncedId ?? null);
+
           saveTableState(this.serverHost, this.database, tableName, {
-            lastSyncedId,
+            lastSyncedId: finalLastSyncedId,
             lastSyncTime,
             rowsSynced: 0,
             primaryKey,
@@ -502,12 +513,16 @@ export class SyncEngine {
         this.log('success', `✅ [Tabel '${tableName}'] Selesai! Total ${totalFetchedForTable} baris data berhasil disinkronkan.`);
 
         // Update state sync terakhir (termasuk Phase 2 updated_at)
+        const existingState = getTableState(this.serverHost, this.database, tableName);
+        const isValidNewId = lastId !== null && lastId !== undefined && lastId !== 0 && lastId !== '0';
+        const finalLastId = isValidNewId ? lastId : (existingState?.lastSyncedId ?? null);
+
         saveTableState(this.serverHost, this.database, tableName, {
           _server: this.serverHost,
           _database: this.database,
           _table: tableName,
-          lastSyncedId: lastId,
-          lastSyncTime: new Date().toISOString(),
+          lastSyncedId: finalLastId,
+          lastSyncTime: formatMySQLDateTime(),
           rowsSynced: totalFetchedForTable,
           primaryKey: pk,
         });

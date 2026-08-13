@@ -23,6 +23,8 @@ pub struct PmaExportConfig {
     pub primary_key: Option<String>,
     /// Riwayat per tabel: ID dan waktu terakhir yang sudah dikonfirmasi dari server.
     pub incremental_watermarks: Option<HashMap<String, IncrementalWatermark>>,
+    /// Set nama tabel yang memiliki kolom updated_at di server.
+    pub tables_with_updated_at: Option<std::collections::HashSet<String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -966,6 +968,109 @@ async fn fetch_all_primary_keys(
     pk_map
 }
 
+async fn fetch_tables_with_updated_at(
+    client: &reqwest::Client,
+    base_url: &str,
+    csrf_token: &str,
+    db: &str,
+    _app: &tauri::AppHandle,
+) -> std::collections::HashSet<String> {
+    let mut updated_at_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    let safe_db = db.replace('\'', "''");
+    let query = format!(
+        "SELECT TABLE_NAME FROM information_schema.COLUMNS \
+         WHERE TABLE_SCHEMA = '{}' AND COLUMN_NAME = 'updated_at' LIMIT 10000",
+        safe_db
+    );
+
+    let sql_endpoints = vec![
+        format!("{}/index.php?route=/sql", base_url),
+        format!("{}/sql.php", base_url),
+    ];
+
+    for sql_url in &sql_endpoints {
+        let mut form_data: Vec<(&str, String)> = vec![
+            ("db", db.to_string()),
+            ("table", String::new()),
+            ("server", "1".to_string()),
+            ("sql_query", query.clone()),
+            ("sql_delimiter", ";".to_string()),
+            ("ajax_request", "true".to_string()),
+            ("ajax_page_request", "true".to_string()),
+            ("submit_query", "Go".to_string()),
+            ("session_max_rows", "all".to_string()),
+            ("max_rows", "100000".to_string()),
+        ];
+        if !csrf_token.is_empty() {
+            form_data.push(("token", csrf_token.to_string()));
+        }
+
+        let resp = match client
+            .post(sql_url)
+            .header("X-Requested-With", "XMLHttpRequest")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .form(&form_data)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+
+        let raw_text = match resp.text().await {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+
+        let json_val = match serde_json::from_str::<serde_json::Value>(&raw_text) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let success = json_val
+            .get("success")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if !success {
+            continue;
+        }
+
+        if let (Some(fields), Some(rows)) = (
+            json_val.get("fields").and_then(|v| v.as_array()),
+            json_val.get("rows").and_then(|v| v.as_array()),
+        ) {
+            let col_names: Vec<String> = fields.iter().map(|f| {
+                f.get("name").or_else(|| f.get("Name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("").to_uppercase()
+            }).collect();
+
+            if let Some(tbl_idx) = col_names.iter().position(|c| c == "TABLE_NAME") {
+                for row in rows {
+                    let tbl = if let Some(arr) = row.as_array() {
+                        arr.get(tbl_idx).and_then(|v| v.as_str()).unwrap_or("").to_string()
+                    } else if let Some(obj) = row.as_object() {
+                        obj.get("TABLE_NAME").or_else(|| obj.get("table_name"))
+                            .and_then(|v| v.as_str()).unwrap_or("").to_string()
+                    } else {
+                        String::new()
+                    };
+                    if !tbl.is_empty() {
+                        updated_at_set.insert(tbl);
+                    }
+                }
+            }
+        }
+
+        if !updated_at_set.is_empty() {
+            break;
+        }
+    }
+
+    updated_at_set
+}
+
 /// Extract table names from PMA AJAX SQL JSON response
 fn extract_tables_from_json(json_val: &serde_json::Value, db: &str) -> Vec<String> {
     let mut tables = Vec::new();
@@ -1375,6 +1480,11 @@ async fn stream_export_single_table(
     'endpoint_loop: for export_url in &export_urls {
         for compression_mode in &compressions {
             let is_gz = compression_mode == "gzip";
+            let is_incremental = pma_config.sync_mode.as_deref() == Some("incremental");
+            let struct_or_data = if is_incremental { "data" } else { "structure_and_data" };
+            let sql_structure = if is_incremental { "0" } else { "1" };
+            let sql_create = if is_incremental { "false" } else { "true" };
+
             let mut form: Vec<(String, String)> = vec![
                 ("db".to_string(), pma_config.database.clone()),
                 ("table".to_string(), table_name.to_string()),
@@ -1391,11 +1501,11 @@ async fn stream_export_single_table(
                 ("asfile".to_string(), "sendit".to_string()),
                 (
                     "sql_structure_or_data".to_string(),
-                    "structure_and_data".to_string(),
+                    struct_or_data.to_string(),
                 ),
-                ("sql_structure".to_string(), "1".to_string()),
+                ("sql_structure".to_string(), sql_structure.to_string()),
                 ("sql_data".to_string(), "1".to_string()),
-                ("sql_create_table".to_string(), "true".to_string()),
+                ("sql_create_table".to_string(), sql_create.to_string()),
                 ("sql_drop_table".to_string(), "false".to_string()),
                 ("sql_if_not_exists".to_string(), "true".to_string()),
                 ("sql_auto_increment".to_string(), "1".to_string()),
@@ -1403,46 +1513,103 @@ async fn stream_export_single_table(
                 ("sql_type".to_string(), sql_type_val.to_string()),
             ];
 
+            let pk_col_opt = pma_config
+                .table_primary_keys
+                .as_ref()
+                .and_then(|m| m.get(table_name))
+                .map(|s| s.trim())
+                .filter(|pk| !pk.is_empty())
+                .or_else(|| pma_config.primary_key.as_deref().map(str::trim).filter(|pk| !pk.is_empty()));
+
+            let has_updated_at = pma_config
+                .tables_with_updated_at
+                .as_ref()
+                .map(|set| set.contains(table_name))
+                .unwrap_or(false);
+
             let has_incremental_watermark = pma_config.sync_mode.as_deref() == Some("incremental")
                 && pma_config.incremental_watermarks.as_ref()
                     .is_some_and(|watermarks| watermarks.contains_key(table_name));
+
+            // Optimasi: Jika mode incremental dan watermark sudah ada, tetapi tabel TIDAK punya PK dan TIDAK punya updated_at
+            if pma_config.sync_mode.as_deref() == Some("incremental") && has_incremental_watermark && pk_col_opt.is_none() && !has_updated_at {
+                emit_log(
+                    app,
+                    "info",
+                    format!("[Tabel '{}'] Tidak memiliki kolom Primary Key (ID) maupun 'updated_at'. Di-skip pada sinkronisasi incremental untuk mencegah error.", table_name),
+                );
+                return Ok(0);
+            }
+
             if pma_config.row_limit.filter(|limit| *limit > 0).is_some() || has_incremental_watermark {
                 let limit = pma_config.row_limit.filter(|limit| *limit > 0).unwrap_or(usize::MAX);
                 let safe_table = table_name.replace('`', "``");
-                // Cari PK: 1) per-tabel map, 2) global fallback, 3) `id`.
-                // Limit tanpa ORDER BY tidak deterministik dan dapat mengimpor baris lama.
-                let pk_col = pma_config
-                    .table_primary_keys
-                    .as_ref()
-                    .and_then(|m| m.get(table_name))
-                    .map(|s| s.trim())
-                    .filter(|pk| !pk.is_empty())
-                    .or_else(|| pma_config.primary_key.as_deref().map(str::trim).filter(|pk| !pk.is_empty()))
-                    .unwrap_or("id");
-                let safe_pk = pk_col.replace('`', "``");
+
                 let limited_query = if let Some(watermark) = pma_config
                     .incremental_watermarks
                     .as_ref()
                     .and_then(|watermarks| watermarks.get(table_name))
                     .filter(|_| pma_config.sync_mode.as_deref() == Some("incremental"))
                 {
-                    let last_id = match &watermark.last_synced_id {
-                        serde_json::Value::Number(value) => value.to_string(),
-                        serde_json::Value::String(value) => format!("'{}'", value.replace('\'', "''")),
-                        _ => return Err(format!("Last ID tabel '{}' tidak valid.", table_name)),
+                    let last_id_str = match &watermark.last_synced_id {
+                        serde_json::Value::Number(value) => Some(value.to_string()),
+                        serde_json::Value::String(value) => Some(format!("'{}'", value.replace('\'', "''"))),
+                        _ => None,
                     };
                     let last_sync = watermark.last_sync_time.replace('\'', "''");
+
+                    let mut conditions = Vec::new();
+
+                    if let (Some(pk_col), Some(last_id)) = (pk_col_opt, last_id_str) {
+                        let safe_pk = pk_col.replace('`', "``");
+                        conditions.push(format!("`{}` > {}", safe_pk, last_id));
+                    }
+
+                    if has_updated_at && !last_sync.is_empty() {
+                        conditions.push(format!("`updated_at` > '{}'", last_sync));
+                    }
+
+                    let where_clause = if !conditions.is_empty() {
+                        format!("WHERE {}", conditions.join(" OR "))
+                    } else {
+                        String::new()
+                    };
+
+                    let order_clause = if let Some(pk_col) = pk_col_opt {
+                        format!("ORDER BY `{}` ASC", pk_col.replace('`', "``"))
+                    } else if has_updated_at {
+                        "ORDER BY `updated_at` ASC".to_string()
+                    } else {
+                        String::new()
+                    };
+
+                    let limit_clause = if limit != usize::MAX {
+                        format!("LIMIT {}", limit)
+                    } else {
+                        String::new()
+                    };
+
                     format!(
-                        "SELECT * FROM `{}` WHERE `{}` > {} OR `updated_at` > '{}' ORDER BY `{}` ASC LIMIT {}",
-                        safe_table, safe_pk, last_id, last_sync, safe_pk, limit
-                    )
+                        "SELECT * FROM `{}` {} {} {}",
+                        safe_table, where_clause, order_clause, limit_clause
+                    ).split_whitespace().collect::<Vec<_>>().join(" ")
                 } else {
+                    let order_clause = if let Some(pk_col) = pk_col_opt {
+                        format!("ORDER BY `{}` DESC", pk_col.replace('`', "``"))
+                    } else {
+                        String::new()
+                    };
+                    let limit_clause = if limit != usize::MAX {
+                        format!("LIMIT {}", limit)
+                    } else {
+                        String::new()
+                    };
                     format!(
-                        "SELECT * FROM `{}` ORDER BY `{}` DESC LIMIT {}",
-                        safe_table, safe_pk, limit
-                    )
+                        "SELECT * FROM `{}` {} {}",
+                        safe_table, order_clause, limit_clause
+                    ).split_whitespace().collect::<Vec<_>>().join(" ")
                 };
-                // emit_log(app, "info", format!("[Tabel '{}'] Query export: {}", table_name, limited_query));
+
                 form.push(("sql_query".to_string(), limited_query));
                 form.push(("query_type".to_string(), "table".to_string()));
                 form.push(("sql_query_input".to_string(), "true".to_string()));
@@ -1640,6 +1807,20 @@ async fn stream_export_single_table(
             "Export tabel '{}' menghasilkan SQL kosong.",
             table_name
         ));
+    }
+
+    if pma_config.sync_mode.as_deref() == Some("incremental") {
+        let sql_text = String::from_utf8_lossy(&sql_bytes);
+        let safe_lines: Vec<&str> = sql_text
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim().to_uppercase();
+                !trimmed.starts_with("DROP TABLE")
+                    && !trimmed.starts_with("TRUNCATE TABLE")
+                    && !trimmed.starts_with("TRUNCATE ")
+            })
+            .collect();
+        sql_bytes = safe_lines.join("\n").into_bytes();
     }
 
     // Import table independently; referenced tables may be synchronized later.
@@ -1844,24 +2025,28 @@ pub async fn export_pma_database(
             !key.is_empty()
         });
     }
-    if pma_config.row_limit.map(|l| l > 0).unwrap_or(false) {
-        emit_log(&app, "info", "Mendeteksi primary key tiap tabel dari INFORMATION_SCHEMA...");
-        let server_pk_map = fetch_all_primary_keys(&client, &base_url, &csrf_token, &pma_config.database, &app).await;
-        if !server_pk_map.is_empty() {
-            emit_log(&app, "info", format!("Primary key terdeteksi untuk {} tabel.", server_pk_map.len()));
-            // Merge: server_pk_map jadi base, lalu override dengan data dari JS (lebih spesifik)
-            let mut merged = server_pk_map;
-            if let Some(js_pks) = pma_config.table_primary_keys.take() {
-                for (tbl, col) in js_pks {
-                    if !col.is_empty() {
-                        merged.insert(tbl, col);
-                    }
+    emit_log(&app, "info", "Mendeteksi Primary Key dan kolom 'updated_at' tiap tabel dari INFORMATION_SCHEMA...");
+    let server_pk_map = fetch_all_primary_keys(&client, &base_url, &csrf_token, &pma_config.database, &app).await;
+    if !server_pk_map.is_empty() {
+        emit_log(&app, "info", format!("Primary key terdeteksi untuk {} tabel.", server_pk_map.len()));
+        // Merge: server_pk_map jadi base, lalu override dengan data dari JS (lebih spesifik)
+        let mut merged = server_pk_map;
+        if let Some(js_pks) = pma_config.table_primary_keys.take() {
+            for (tbl, col) in js_pks {
+                if !col.is_empty() {
+                    merged.insert(tbl, col);
                 }
             }
-            pma_config.table_primary_keys = Some(merged);
-        } else {
-            emit_log(&app, "warn", "Primary key server tidak terdeteksi; memakai Primary Key konfigurasi atau fallback `id`.");
         }
+        pma_config.table_primary_keys = Some(merged);
+    } else {
+        emit_log(&app, "warn", "Primary key server tidak terdeteksi via metadata; memakai fallback per tabel.");
+    }
+
+    let tables_with_updated_at = fetch_tables_with_updated_at(&client, &base_url, &csrf_token, &pma_config.database, &app).await;
+    if !tables_with_updated_at.is_empty() {
+        emit_log(&app, "info", format!("Kolom 'updated_at' terdeteksi untuk {} tabel.", tables_with_updated_at.len()));
+        pma_config.tables_with_updated_at = Some(tables_with_updated_at);
     }
 
     let total_tables = tables.len();
