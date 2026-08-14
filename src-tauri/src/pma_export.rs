@@ -881,6 +881,7 @@ async fn fetch_all_primary_keys(
         if !success {
             let err = json_val.get("error").or_else(|| json_val.get("message"))
                 .and_then(|v| v.as_str()).unwrap_or("unknown");
+            emit_log(app, "warn", &format!("[PK detect] Query gagal: {}", err));
             continue;
         }
 
