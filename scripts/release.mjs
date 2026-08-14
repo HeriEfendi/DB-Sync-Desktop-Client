@@ -20,6 +20,17 @@ if (currentBranch && currentBranch !== 'main') {
   run('git', ['merge', currentBranch]);
 }
 
+// Lakukan git pull --rebase untuk memastikan lokal sinkron dengan remote sebelum menambahkan release commit
+const remotes = execFileSync('git', ['remote'], { encoding: 'utf8' }).trim().split(/\s+/).filter(Boolean);
+const remote = remotes.includes('origin') ? 'origin' : remotes[0];
+if (!remote) throw new Error('No Git remote configured');
+
+try {
+  run('git', ['pull', '--rebase', remote, 'main']);
+} catch (e) {
+  console.warn('Gagal git pull --rebase, melanjutkan...');
+}
+
 const json = (file) => JSON.parse(readFileSync(file, 'utf8'));
 const packageJson = json('package.json');
 packageJson.version = version;
@@ -40,9 +51,6 @@ try {
   writeFileSync(pkgbuildPath, content.replace(/^(pkgver=)[^\n]+/m, `$1${version}`));
 } catch (e) {}
 
-const remotes = execFileSync('git', ['remote'], { encoding: 'utf8' }).trim().split(/\s+/).filter(Boolean);
-const remote = remotes.includes('origin') ? 'origin' : remotes[0];
-if (!remote) throw new Error('No Git remote configured');
 run('git', ['add', 'package.json', 'package-lock.json', 'src-tauri/tauri.conf.json', 'src-tauri/Cargo.toml', 'src-tauri/Cargo.lock', 'PKGBUILD']);
 run('git', ['commit', '-m', `Release v${version}`]);
 run('git', ['tag', '-a', `v${version}`, '-m', `Release v${version}`]);
