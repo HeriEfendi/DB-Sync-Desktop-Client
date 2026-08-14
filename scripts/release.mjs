@@ -20,7 +20,7 @@ if (!remote) throw new Error('No Git remote configured');
 const initialBranch = runOut('git', ['branch', '--show-current']);
 
 try {
-  // 1. Pastikan branch aktif (dev) sinkron dengan remote jika ada remote branch
+  // 1. Ambil update terbaru dari remote
   console.log(`Mengambil update terbaru dari remote '${remote}'...`);
   run('git', ['fetch', remote]);
 
@@ -29,22 +29,8 @@ try {
     console.log(`Mengalihkan dari branch '${initialBranch}' ke 'main'...`);
     run('git', ['checkout', 'main']);
     
-    console.log(`Menyinkronkan 'main' dengan remote...`);
-    try {
-      run('git', ['pull', remote, 'main', '--rebase']);
-    } catch (e) {
-      console.warn('Gagal pull rebase main, melanjutkan...');
-    }
-
     console.log(`Melakukan merge branch '${initialBranch}' ke 'main'...`);
     run('git', ['merge', initialBranch, '-X', 'theirs', '--no-edit']);
-  } else {
-    console.log(`Menyinkronkan 'main' dengan remote...`);
-    try {
-      run('git', ['pull', remote, 'main', '--rebase']);
-    } catch (e) {
-      console.warn('Gagal pull rebase main, melanjutkan...');
-    }
   }
 
   // 3. Update versi file-file konfigurasi
@@ -87,7 +73,7 @@ try {
   run('git', ['push', remote, 'main']);
   run('git', ['push', '-f', remote, `v${version}`]);
 
-  console.log(`Release v${version} sukses terdorong ke GitHub! workflow release.yml akan memproses build.`);
+  console.log(`Release v${version} sukses terdorong ke GitHub! Workflow release.yml akan memproses build.`);
 
 } finally {
   // 6. Selalu kembalikan pengguna ke branch awal ('dev') setelah selesai
@@ -97,7 +83,6 @@ try {
     try {
       console.log(`Menyinkronkan '${initialBranch}' dengan 'main'...`);
       run('git', ['merge', 'main', '-X', 'theirs', '--no-edit']);
-      run('git', ['push', remote, initialBranch]);
     } catch (e) {
       console.warn(`Gagal sinkronisasi kembali 'main' ke '${initialBranch}'.`);
     }
