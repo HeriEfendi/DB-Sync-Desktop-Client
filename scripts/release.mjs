@@ -7,6 +7,7 @@ if (!/^\d+\.\d+\.\d+$/.test(version)) {
   console.error('Usage: npm run release -- 1.0.1');
   process.exit(1);
 }
+
 const run = (command, args) => execFileSync(command, args, { stdio: 'inherit' });
 const runOut = (command, args) => execFileSync(command, args, { encoding: 'utf8' }).trim();
 
