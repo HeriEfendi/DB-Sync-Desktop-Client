@@ -60,7 +60,7 @@ jobs:
           args: --bundles ${{ matrix.bundles }}
           tagName: ${{ github.ref_name }}
           releaseName: ${{ github.ref_name }}
-          releaseBody: Automatic build for ${{ github.ref_name }}.
+          releaseBody: Automatic build for ${{ github.ref_name }}
           releaseDraft: false
           prerelease: false
 
