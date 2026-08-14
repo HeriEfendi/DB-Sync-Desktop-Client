@@ -80,12 +80,12 @@ try {
   console.log(`Membuat commit & tag release v${version}...`);
   run('git', ['add', 'package.json', 'package-lock.json', 'src-tauri/tauri.conf.json', 'src-tauri/Cargo.toml', 'src-tauri/Cargo.lock', 'PKGBUILD']);
   run('git', ['commit', '-m', `Release v${version}`]);
-  run('git', ['tag', '-a', `v${version}`, '-m', `Release v${version}`]);
+  run('git', ['tag', '-f', '-a', `v${version}`, '-m', `Release v${version}`]);
 
   // 5. Push branch main & tag ke GitHub remote (ini akan mentrigger release.yml di GitHub Actions)
   console.log(`Mendorong branch 'main' dan tag 'v${version}' ke GitHub (${remote})...`);
   run('git', ['push', remote, 'main']);
-  run('git', ['push', remote, `v${version}`]);
+  run('git', ['push', '-f', remote, `v${version}`]);
 
   console.log(`Release v${version} sukses terdorong ke GitHub! workflow release.yml akan memproses build.`);
 
