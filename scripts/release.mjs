@@ -8,6 +8,18 @@ if (!/^\d+\.\d+\.\d+$/.test(version)) {
   process.exit(1);
 }
 const run = (command, args) => execFileSync(command, args, { stdio: 'inherit' });
+const runOut = (command, args) => execFileSync(command, args, { encoding: 'utf8' }).trim();
+
+// Cek branch aktif saat ini
+const currentBranch = runOut('git', ['branch', '--show-current']);
+
+// Jika berada di branch selain 'main', pindah ke 'main' dan merge branch aktif tersebut
+if (currentBranch && currentBranch !== 'main') {
+  console.log(`Mengalihkan dari branch '${currentBranch}' ke 'main' dan melakukan merge...`);
+  run('git', ['checkout', 'main']);
+  run('git', ['merge', currentBranch]);
+}
+
 const json = (file) => JSON.parse(readFileSync(file, 'utf8'));
 const packageJson = json('package.json');
 packageJson.version = version;
