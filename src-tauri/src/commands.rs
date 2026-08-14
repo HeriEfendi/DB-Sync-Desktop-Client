@@ -376,15 +376,25 @@ pub async fn delete_local_rows_after_id(
 
     let safe_table = sanitize_identifier(&table_name)?;
     let safe_pk = sanitize_identifier(&primary_key)?;
+
+    // Nonaktifkan Foreign Key Checks agar tidak terjadi Foreign Key Constraint error saat DELETE
+    let _ = sqlx::query("SET FOREIGN_KEY_CHECKS=0").execute(&pool).await;
+
     let query = format!("DELETE FROM {} WHERE {} > ?", safe_table, safe_pk);
     let result = match last_synced_id {
         serde_json::Value::Number(value) => sqlx::query(&query).bind(value.to_string()).execute(&pool).await,
         serde_json::Value::String(value) => sqlx::query(&query).bind(value).execute(&pool).await,
         _ => {
+            let _ = sqlx::query("SET FOREIGN_KEY_CHECKS=1").execute(&pool).await;
             pool.close().await;
             return Err("Last synced ID harus angka atau teks".to_string());
         }
-    }.map_err(|e| format!("Gagal menghapus data lokal setelah {}: {}", primary_key, e))?;
+    };
+
+    // Aktifkan kembali Foreign Key Checks
+    let _ = sqlx::query("SET FOREIGN_KEY_CHECKS=1").execute(&pool).await;
+
+    let result = result.map_err(|e| format!("Gagal menghapus data lokal setelah {}: {}", primary_key, e))?;
 
     pool.close().await;
     Ok(result.rows_affected())
