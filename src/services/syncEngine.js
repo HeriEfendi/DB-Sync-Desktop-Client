@@ -29,10 +29,17 @@ export class SyncEngine {
     });
   }
 
-  stopSync() {
+  async stopSync() {
     if (this.isSyncing) {
       this.shouldStop = true;
       this.log('warning', '🛑 Sinyal pembatalan diterima. Menghentikan sinkronisasi...');
+      if (isTauriEnvironment()) {
+        try {
+          await safeInvoke('cancel_pma_export');
+        } catch (err) {
+          console.warn('Gagal memanggil cancel_pma_export:', err);
+        }
+      }
     }
   }
 
@@ -83,6 +90,7 @@ export class SyncEngine {
     }
 
     this.isSyncing = true;
+    this.shouldStop = false;
     const startTime = performance.now();
 
     const rawTables = syncOptions.tables && syncOptions.tables.length > 0
@@ -143,6 +151,13 @@ export class SyncEngine {
         const incrementalWatermarks = {};
         if (syncMode === 'incremental') {
           for (const tableName of tableNames) {
+            if (this.shouldStop) {
+              this.isSyncing = false;
+              if (typeof unlistenLog === 'function') unlistenLog();
+              if (typeof unlistenProgress === 'function') unlistenProgress();
+              this.log('warning', '🛑 Sinkronisasi telah dihentikan oleh pengguna.');
+              return { success: false, cancelled: true, error: 'Dibatalkan oleh pengguna' };
+            }
             const state = getTableState(this.serverHost, this.database, tableName);
             const primaryKey = tablePrimaryKeys[tableName] || this.pmaConfig.primaryKey?.trim() || 'id';
             if (!state || state.lastSyncedId === null || state.lastSyncedId === undefined || state.lastSyncedId === 0 || state.lastSyncedId === '0' || !state.lastSyncTime) continue;
@@ -158,6 +173,13 @@ export class SyncEngine {
             };
             if (removedRows > 0) this.log('warning', `[Tabel '${tableName}'] ${removedRows} data lokal di atas Last ID ${state.lastSyncedId} dihapus untuk sinkron dengan server.`);
           }
+        }
+        if (this.shouldStop) {
+          this.isSyncing = false;
+          if (typeof unlistenLog === 'function') unlistenLog();
+          if (typeof unlistenProgress === 'function') unlistenProgress();
+          this.log('warning', '🛑 Sinkronisasi telah dihentikan oleh pengguna.');
+          return { success: false, cancelled: true, error: 'Dibatalkan oleh pengguna' };
         }
         const exportResult = await safeInvoke('export_pma_database', {
           pmaConfig: {
@@ -234,6 +256,10 @@ export class SyncEngine {
         if (typeof unlistenLog === 'function') unlistenLog();
         if (typeof unlistenProgress === 'function') unlistenProgress();
         const errMsg = err.message || String(err);
+        if (this.shouldStop || errMsg.toLowerCase().includes('dibatalkan')) {
+          this.log('warning', '🛑 Sinkronisasi telah dihentikan oleh pengguna.');
+          return { success: false, cancelled: true, error: 'Dibatalkan oleh pengguna' };
+        }
         this.log('error', `Gagal sinkronisasi Direct GZIP Stream: ${errMsg}`);
         return { success: false, error: errMsg };
       }

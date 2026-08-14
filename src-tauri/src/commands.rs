@@ -152,25 +152,31 @@ async fn rebuild_local_table(
         pk_def
     );
 
-    sqlx::query(&format!("DROP TABLE IF EXISTS {}", safe_table))
-        .execute(pool)
+    let mut conn = pool
+        .acquire()
         .await
-        .map_err(|e| {
-            format!(
-                "Gagal menghapus tabel lokal '{}' sebelum rebuild: {}",
-                table_name, e
-            )
-        })?;
+        .map_err(|e| format!("Koneksi ke MySQL lokal gagal: {}", e))?;
 
-    sqlx::query(&create_query)
-        .execute(pool)
-        .await
-        .map_err(|e| {
-            format!(
-                "Gagal membuat ulang tabel lokal '{}' secara otomatis: {}",
-                table_name, e
-            )
-        })?;
+    let _ = sqlx::query("SET FOREIGN_KEY_CHECKS=0").execute(&mut *conn).await;
+
+    let drop_res = sqlx::query(&format!("DROP TABLE IF EXISTS {}", safe_table))
+        .execute(&mut *conn)
+        .await;
+
+    let create_res = if drop_res.is_ok() {
+        sqlx::query(&create_query).execute(&mut *conn).await
+    } else {
+        drop_res
+    };
+
+    let _ = sqlx::query("SET FOREIGN_KEY_CHECKS=1").execute(&mut *conn).await;
+
+    create_res.map_err(|e| {
+        format!(
+            "Gagal membuat ulang tabel lokal '{}' secara otomatis: {}",
+            table_name, e
+        )
+    })?;
 
     Ok(())
 }
@@ -377,25 +383,32 @@ pub async fn delete_local_rows_after_id(
     let safe_table = sanitize_identifier(&table_name)?;
     let safe_pk = sanitize_identifier(&primary_key)?;
 
-    // Nonaktifkan Foreign Key Checks agar tidak terjadi Foreign Key Constraint error saat DELETE
-    let _ = sqlx::query("SET FOREIGN_KEY_CHECKS=0").execute(&pool).await;
+    let mut conn = pool
+        .acquire()
+        .await
+        .map_err(|e| format!("Koneksi ke MySQL lokal gagal: {}", e))?;
+
+    // Nonaktifkan Foreign Key Checks agar tidak terjadi Foreign Key Constraint error saat DELETE pada relasi tabel
+    let _ = sqlx::query("SET FOREIGN_KEY_CHECKS=0").execute(&mut *conn).await;
 
     let query = format!("DELETE FROM {} WHERE {} > ?", safe_table, safe_pk);
     let result = match last_synced_id {
-        serde_json::Value::Number(value) => sqlx::query(&query).bind(value.to_string()).execute(&pool).await,
-        serde_json::Value::String(value) => sqlx::query(&query).bind(value).execute(&pool).await,
+        serde_json::Value::Number(value) => sqlx::query(&query).bind(value.to_string()).execute(&mut *conn).await,
+        serde_json::Value::String(value) => sqlx::query(&query).bind(value).execute(&mut *conn).await,
         _ => {
-            let _ = sqlx::query("SET FOREIGN_KEY_CHECKS=1").execute(&pool).await;
+            let _ = sqlx::query("SET FOREIGN_KEY_CHECKS=1").execute(&mut *conn).await;
+            drop(conn);
             pool.close().await;
             return Err("Last synced ID harus angka atau teks".to_string());
         }
     };
 
     // Aktifkan kembali Foreign Key Checks
-    let _ = sqlx::query("SET FOREIGN_KEY_CHECKS=1").execute(&pool).await;
+    let _ = sqlx::query("SET FOREIGN_KEY_CHECKS=1").execute(&mut *conn).await;
 
     let result = result.map_err(|e| format!("Gagal menghapus data lokal setelah {}: {}", primary_key, e))?;
 
+    drop(conn);
     pool.close().await;
     Ok(result.rows_affected())
 }
@@ -707,15 +720,19 @@ pub async fn truncate_local_table(
         ));
     }
 
-    // Disable FK checks agar TRUNCATE tidak gagal karena relasi foreign key
-    sqlx::query("SET FOREIGN_KEY_CHECKS=0")
-        .execute(&pool)
+    let mut conn = pool
+        .acquire()
         .await
-        .map_err(|e| format!("Gagal menonaktifkan FOREIGN_KEY_CHECKS: {}", e))?;
+        .map_err(|e| format!("Koneksi ke MySQL lokal gagal: {}", e))?;
+
+    // Disable FK checks agar TRUNCATE tidak gagal karena relasi foreign key
+    let _ = sqlx::query("SET FOREIGN_KEY_CHECKS=0")
+        .execute(&mut *conn)
+        .await;
 
     let query = format!("TRUNCATE TABLE {}", safe_table);
 
-    let truncate_result = sqlx::query(&query).execute(&pool).await.map_err(|e| {
+    let truncate_result = sqlx::query(&query).execute(&mut *conn).await.map_err(|e| {
         format!(
             "Gagal mengosongkan (TRUNCATE) tabel lokal {}: {}",
             table_name, e
@@ -723,8 +740,9 @@ pub async fn truncate_local_table(
     });
 
     // Selalu re-enable FK checks, bahkan jika TRUNCATE gagal
-    let _ = sqlx::query("SET FOREIGN_KEY_CHECKS=1").execute(&pool).await;
+    let _ = sqlx::query("SET FOREIGN_KEY_CHECKS=1").execute(&mut *conn).await;
 
+    drop(conn);
     pool.close().await;
 
     // Propagate error setelah FK checks di-restore

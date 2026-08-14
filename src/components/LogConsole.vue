@@ -192,6 +192,9 @@ const copyLogs = () => {
   line-height: 1.6;
   background: #090d16;
   overscroll-behavior: contain;
+  user-select: text !important;
+  -webkit-user-select: text !important;
+  cursor: text;
 }
 
 .empty-log {
@@ -202,6 +205,7 @@ const copyLogs = () => {
   color: var(--text-dim);
   font-style: italic;
   font-size: 0.82rem;
+  user-select: none;
 }
 
 .log-row {
@@ -210,11 +214,15 @@ const copyLogs = () => {
   gap: 8px;
   margin-bottom: 4px;
   word-break: break-all;
+  user-select: text !important;
+  -webkit-user-select: text !important;
 }
 
 .log-time {
   color: var(--text-dim);
   white-space: nowrap;
+  user-select: text !important;
+  -webkit-user-select: text !important;
 }
 
 .log-level-badge {
@@ -223,6 +231,13 @@ const copyLogs = () => {
   padding: 1px 5px;
   border-radius: 3px;
   white-space: nowrap;
+  user-select: text !important;
+  -webkit-user-select: text !important;
+}
+
+.log-msg {
+  user-select: text !important;
+  -webkit-user-select: text !important;
 }
 
 .log-info .log-level-badge { background: rgba(99, 102, 241, 0.2); color: #818cf8; }

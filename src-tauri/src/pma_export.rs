@@ -4,8 +4,16 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Read;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tauri::Emitter;
+
+pub static EXPORT_CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+#[tauri::command]
+pub fn cancel_pma_export() {
+    EXPORT_CANCEL_REQUESTED.store(true, Ordering::SeqCst);
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PmaExportConfig {
@@ -1439,6 +1447,10 @@ async fn stream_export_single_table(
     cached_endpoint: &std::sync::Arc<tokio::sync::Mutex<Option<(String, String)>>>,
     app: &tauri::AppHandle,
 ) -> Result<usize, String> {
+    if EXPORT_CANCEL_REQUESTED.load(Ordering::SeqCst) {
+        return Err("Sinkronisasi dibatalkan oleh pengguna.".to_string());
+    }
+
     let table_start = std::time::Instant::now();
 
     emit_log(
@@ -1480,6 +1492,9 @@ async fn stream_export_single_table(
 
     'endpoint_loop: for export_url in &export_urls {
         for compression_mode in &compressions {
+            if EXPORT_CANCEL_REQUESTED.load(Ordering::SeqCst) {
+                return Err("Sinkronisasi dibatalkan oleh pengguna.".to_string());
+            }
             let is_gz = compression_mode == "gzip";
             let is_incremental = pma_config.sync_mode.as_deref() == Some("incremental");
             let struct_or_data = if is_incremental { "data" } else { "structure_and_data" };
@@ -1711,6 +1726,8 @@ async fn stream_export_single_table(
         // emit_log(app, "info", format!("[Tabel '{}'] Mode Fresh Sync — Menghapus (DROP TABLE IF EXISTS) tabel lokal terlebih dahulu...", table_name));
         let mut drop_cmd = Command::new("mysql");
         drop_cmd
+            .arg("--skip-ssl")
+            .arg("--connect-timeout=60")
             .arg("-h")
             .arg(host)
             .arg("-P")
@@ -1737,9 +1754,17 @@ async fn stream_export_single_table(
         }
     }
 
+    if EXPORT_CANCEL_REQUESTED.load(Ordering::SeqCst) {
+        return Err("Sinkronisasi dibatalkan oleh pengguna.".to_string());
+    }
+
     // Spawn child process `mysql` CLI
     let mut cmd = Command::new("mysql");
-    cmd.arg("-h")
+    cmd.arg("--skip-ssl")
+        .arg("--max-allowed-packet=512M")
+        .arg("--connect-timeout=60")
+        .arg("--default-character-set=utf8mb4")
+        .arg("-h")
         .arg(host)
         .arg("-P")
         .arg(&port_str)
@@ -1825,9 +1850,9 @@ async fn stream_export_single_table(
     }
 
     // Import table independently; referenced tables may be synchronized later.
-    let mut import_sql = b"SET FOREIGN_KEY_CHECKS=0;\n".to_vec();
+    let mut import_sql = b"SET FOREIGN_KEY_CHECKS=0;\nSET UNIQUE_CHECKS=0;\nSET AUTOCOMMIT=1;\nSET sql_mode='';\nSET net_read_timeout=600;\nSET net_write_timeout=600;\nSET wait_timeout=600;\n".to_vec();
     import_sql.append(&mut sql_bytes);
-    import_sql.extend_from_slice(b"\nSET FOREIGN_KEY_CHECKS=1;\n");
+    import_sql.extend_from_slice(b"\nSET FOREIGN_KEY_CHECKS=1;\nSET UNIQUE_CHECKS=1;\n");
     let sql_bytes = import_sql;
 
     let mut mysql_stdin = child
@@ -1940,7 +1965,9 @@ fn ensure_local_database_exists(local_config: &LocalDbConfig, app: &tauri::AppHa
     };
 
     let mut cmd = Command::new("mysql");
-    cmd.arg("-h")
+    cmd.arg("--skip-ssl")
+        .arg("--connect-timeout=60")
+        .arg("-h")
         .arg(host)
         .arg("-P")
         .arg(&port_str)
@@ -1970,7 +1997,11 @@ fn ensure_local_database_exists(local_config: &LocalDbConfig, app: &tauri::AppHa
                 emit_log(
                     app,
                     "warn",
-                    format!("Penyiapan DB lokal '{}': {}", db_name, err),
+                    format!(
+                        "Gagal membuat database lokal '{}' via MySQL CLI: {}",
+                        db_name,
+                        err.trim()
+                    ),
                 );
             } else {
                 emit_log(
@@ -1984,7 +2015,10 @@ fn ensure_local_database_exists(local_config: &LocalDbConfig, app: &tauri::AppHa
             emit_log(
                 app,
                 "warn",
-                format!("Gagal memeriksa/membuat DB lokal via CLI mysql: {}", e),
+                format!(
+                    "Gagal mengecek/membuat database lokal '{}': {}",
+                    db_name, e
+                ),
             );
         }
     }
@@ -1997,6 +2031,8 @@ pub async fn export_pma_database(
     local_config: LocalDbConfig,
     app: tauri::AppHandle,
 ) -> Result<String, String> {
+    EXPORT_CANCEL_REQUESTED.store(false, Ordering::SeqCst);
+
     emit_log(
         &app,
         "info",
@@ -2087,7 +2123,15 @@ pub async fn export_pma_database(
         let app_handle = app.clone();
 
         let handle = tokio::spawn(async move {
+            if EXPORT_CANCEL_REQUESTED.load(Ordering::SeqCst) {
+                return Err("Sinkronisasi dibatalkan oleh pengguna.".to_string());
+            }
+
             let _permit = sem.acquire().await.map_err(|e| e.to_string())?;
+
+            if EXPORT_CANCEL_REQUESTED.load(Ordering::SeqCst) {
+                return Err("Sinkronisasi dibatalkan oleh pengguna.".to_string());
+            }
 
             let imported_rows = stream_export_single_table(
                 &client_c,
@@ -2120,12 +2164,31 @@ pub async fn export_pma_database(
         join_handles.push(handle);
     }
 
+    let mut cancel_or_err: Option<String> = None;
     for handle in join_handles {
         match handle.await {
             Ok(Ok(_)) => {},
-            Ok(Err(e)) => return Err(e),
-            Err(e) => return Err(format!("Worker execution error: {}", e)),
+            Ok(Err(e)) => {
+                EXPORT_CANCEL_REQUESTED.store(true, Ordering::SeqCst);
+                if cancel_or_err.is_none() {
+                    cancel_or_err = Some(e);
+                }
+            },
+            Err(e) => {
+                EXPORT_CANCEL_REQUESTED.store(true, Ordering::SeqCst);
+                if cancel_or_err.is_none() {
+                    cancel_or_err = Some(format!("Worker execution error: {}", e));
+                }
+            }
         }
+    }
+
+    if let Some(err) = cancel_or_err {
+        if EXPORT_CANCEL_REQUESTED.load(Ordering::SeqCst) || err.contains("dibatalkan") {
+            emit_progress(&app, completed_tables.load(Ordering::SeqCst), total_tables, "", 0, total_rows.load(Ordering::SeqCst), "cancelled");
+            return Err("Sinkronisasi dibatalkan oleh pengguna.".to_string());
+        }
+        return Err(err);
     }
 
     let final_total_rows = total_rows.load(std::sync::atomic::Ordering::SeqCst);
