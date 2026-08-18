@@ -5,7 +5,7 @@ import path from 'node:path';
 const version = process.argv[2] || JSON.parse(readFileSync('package.json', 'utf8')).version;
 const pkgName = 'db-sync-desktop-client';
 const arch = 'x86_64';
-const pkgFileName = `${pkgName}-${version}-1-${arch}.pkg.tar.zst`;
+const pkgFileName = `${pkgName}-${version}-${arch}.pkg.tar.zst`;
 
 console.log(`Building Arch Linux package: ${pkgFileName}...`);
 
