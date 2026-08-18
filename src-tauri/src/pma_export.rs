@@ -1738,7 +1738,7 @@ async fn stream_export_single_table(
             drop_cmd.arg(format!("-p{}", local_config.password));
         }
         drop_cmd.arg(db_name).arg("-e").arg(format!(
-            "SET FOREIGN_KEY_CHECKS=0; DROP TABLE IF EXISTS `{}`; SET FOREIGN_KEY_CHECKS=1;",
+            "SET FOREIGN_KEY_CHECKS=0; SET lock_wait_timeout=600; SET innodb_lock_wait_timeout=600; DROP TABLE IF EXISTS `{}`; SET FOREIGN_KEY_CHECKS=1;",
             table_name.replace('`', "``")
         ));
         let drop_output = drop_cmd
@@ -1757,38 +1757,6 @@ async fn stream_export_single_table(
     if EXPORT_CANCEL_REQUESTED.load(Ordering::SeqCst) {
         return Err("Sinkronisasi dibatalkan oleh pengguna.".to_string());
     }
-
-    // Spawn child process `mysql` CLI
-    let mut cmd = Command::new("mysql");
-    cmd.arg("--skip-ssl")
-        .arg("--max-allowed-packet=512M")
-        .arg("--connect-timeout=60")
-        .arg("--default-character-set=utf8mb4")
-        .arg("-h")
-        .arg(host)
-        .arg("-P")
-        .arg(&port_str)
-        .arg("-u")
-        .arg(&local_config.username);
-
-    if !local_config.password.is_empty() {
-        cmd.arg(format!("-p{}", local_config.password));
-    }
-
-    cmd.arg(db_name);
-    cmd.stdin(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-    cmd.stdout(Stdio::null());
-
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            return Err(format!(
-                "Gagal menjalankan perintah CLI 'mysql'. Pastikan client MySQL/MariaDB terinstall dan ada di PATH system. Error: {}",
-                e
-            ));
-        }
-    };
 
     // Read export body once. Detect real GZIP signature; PMA may label plain SQL as application/x-gzip.
     let response_bytes = response
@@ -1835,38 +1803,100 @@ async fn stream_export_single_table(
         ));
     }
 
-    if pma_config.sync_mode.as_deref() == Some("incremental") {
-        let sql_text = String::from_utf8_lossy(&sql_bytes);
-        let safe_lines: Vec<&str> = sql_text
-            .lines()
-            .filter(|line| {
-                let trimmed = line.trim().to_uppercase();
-                !trimmed.starts_with("DROP TABLE")
-                    && !trimmed.starts_with("TRUNCATE TABLE")
-                    && !trimmed.starts_with("TRUNCATE ")
-            })
-            .collect();
-        sql_bytes = safe_lines.join("\n").into_bytes();
+    let sql_text = String::from_utf8_lossy(&sql_bytes);
+    let mut safe_lines: Vec<String> = Vec::new();
+    let is_incremental = pma_config.sync_mode.as_deref() == Some("incremental");
+    for line in sql_text.lines() {
+        let trimmed = line.trim().to_uppercase();
+        if is_incremental
+            && (trimmed.starts_with("DROP TABLE")
+                || trimmed.starts_with("TRUNCATE TABLE")
+                || trimmed.starts_with("TRUNCATE "))
+        {
+            continue;
+        }
+        // Neutralize PMA dump commands that re-enable foreign key checks mid-file
+        if trimmed.contains("FOREIGN_KEY_CHECKS")
+            && (trimmed.contains("=1")
+                || trimmed.contains("= 1")
+                || trimmed.contains("@OLD_FOREIGN_KEY_CHECKS"))
+        {
+            safe_lines.push("SET FOREIGN_KEY_CHECKS=0;".to_string());
+        } else {
+            safe_lines.push(line.to_string());
+        }
     }
+    sql_bytes = safe_lines.join("\n").into_bytes();
 
     // Import table independently; referenced tables may be synchronized later.
-    let mut import_sql = b"SET FOREIGN_KEY_CHECKS=0;\nSET UNIQUE_CHECKS=0;\nSET AUTOCOMMIT=1;\nSET sql_mode='';\nSET net_read_timeout=600;\nSET net_write_timeout=600;\nSET wait_timeout=600;\n".to_vec();
+    let mut import_sql = b"SET FOREIGN_KEY_CHECKS=0;\nSET UNIQUE_CHECKS=0;\nSET AUTOCOMMIT=1;\nSET sql_mode='';\nSET net_read_timeout=600;\nSET net_write_timeout=600;\nSET wait_timeout=600;\nSET lock_wait_timeout=600;\nSET innodb_lock_wait_timeout=600;\n".to_vec();
     import_sql.append(&mut sql_bytes);
-    import_sql.extend_from_slice(b"\nSET FOREIGN_KEY_CHECKS=1;\nSET UNIQUE_CHECKS=1;\n");
+    import_sql.extend_from_slice(b"\nSET FOREIGN_KEY_CHECKS=0;\nSET UNIQUE_CHECKS=1;\n");
     let sql_bytes = import_sql;
 
-    let mut mysql_stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| "Gagal membuka STDIN child process mysql".to_string())?;
-    use std::io::Write;
-    let write_result = mysql_stdin.write_all(&sql_bytes);
-    drop(mysql_stdin);
+    let max_retries = 3;
+    let mut attempt = 0;
+    let mut last_error = String::new();
 
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("Gagal menghentikan child process mysql: {}", e))?;
-    if !output.status.success() {
+    while attempt < max_retries {
+        attempt += 1;
+
+        if EXPORT_CANCEL_REQUESTED.load(Ordering::SeqCst) {
+            return Err("Sinkronisasi dibatalkan oleh pengguna.".to_string());
+        }
+
+        // Spawn child process `mysql` CLI
+        let mut cmd = Command::new("mysql");
+        cmd.arg("--skip-ssl")
+            .arg("--max-allowed-packet=512M")
+            .arg("--connect-timeout=60")
+            .arg("--default-character-set=utf8mb4")
+            .arg("-h")
+            .arg(host)
+            .arg("-P")
+            .arg(&port_str)
+            .arg("-u")
+            .arg(&local_config.username);
+
+        if !local_config.password.is_empty() {
+            cmd.arg(format!("-p{}", local_config.password));
+        }
+
+        cmd.arg(db_name);
+        cmd.stdin(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        cmd.stdout(Stdio::null());
+
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                return Err(format!(
+                    "Gagal menjalankan perintah CLI 'mysql'. Pastikan client MySQL/MariaDB terinstall dan ada di PATH system. Error: {}",
+                    e
+                ));
+            }
+        };
+
+        let mut mysql_stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "Gagal membuka STDIN child process mysql".to_string())?;
+        use std::io::Write;
+        let write_result = mysql_stdin.write_all(&sql_bytes);
+        drop(mysql_stdin);
+
+        let output = child
+            .wait_with_output()
+            .map_err(|e| format!("Gagal menghentikan child process mysql: {}", e))?;
+
+        if output.status.success() {
+            if let Err(e) = write_result {
+                return Err(format!("Gagal mengirim SQL ke MySQL: {}", e));
+            }
+            last_error.clear();
+            break;
+        }
+
         let stderr_full = String::from_utf8_lossy(&output.stderr);
         let stderr_tail = stderr_full
             .lines()
@@ -1881,6 +1911,23 @@ async fn stream_export_single_table(
             .err()
             .map(|e| format!(" (stdin: {})", e))
             .unwrap_or_default();
+        last_error = format!("MySQL CLI import error: {}{}", stderr_tail, write_context);
+
+        if (stderr_full.contains("1205") || stderr_full.contains("Lock wait timeout exceeded"))
+            && attempt < max_retries
+        {
+            emit_log(
+                app,
+                "warn",
+                format!(
+                    "[Tabel '{}'] Lock wait timeout exceeded (Percobaan {}/{}). Menunggu 2 detik lalu mencoba kembali...",
+                    table_name, attempt, max_retries
+                ),
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            continue;
+        }
+
         emit_log(
             app,
             "error",
@@ -1889,13 +1936,11 @@ async fn stream_export_single_table(
                 table_name, stderr_tail, write_context
             ),
         );
-        return Err(format!(
-            "MySQL CLI import error: {}{}",
-            stderr_tail, write_context
-        ));
+        return Err(last_error);
     }
-    if let Err(e) = write_result {
-        return Err(format!("Gagal mengirim SQL ke MySQL: {}", e));
+
+    if !last_error.is_empty() {
+        return Err(last_error);
     }
 
     let imported_rows = count_imported_sql_rows(&sql_bytes);
