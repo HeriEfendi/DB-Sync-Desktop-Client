@@ -73,4 +73,4 @@ jobs:
           sudo apt-get install -y zstd
           VERSION="${GITHUB_REF_NAME#v}"
           node scripts/create-arch-pkg.mjs "$VERSION"
-          gh release upload "${GITHUB_REF_NAME}" db-sync-desktop-client-*.pkg.tar.zst --clobber
+          gh release upload "${GITHUB_REF_NAME}" DB-Sync.Client-*.pkg.tar.zst --clobber

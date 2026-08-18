@@ -2,10 +2,12 @@ import { execSync } from 'node:child_process';
 import { readFileSync, mkdirSync, writeFileSync, rmSync, existsSync } from 'node:fs';
 import path from 'node:path';
 
+const tauriConfig = JSON.parse(readFileSync('src-tauri/tauri.conf.json', 'utf8'));
+const appName = tauriConfig.productName ? tauriConfig.productName.replace(/\s+/g, '.') : 'DB-Sync.Client';
 const version = process.argv[2] || JSON.parse(readFileSync('package.json', 'utf8')).version;
 const pkgName = 'db-sync-desktop-client';
 const arch = 'x86_64';
-const pkgFileName = `${pkgName}-${version}-${arch}.pkg.tar.zst`;
+const pkgFileName = `${appName}-${version}-${arch}.pkg.tar.zst`;
 
 console.log(`Building Arch Linux package: ${pkgFileName}...`);
 
