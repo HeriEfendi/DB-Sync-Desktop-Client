@@ -145,14 +145,63 @@ const stats = ref({
 let logSaveTimer = null;
 
 const addLog = (entry) => {
+  const msg = entry.message || '';
+  const tableMatch = msg.match(/\[Tabel\s+'([^']+)'\]/);
+  const tableName = tableMatch ? tableMatch[1] : null;
+
+  const isTransientProgress =
+    msg.includes('Mengunduh stream:') ||
+    msg.includes('Menunggu server remote PMA') ||
+    msg.includes('Mengalirkan ke MySQL:');
+
+  const isTableFinished =
+    msg.includes('Selesai! ~') ||
+    msg.includes('Melewati proses import lokal') ||
+    msg.includes('Di-skip pada sinkronisasi');
+
+  if (tableName && isTransientProgress) {
+    // If there is already an active progress log for this table, update it in place
+    const existingIdx = logs.value.findIndex(
+      (l) => l.isTransient && l.tableName === tableName
+    );
+    if (existingIdx !== -1) {
+      logs.value[existingIdx] = {
+        ...entry,
+        isTransient: true,
+        tableName,
+      };
+      return;
+    } else {
+      logs.value.push({
+        ...entry,
+        isTransient: true,
+        tableName,
+      });
+      if (logs.value.length > 500) logs.value.shift();
+      return;
+    }
+  }
+
+  if (tableName && isTableFinished) {
+    // Clean up temporary in-flight progress logs for this table upon finish
+    logs.value = logs.value.filter(
+      (l) => !(l.isTransient && l.tableName === tableName)
+    );
+  }
+
+  // Push permanent clean log
   logs.value.push(entry);
-  if (logs.value.length > 300) {
+  if (logs.value.length > 500) {
     logs.value.shift();
   }
+
   if (!logSaveTimer) {
     logSaveTimer = setTimeout(() => {
       try {
-        localStorage.setItem('db_sync_logs', JSON.stringify(logs.value.slice(-100)));
+        localStorage.setItem(
+          'db_sync_logs',
+          JSON.stringify(logs.value.filter((l) => !l.isTransient).slice(-100))
+        );
       } catch (e) {}
       logSaveTimer = null;
     }, 2500);

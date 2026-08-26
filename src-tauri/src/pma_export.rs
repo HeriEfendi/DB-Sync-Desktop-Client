@@ -3,10 +3,11 @@ use flate2::read::MultiGzDecoder;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Read;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tauri::Emitter;
+use tokio::process::Command;
 
 pub static USER_CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
 pub static WORKER_ABORT_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -234,6 +235,8 @@ async fn authenticate_pma(
         .gzip(false)
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) DB-Sync-Client/1.0")
         .timeout(Duration::from_secs(300))
+        .tcp_keepalive(Duration::from_secs(30))
+        .pool_idle_timeout(Duration::from_secs(90))
         .redirect(reqwest::redirect::Policy::limited(10))
         .build()
         .map_err(|e| format!("Gagal membina Client HTTP: {}", e))?;
@@ -1435,6 +1438,24 @@ fn count_imported_sql_rows(bytes: &[u8]) -> usize {
     count
 }
 
+fn format_byte_size(bytes: usize) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.2} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.2} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.2} KB", b / KB)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+#[derive(Clone)]
 struct DownloadedTableData {
     table_name: String,
     response_bytes: Vec<u8>,
@@ -1467,10 +1488,116 @@ async fn fetch_table_export_stream(
         format!("[Tabel '{}'] Mengunduh export SQL dari server PMA...", table_name),
     );
 
+    let pk_col_opt = pma_config
+        .table_primary_keys
+        .as_ref()
+        .and_then(|m| m.get(table_name))
+        .map(|s| s.trim())
+        .filter(|pk| !pk.is_empty())
+        .or_else(|| pma_config.primary_key.as_deref().map(str::trim).filter(|pk| !pk.is_empty()));
+
+    let has_updated_at = pma_config
+        .tables_with_updated_at
+        .as_ref()
+        .map(|set| set.contains(table_name))
+        .unwrap_or(false);
+
+    let has_incremental_watermark = pma_config.sync_mode.as_deref() == Some("incremental")
+        && pma_config.incremental_watermarks.as_ref()
+            .is_some_and(|watermarks| watermarks.contains_key(table_name));
+
+    // Optimasi: Jika mode incremental dan watermark sudah ada, tetapi tabel TIDAK punya PK dan TIDAK punya updated_at
+    if pma_config.sync_mode.as_deref() == Some("incremental") && has_incremental_watermark && pk_col_opt.is_none() && !has_updated_at {
+        emit_log(
+            app,
+            "info",
+            format!("[Tabel '{}'] Tidak memiliki kolom Primary Key (ID) maupun 'updated_at'. Di-skip pada sinkronisasi incremental untuk mencegah error.", table_name),
+        );
+        return Ok(None);
+    }
+
     let sql_type_val = if pma_config.sync_mode.as_deref() == Some("fresh") {
         "INSERT"
     } else {
         "REPLACE"
+    };
+
+    let is_incremental = pma_config.sync_mode.as_deref() == Some("incremental");
+    let struct_or_data = if is_incremental { "data" } else { "structure_and_data" };
+    let sql_structure = if is_incremental { "0" } else { "1" };
+    let sql_create = if is_incremental { "false" } else { "true" };
+
+    let custom_query_opt = if pma_config.row_limit.filter(|limit| *limit > 0).is_some() || has_incremental_watermark {
+        let limit = pma_config.row_limit.filter(|limit| *limit > 0).unwrap_or(usize::MAX);
+        let safe_table = table_name.replace('`', "``");
+
+        let limited_query = if let Some(watermark) = pma_config
+            .incremental_watermarks
+            .as_ref()
+            .and_then(|watermarks| watermarks.get(table_name))
+            .filter(|_| pma_config.sync_mode.as_deref() == Some("incremental"))
+        {
+            let last_id_str = match &watermark.last_synced_id {
+                serde_json::Value::Number(value) => Some(value.to_string()),
+                serde_json::Value::String(value) => Some(format!("'{}'", value.replace('\'', "''"))),
+                _ => None,
+            };
+            let last_sync = watermark.last_sync_time.replace('\'', "''");
+
+            let mut conditions = Vec::new();
+
+            if let (Some(pk_col), Some(last_id)) = (pk_col_opt, last_id_str) {
+                let safe_pk = pk_col.replace('`', "``");
+                conditions.push(format!("`{}` > {}", safe_pk, last_id));
+            }
+
+            if has_updated_at && !last_sync.is_empty() {
+                conditions.push(format!("`updated_at` > '{}'", last_sync));
+            }
+
+            let where_clause = if !conditions.is_empty() {
+                format!("WHERE {}", conditions.join(" OR "))
+            } else {
+                String::new()
+            };
+
+            let order_clause = if let Some(pk_col) = pk_col_opt {
+                format!("ORDER BY `{}` ASC", pk_col.replace('`', "``"))
+            } else if has_updated_at {
+                "ORDER BY `updated_at` ASC".to_string()
+            } else {
+                String::new()
+            };
+
+            let limit_clause = if limit != usize::MAX {
+                format!("LIMIT {}", limit)
+            } else {
+                String::new()
+            };
+
+            format!(
+                "SELECT * FROM `{}` {} {} {}",
+                safe_table, where_clause, order_clause, limit_clause
+            ).split_whitespace().collect::<Vec<_>>().join(" ")
+        } else {
+            let order_clause = if let Some(pk_col) = pk_col_opt {
+                format!("ORDER BY `{}` DESC", pk_col.replace('`', "``"))
+            } else {
+                String::new()
+            };
+            let limit_clause = if limit != usize::MAX {
+                format!("LIMIT {}", limit)
+            } else {
+                String::new()
+            };
+            format!(
+                "SELECT * FROM `{}` {} {}",
+                safe_table, order_clause, limit_clause
+            ).split_whitespace().collect::<Vec<_>>().join(" ")
+        };
+        Some(limited_query)
+    } else {
+        None
     };
 
     let (cached_url, cached_comp) = {
@@ -1478,182 +1605,104 @@ async fn fetch_table_export_stream(
         guard.clone().unzip()
     };
 
-    let export_urls = if let Some(ref u) = cached_url {
-        vec![u.clone()]
+    let default_urls = if base_url.contains("/public") {
+        vec![
+            format!("{}/index.php?route=/table/export", base_url),
+            format!("{}/index.php?route=/export", base_url),
+            format!("{}/index.php?route=/database/export", base_url),
+            format!("{}/export.php", base_url),
+        ]
     } else {
         vec![
             format!("{}/export.php", base_url),
-            format!("{}/index.php?route=/export", base_url),
             format!("{}/index.php?route=/table/export", base_url),
+            format!("{}/index.php?route=/export", base_url),
             format!("{}/index.php?route=/database/export", base_url),
         ]
     };
+    let default_compressions = vec!["gzip".to_string(), "none".to_string()];
 
-    let compressions = if let Some(ref c) = cached_comp {
-        vec![c.clone()]
-    } else {
-        vec!["gzip".to_string(), "none".to_string()]
-    };
+    let mut candidates = Vec::new();
+    if let (Some(u), Some(c)) = (cached_url, cached_comp) {
+        candidates.push((u.clone(), c.clone()));
+        if c == "gzip" {
+            candidates.push((u.clone(), "none".to_string()));
+        }
+    }
+    for u in &default_urls {
+        for c in &default_compressions {
+            if !candidates.iter().any(|(cand_u, cand_c)| cand_u == u && cand_c == c) {
+                candidates.push((u.clone(), c.clone()));
+            }
+        }
+    }
 
-    let mut valid_response: Option<(reqwest::Response, bool)> = None; // (response, is_gzip)
     let mut last_html_err = String::new();
+    let mut last_network_err = String::new();
+    let max_retries_per_candidate = 3;
 
-    'endpoint_loop: for export_url in &export_urls {
-        for compression_mode in &compressions {
+    'candidate_loop: for (export_url, compression_mode) in candidates {
+        let is_gz = compression_mode == "gzip";
+
+        let mut form: Vec<(String, String)> = vec![
+            ("db".to_string(), pma_config.database.clone()),
+            ("table".to_string(), table_name.to_string()),
+            ("table_select[]".to_string(), table_name.to_string()),
+            ("table_structure[]".to_string(), table_name.to_string()),
+            ("table_data[]".to_string(), table_name.to_string()),
+            ("single_table".to_string(), "true".to_string()),
+            ("what".to_string(), "sql".to_string()),
+            ("export_type".to_string(), "table".to_string()),
+            ("export_method".to_string(), "custom".to_string()),
+            ("quick_or_custom".to_string(), "custom".to_string()),
+            ("output_format".to_string(), "sendit".to_string()),
+            ("compression".to_string(), compression_mode.clone()),
+            ("asfile".to_string(), "sendit".to_string()),
+            (
+                "sql_structure_or_data".to_string(),
+                struct_or_data.to_string(),
+            ),
+            ("sql_structure".to_string(), sql_structure.to_string()),
+            ("sql_data".to_string(), "1".to_string()),
+            ("sql_create_table".to_string(), sql_create.to_string()),
+            ("sql_drop_table".to_string(), "false".to_string()),
+            ("sql_if_not_exists".to_string(), "true".to_string()),
+            ("sql_auto_increment".to_string(), "1".to_string()),
+            ("sql_backquotes".to_string(), "1".to_string()),
+            ("sql_type".to_string(), sql_type_val.to_string()),
+            ("sql_extended_inserts".to_string(), "true".to_string()),
+            ("sql_max_query_size".to_string(), "4194304".to_string()),
+            ("sql_disable_fk".to_string(), "true".to_string()),
+            ("sql_use_transaction".to_string(), "true".to_string()),
+        ];
+
+        if let Some(ref limited_query) = custom_query_opt {
+            form.push(("sql_query".to_string(), limited_query.clone()));
+            form.push(("query_type".to_string(), "table".to_string()));
+            form.push(("sql_query_input".to_string(), "true".to_string()));
+        }
+
+        if !csrf_token.is_empty() {
+            form.push(("token".to_string(), csrf_token.to_string()));
+        }
+
+        let mut attempt = 0;
+        while attempt < max_retries_per_candidate {
+            attempt += 1;
             if is_user_cancelled() {
                 return Err("__USER_CANCELLED__".to_string());
             }
             if is_aborted() {
                 return Err("__WORKER_ABORTED__".to_string());
             }
-            let is_gz = compression_mode == "gzip";
-            let is_incremental = pma_config.sync_mode.as_deref() == Some("incremental");
-            let struct_or_data = if is_incremental { "data" } else { "structure_and_data" };
-            let sql_structure = if is_incremental { "0" } else { "1" };
-            let sql_create = if is_incremental { "false" } else { "true" };
 
-            let mut form: Vec<(String, String)> = vec![
-                ("db".to_string(), pma_config.database.clone()),
-                ("table".to_string(), table_name.to_string()),
-                ("table_select[]".to_string(), table_name.to_string()),
-                ("table_structure[]".to_string(), table_name.to_string()),
-                ("table_data[]".to_string(), table_name.to_string()),
-                ("single_table".to_string(), "true".to_string()),
-                ("what".to_string(), "sql".to_string()),
-                ("export_type".to_string(), "table".to_string()),
-                ("export_method".to_string(), "custom".to_string()),
-                ("quick_or_custom".to_string(), "custom".to_string()),
-                ("output_format".to_string(), "sendit".to_string()),
-                ("compression".to_string(), compression_mode.clone()),
-                ("asfile".to_string(), "sendit".to_string()),
-                (
-                    "sql_structure_or_data".to_string(),
-                    struct_or_data.to_string(),
-                ),
-                ("sql_structure".to_string(), sql_structure.to_string()),
-                ("sql_data".to_string(), "1".to_string()),
-                ("sql_create_table".to_string(), sql_create.to_string()),
-                ("sql_drop_table".to_string(), "false".to_string()),
-                ("sql_if_not_exists".to_string(), "true".to_string()),
-                ("sql_auto_increment".to_string(), "1".to_string()),
-                ("sql_backquotes".to_string(), "1".to_string()),
-                ("sql_type".to_string(), sql_type_val.to_string()),
-                ("sql_extended_inserts".to_string(), "true".to_string()),
-                ("sql_max_query_size".to_string(), "4194304".to_string()),
-                ("sql_disable_fk".to_string(), "true".to_string()),
-                ("sql_use_transaction".to_string(), "true".to_string()),
-            ];
+            let post_future = client.post(&export_url).form(&form).send();
+            tokio::pin!(post_future);
 
-            let pk_col_opt = pma_config
-                .table_primary_keys
-                .as_ref()
-                .and_then(|m| m.get(table_name))
-                .map(|s| s.trim())
-                .filter(|pk| !pk.is_empty())
-                .or_else(|| pma_config.primary_key.as_deref().map(str::trim).filter(|pk| !pk.is_empty()));
+            let send_start = std::time::Instant::now();
+            let mut last_wait_log = std::time::Instant::now();
 
-            let has_updated_at = pma_config
-                .tables_with_updated_at
-                .as_ref()
-                .map(|set| set.contains(table_name))
-                .unwrap_or(false);
-
-            let has_incremental_watermark = pma_config.sync_mode.as_deref() == Some("incremental")
-                && pma_config.incremental_watermarks.as_ref()
-                    .is_some_and(|watermarks| watermarks.contains_key(table_name));
-
-            // Optimasi: Jika mode incremental dan watermark sudah ada, tetapi tabel TIDAK punya PK dan TIDAK punya updated_at
-            if pma_config.sync_mode.as_deref() == Some("incremental") && has_incremental_watermark && pk_col_opt.is_none() && !has_updated_at {
-                emit_log(
-                    app,
-                    "info",
-                    format!("[Tabel '{}'] Tidak memiliki kolom Primary Key (ID) maupun 'updated_at'. Di-skip pada sinkronisasi incremental untuk mencegah error.", table_name),
-                );
-                return Ok(None);
-            }
-
-            if pma_config.row_limit.filter(|limit| *limit > 0).is_some() || has_incremental_watermark {
-                let limit = pma_config.row_limit.filter(|limit| *limit > 0).unwrap_or(usize::MAX);
-                let safe_table = table_name.replace('`', "``");
-
-                let limited_query = if let Some(watermark) = pma_config
-                    .incremental_watermarks
-                    .as_ref()
-                    .and_then(|watermarks| watermarks.get(table_name))
-                    .filter(|_| pma_config.sync_mode.as_deref() == Some("incremental"))
-                {
-                    let last_id_str = match &watermark.last_synced_id {
-                        serde_json::Value::Number(value) => Some(value.to_string()),
-                        serde_json::Value::String(value) => Some(format!("'{}'", value.replace('\'', "''"))),
-                        _ => None,
-                    };
-                    let last_sync = watermark.last_sync_time.replace('\'', "''");
-
-                    let mut conditions = Vec::new();
-
-                    if let (Some(pk_col), Some(last_id)) = (pk_col_opt, last_id_str) {
-                        let safe_pk = pk_col.replace('`', "``");
-                        conditions.push(format!("`{}` > {}", safe_pk, last_id));
-                    }
-
-                    if has_updated_at && !last_sync.is_empty() {
-                        conditions.push(format!("`updated_at` > '{}'", last_sync));
-                    }
-
-                    let where_clause = if !conditions.is_empty() {
-                        format!("WHERE {}", conditions.join(" OR "))
-                    } else {
-                        String::new()
-                    };
-
-                    let order_clause = if let Some(pk_col) = pk_col_opt {
-                        format!("ORDER BY `{}` ASC", pk_col.replace('`', "``"))
-                    } else if has_updated_at {
-                        "ORDER BY `updated_at` ASC".to_string()
-                    } else {
-                        String::new()
-                    };
-
-                    let limit_clause = if limit != usize::MAX {
-                        format!("LIMIT {}", limit)
-                    } else {
-                        String::new()
-                    };
-
-                    format!(
-                        "SELECT * FROM `{}` {} {} {}",
-                        safe_table, where_clause, order_clause, limit_clause
-                    ).split_whitespace().collect::<Vec<_>>().join(" ")
-                } else {
-                    let order_clause = if let Some(pk_col) = pk_col_opt {
-                        format!("ORDER BY `{}` DESC", pk_col.replace('`', "``"))
-                    } else {
-                        String::new()
-                    };
-                    let limit_clause = if limit != usize::MAX {
-                        format!("LIMIT {}", limit)
-                    } else {
-                        String::new()
-                    };
-                    format!(
-                        "SELECT * FROM `{}` {} {}",
-                        safe_table, order_clause, limit_clause
-                    ).split_whitespace().collect::<Vec<_>>().join(" ")
-                };
-
-                form.push(("sql_query".to_string(), limited_query));
-                form.push(("query_type".to_string(), "table".to_string()));
-                form.push(("sql_query_input".to_string(), "true".to_string()));
-            }
-            if !csrf_token.is_empty() {
-                form.push(("token".to_string(), csrf_token.to_string()));
-            }
-            let mut req_attempt = 0;
-            let max_req_attempts = 3;
-            let mut response_opt = None;
-
-            while req_attempt < max_req_attempts {
-                req_attempt += 1;
+            let send_result = loop {
                 if is_user_cancelled() {
                     return Err("__USER_CANCELLED__".to_string());
                 }
@@ -1661,39 +1710,46 @@ async fn fetch_table_export_stream(
                     return Err("__WORKER_ABORTED__".to_string());
                 }
 
-                match client.post(export_url).form(&form).send().await {
-                    Ok(r) => {
-                        response_opt = Some(r);
-                        break;
+                tokio::select! {
+                    res = &mut post_future => {
+                        break res;
                     }
-                    Err(e) => {
-                        if req_attempt < max_req_attempts {
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                        let elapsed_wait = send_start.elapsed().as_secs();
+                        if elapsed_wait >= 5 && last_wait_log.elapsed().as_secs() >= 5 {
                             emit_log(
                                 app,
-                                "warn",
+                                "info",
                                 format!(
-                                    "[Tabel '{}'] Koneksi ke {} terputus ({}/{}): {}. Mencoba kembali dalam 2 detik...",
-                                    table_name, export_url, req_attempt, max_req_attempts, e
+                                    "[Tabel '{}'] Menunggu server remote PMA memproses & menyiapkan export SQL... ({}s)",
+                                    table_name, elapsed_wait
                                 ),
                             );
-                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                        } else {
-                            emit_log(
-                                app,
-                                "warn",
-                                format!(
-                                    "[Tabel '{}'] POST ke {} gagal setelah {} percobaan: {}",
-                                    table_name, export_url, max_req_attempts, e
-                                ),
-                            );
+                            last_wait_log = std::time::Instant::now();
                         }
                     }
                 }
-            }
+            };
 
-            let response = match response_opt {
-                Some(r) => r,
-                None => continue,
+            let response = match send_result {
+                Ok(r) => r,
+                Err(e) => {
+                    last_network_err = e.to_string();
+                    if attempt < max_retries_per_candidate {
+                        emit_log(
+                            app,
+                            "warn",
+                            format!(
+                                "[Tabel '{}'] Koneksi ke {} terputus ({}/{}): {}. Mencoba kembali...",
+                                table_name, export_url, attempt, max_retries_per_candidate, e
+                            ),
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        continue;
+                    } else {
+                        continue 'candidate_loop;
+                    }
+                }
             };
 
             let content_type = response
@@ -1714,63 +1770,105 @@ async fn fetch_table_export_stream(
                         table_name, export_url, compression_mode, last_html_err
                     ),
                 );
+                let mut guard = cached_endpoint.lock().await;
+                if guard.as_ref().map(|(u, _)| u == &export_url).unwrap_or(false) {
+                    *guard = None;
+                }
+                continue 'candidate_loop;
+            }
+
+            use futures_util::StreamExt;
+            let mut stream = response.bytes_stream();
+            let mut response_bytes = Vec::new();
+            let mut last_progress_log = std::time::Instant::now();
+            let mut last_logged_bytes = 0usize;
+            let mut read_failed = false;
+
+            while let Some(chunk_res) = stream.next().await {
+                if is_user_cancelled() {
+                    return Err("__USER_CANCELLED__".to_string());
+                }
+                if is_aborted() {
+                    return Err("__WORKER_ABORTED__".to_string());
+                }
+                match chunk_res {
+                    Ok(chunk) => {
+                        response_bytes.extend_from_slice(&chunk);
+                        if response_bytes.len() >= 3 * 1024 * 1024 && last_progress_log.elapsed().as_secs() >= 3 {
+                            let delta_bytes = response_bytes.len() - last_logged_bytes;
+                            let delta_secs = last_progress_log.elapsed().as_secs_f64();
+                            let speed_mb = (delta_bytes as f64 / (1024.0 * 1024.0)) / delta_secs.max(0.1);
+                            emit_log(
+                                app,
+                                "info",
+                                format!(
+                                    "[Tabel '{}'] Mengunduh stream: {} diterima (~{:.2} MB/s)...",
+                                    table_name,
+                                    format_byte_size(response_bytes.len()),
+                                    speed_mb
+                                ),
+                            );
+                            last_progress_log = std::time::Instant::now();
+                            last_logged_bytes = response_bytes.len();
+                        }
+                    }
+                    Err(e) => {
+                        last_network_err = format!("error decoding response body: {}", e);
+                        emit_log(
+                            app,
+                            "warn",
+                            format!(
+                                "[Tabel '{}'] Gagal membaca body dari {} (comp={}, percobaan {}/{}): {}. Mencoba kembali...",
+                                table_name, export_url, compression_mode, attempt, max_retries_per_candidate, e
+                            ),
+                        );
+                        read_failed = true;
+                        break;
+                    }
+                }
+            }
+
+            if read_failed {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 continue;
             }
 
-            emit_log(
-                app,
-                "info",
-                format!(
-                    "[Tabel '{}'] Endpoint PMA valid ditemukan ({}, Content-Type: {})",
-                    table_name, export_url, content_type
-                ),
-            );
-            valid_response = Some((response, is_gz));
+            let total_bytes = response_bytes.len();
+            if total_bytes == 0 {
+                emit_log(
+                    app,
+                    "warn",
+                    format!(
+                        "[Tabel '{}'] Response kosong dari {} (comp={}, percobaan {}/{}). Mencoba kembali...",
+                        table_name, export_url, compression_mode, attempt, max_retries_per_candidate
+                    ),
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                continue;
+            }
 
-            // Cache valid working endpoint for next tables
             let mut guard = cached_endpoint.lock().await;
             if guard.is_none() {
                 *guard = Some((export_url.clone(), compression_mode.clone()));
             }
-            break 'endpoint_loop;
+
+            return Ok(Some(DownloadedTableData {
+                table_name: table_name.to_string(),
+                response_bytes: response_bytes.to_vec(),
+                is_gzip: is_gz,
+                table_start,
+            }));
         }
     }
 
-    let (response, is_gzip) = match valid_response {
-        Some(res) => res,
-        None => {
-            return Err(format!(
-                "Export GAGAL untuk tabel '{}'. Semua endpoint PMA mengembalikan HTML Error. Pesan terakhir: {}",
-                table_name, last_html_err
-            ));
-        }
+    let err_msg = if !last_html_err.is_empty() {
+        format!("Export GAGAL untuk tabel '{}'. Semua endpoint PMA mengembalikan HTML Error: {}", table_name, last_html_err)
+    } else if !last_network_err.is_empty() {
+        format!("Export GAGAL untuk tabel '{}'. Gagal membaca data dari server PMA: {}", table_name, last_network_err)
+    } else {
+        format!("Export GAGAL untuk tabel '{}'. Tidak ada data yang berhasil diunduh dari server PMA.", table_name)
     };
-
-    if is_user_cancelled() {
-        return Err("__USER_CANCELLED__".to_string());
-    }
-    if is_aborted() {
-        return Err("__WORKER_ABORTED__".to_string());
-    }
-
-    let response_bytes = response
-        .bytes()
-        .await
-        .map_err(|e| format!("Gagal membaca body export PMA: {}", e))?;
-    let total_bytes = response_bytes.len();
-    if total_bytes == 0 {
-        return Err(format!(
-            "Export tabel '{}' mengembalikan response kosong.",
-            table_name
-        ));
-    }
-
-    Ok(Some(DownloadedTableData {
-        table_name: table_name.to_string(),
-        response_bytes: response_bytes.to_vec(),
-        is_gzip,
-        table_start,
-    }))
+    Err(err_msg)
 }
 
 /// Tahap 2 (Consumer): Mendekompresi GZIP secara real-time dan mengalirkan langsung ke STDIN MySQL Lokal
@@ -1868,6 +1966,7 @@ async fn import_table_to_local(
         ));
         let drop_output = drop_cmd
             .output()
+            .await
             .map_err(|e| format!("Gagal menjalankan DROP TABLE untuk '{}': {}", table_name, e))?;
         if !drop_output.status.success() {
             let stderr = String::from_utf8_lossy(&drop_output.stderr);
@@ -1883,9 +1982,9 @@ async fn import_table_to_local(
         app,
         "info",
         format!(
-            "[Tabel '{}'] Data diterima {} byte (format: {}). Memulai impor ke MySQL lokal...",
+            "[Tabel '{}'] Data diterima {} (format: {}). Memulai impor ke MySQL lokal...",
             table_name,
-            total_bytes,
+            format_byte_size(total_bytes),
             if is_actual_gzip { "GZIP" } else { "SQL/raw" }
         ),
     );
@@ -1937,36 +2036,100 @@ async fn import_table_to_local(
             }
         };
 
-        let mut mysql_stdin = child
+        let mut child_stdin = child
             .stdin
             .take()
             .ok_or_else(|| "Gagal membuka STDIN child process mysql".to_string())?;
-        use std::io::Write;
-        let prelude = b"SET FOREIGN_KEY_CHECKS=0;\nSET UNIQUE_CHECKS=0;\nSET AUTOCOMMIT=0;\nSET sql_mode='';\nSET net_read_timeout=600;\nSET net_write_timeout=600;\nSET wait_timeout=600;\nSET lock_wait_timeout=600;\nSET innodb_lock_wait_timeout=600;\n";
-        let postlude = b"\nCOMMIT;\nSET FOREIGN_KEY_CHECKS=1;\nSET UNIQUE_CHECKS=1;\nSET AUTOCOMMIT=1;\n";
+        let mut child_stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| "Gagal membuka STDERR child process mysql".to_string())?;
 
-        let mut write_err = mysql_stdin.write_all(prelude);
-        if write_err.is_ok() {
-            write_err = mysql_stdin.write_all(&sql_bytes);
-        }
-        if write_err.is_ok() {
-            write_err = mysql_stdin.write_all(postlude);
-        }
-        drop(mysql_stdin);
+        let sql_bytes_clone = sql_bytes.clone();
+        let app_handle = app.clone();
+        let table_name_clone = table_name.to_string();
+        let total_sql_len = sql_bytes_clone.len();
 
-        let output = child
-            .wait_with_output()
-            .map_err(|e| format!("Gagal menghentikan child process mysql: {}", e))?;
+        let stdin_task = tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let prelude = b"SET SESSION sql_log_bin=0;\nSET SESSION foreign_key_checks=0;\nSET SESSION unique_checks=0;\nSET SESSION autocommit=0;\nSET SESSION sql_mode='';\nSET SESSION net_read_timeout=600;\nSET SESSION net_write_timeout=600;\nSET SESSION wait_timeout=600;\nSET SESSION lock_wait_timeout=600;\nSET SESSION innodb_lock_wait_timeout=600;\n";
+            let postlude = b"\nCOMMIT;\nSET SESSION foreign_key_checks=1;\nSET SESSION unique_checks=1;\nSET SESSION autocommit=1;\n";
 
-        if output.status.success() {
-            if let Err(e) = write_err {
-                return Err(format!("Gagal mengirim SQL ke MySQL: {}", e));
+            if let Err(e) = child_stdin.write_all(prelude).await {
+                return Err(e);
+            }
+
+            let chunk_size = 512 * 1024; // 512 KB per chunk
+            let mut written = 0usize;
+            let mut last_log_time = std::time::Instant::now();
+            let mut last_logged_written = 0usize;
+
+            while written < total_sql_len {
+                let end = (written + chunk_size).min(total_sql_len);
+                child_stdin.write_all(&sql_bytes_clone[written..end]).await?;
+                written = end;
+
+                // Log live import streaming progress every 3 seconds for large SQL (> 3 MB)
+                if total_sql_len >= 3 * 1024 * 1024 && last_log_time.elapsed().as_secs() >= 3 {
+                    let delta_bytes = written - last_logged_written;
+                    let delta_secs = last_log_time.elapsed().as_secs_f64();
+                    let speed_mb = (delta_bytes as f64 / (1024.0 * 1024.0)) / delta_secs.max(0.1);
+                    let percent = (written as f64 / total_sql_len as f64) * 100.0;
+                    emit_log(
+                        &app_handle,
+                        "info",
+                        format!(
+                            "[Tabel '{}'] Mengalirkan ke MySQL: {} / {} ({:.1}%) (~{:.2} MB/s)...",
+                            table_name_clone,
+                            format_byte_size(written),
+                            format_byte_size(total_sql_len),
+                            percent,
+                            speed_mb
+                        ),
+                    );
+                    last_log_time = std::time::Instant::now();
+                    last_logged_written = written;
+                }
+            }
+
+            if let Err(e) = child_stdin.write_all(postlude).await {
+                return Err(e);
+            }
+            let _ = child_stdin.flush().await;
+            drop(child_stdin);
+            Ok::<(), std::io::Error>(())
+        });
+
+        let stderr_task = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut err_buf = Vec::new();
+            let _ = child_stderr.read_to_end(&mut err_buf).await;
+            err_buf
+        });
+
+        let (status_res, stdin_res, stderr_res) = tokio::join!(
+            child.wait(),
+            stdin_task,
+            stderr_task
+        );
+
+        let status = status_res.map_err(|e| format!("Gagal menunggu child process mysql: {}", e))?;
+        let write_res = stdin_res.unwrap_or_else(|e| Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())));
+        let stderr_raw = stderr_res.unwrap_or_default();
+        let stderr_full = String::from_utf8_lossy(&stderr_raw);
+
+        if status.success() {
+            if let Err(e) = write_res {
+                emit_log(
+                    app,
+                    "warn",
+                    format!("[Tabel '{}'] MySQL selesai tetapi terdapat catatan stdin: {}", table_name, e),
+                );
             }
             last_error.clear();
             break;
         }
 
-        let stderr_full = String::from_utf8_lossy(&output.stderr);
         let stderr_tail = stderr_full
             .lines()
             .rev()
@@ -1975,21 +2138,21 @@ async fn import_table_to_local(
             .into_iter()
             .rev()
             .collect::<Vec<_>>()
-            .join("\\n");
-        let write_context = write_err
+            .join("\n");
+        let write_context = write_res
             .err()
             .map(|e| format!(" (stdin: {})", e))
             .unwrap_or_default();
         last_error = format!("MySQL CLI import error: {}{}", stderr_tail, write_context);
 
-        if (stderr_full.contains("1205") || stderr_full.contains("Lock wait timeout exceeded"))
+        if (stderr_full.contains("1205") || stderr_full.contains("Lock wait timeout exceeded") || stderr_full.contains("1213") || stderr_full.contains("Deadlock found"))
             && attempt < max_retries
         {
             emit_log(
                 app,
                 "warn",
                 format!(
-                    "[Tabel '{}'] Lock wait timeout exceeded (Percobaan {}/{}). Menunggu 2 detik lalu mencoba kembali...",
+                    "[Tabel '{}'] Lock / Deadlock timeout (Percobaan {}/{}). Menunggu 2 detik lalu mencoba kembali...",
                     table_name, attempt, max_retries
                 ),
             );
@@ -2001,7 +2164,7 @@ async fn import_table_to_local(
             app,
             "error",
             format!(
-                "[Tabel '{}'] Executable MySQL gagal:\\n{}{}",
+                "[Tabel '{}'] Executable MySQL gagal:\n{}{}",
                 table_name, stderr_tail, write_context
             ),
         );
@@ -2066,7 +2229,7 @@ fn sanitize_html_error(html: &str) -> String {
     }
 }
 
-fn ensure_local_database_exists(local_config: &LocalDbConfig, app: &tauri::AppHandle) {
+async fn ensure_local_database_exists(local_config: &LocalDbConfig, app: &tauri::AppHandle) {
     let host = if local_config.host.is_empty() {
         "127.0.0.1"
     } else {
@@ -2104,7 +2267,7 @@ fn ensure_local_database_exists(local_config: &LocalDbConfig, app: &tauri::AppHa
 
     cmd.arg("-e").arg(&create_sql);
 
-    match cmd.output() {
+    match cmd.output().await {
         Ok(out) => {
             if !out.status.success() {
                 let err = String::from_utf8_lossy(&out.stderr);
@@ -2172,7 +2335,7 @@ pub async fn export_pma_database(
         "🚀 Memulai Sinkronisasi via Direct SQL/GZIP Stream (export.php)...",
     );
 
-    ensure_local_database_exists(&local_config, &app);
+    ensure_local_database_exists(&local_config, &app).await;
 
     let (client, base_url, csrf_token) = authenticate_pma(&pma_config, &app).await?;
 
@@ -2219,8 +2382,8 @@ pub async fn export_pma_database(
 
     let total_tables = tables.len();
     let (concurrency, cpu_cores) = calculate_optimal_workers(total_tables);
-    let buffer_capacity = 5.min(total_tables).max(1);
-    let download_concurrency = concurrency.min(2).max(1);
+    let buffer_capacity = 8.min(total_tables).max(2);
+    let download_concurrency = (cpu_cores / 3).clamp(2, 4).min(total_tables);
 
     emit_log(
         &app,
@@ -2291,8 +2454,22 @@ pub async fn export_pma_database(
 
                 match download_res {
                     Ok(maybe_data) => {
-                        if tx_c.send(maybe_data).await.is_err() {
-                            break;
+                        let mut sent = false;
+                        while !sent {
+                            if is_user_cancelled() || is_aborted() {
+                                return Err("__WORKER_ABORTED__".to_string());
+                            }
+                            tokio::select! {
+                                send_res = tx_c.send(maybe_data.clone()) => {
+                                    if send_res.is_err() {
+                                        return Ok(());
+                                    }
+                                    sent = true;
+                                }
+                                _ = tokio::time::sleep(tokio::time::Duration::from_millis(150)) => {
+                                    // Periodic cancellation check
+                                }
+                            }
                         }
                     }
                     Err(e) => {
@@ -2327,21 +2504,39 @@ pub async fn export_pma_database(
                     return Err("__WORKER_ABORTED__".to_string());
                 }
 
-                let maybe_item = {
+                let maybe_item = loop {
+                    if is_user_cancelled() || is_aborted() {
+                        return Err("__WORKER_ABORTED__".to_string());
+                    }
                     let mut lock = rx_c.lock().await;
-                    lock.recv().await
+                    tokio::select! {
+                        item = lock.recv() => {
+                            break item;
+                        }
+                        _ = tokio::time::sleep(tokio::time::Duration::from_millis(150)) => {
+                            // Check cancellation periodically
+                        }
+                    }
                 };
 
                 match maybe_item {
                     Some(Some(data)) => {
                         let table_name = data.table_name.clone();
-                        let imported_rows = import_table_to_local(
+                        let import_res = import_table_to_local(
                             &pma_config_c,
                             &local_config_c,
                             data,
                             &app_c,
                         )
-                        .await?;
+                        .await;
+
+                        let imported_rows = match import_res {
+                            Ok(rows) => rows,
+                            Err(e) => {
+                                WORKER_ABORT_REQUESTED.store(true, Ordering::SeqCst);
+                                return Err(e);
+                            }
+                        };
 
                         let current_completed = completed_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                         let current_total_rows = total_rows_c.fetch_add(imported_rows, std::sync::atomic::Ordering::SeqCst) + imported_rows;
@@ -2379,10 +2574,13 @@ pub async fn export_pma_database(
         consumer_handles.push(handle);
     }
 
+    let all_download_res = futures_util::future::join_all(download_handles).await;
+    let all_consumer_res = futures_util::future::join_all(consumer_handles).await;
+
     let mut real_error: Option<String> = None;
 
-    for handle in download_handles {
-        match handle.await {
+    for res in all_download_res {
+        match res {
             Ok(Ok(_)) => {},
             Ok(Err(e)) => {
                 WORKER_ABORT_REQUESTED.store(true, Ordering::SeqCst);
@@ -2399,8 +2597,8 @@ pub async fn export_pma_database(
         }
     }
 
-    for handle in consumer_handles {
-        match handle.await {
+    for res in all_consumer_res {
+        match res {
             Ok(Ok(_)) => {},
             Ok(Err(e)) => {
                 WORKER_ABORT_REQUESTED.store(true, Ordering::SeqCst);
