@@ -8,11 +8,21 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tauri::Emitter;
 
-pub static EXPORT_CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
+pub static USER_CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
+pub static WORKER_ABORT_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 #[tauri::command]
 pub fn cancel_pma_export() {
-    EXPORT_CANCEL_REQUESTED.store(true, Ordering::SeqCst);
+    USER_CANCEL_REQUESTED.store(true, Ordering::SeqCst);
+    WORKER_ABORT_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+pub fn is_user_cancelled() -> bool {
+    USER_CANCEL_REQUESTED.load(Ordering::SeqCst)
+}
+
+pub fn is_aborted() -> bool {
+    USER_CANCEL_REQUESTED.load(Ordering::SeqCst) || WORKER_ABORT_REQUESTED.load(Ordering::SeqCst)
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -1447,8 +1457,11 @@ async fn stream_export_single_table(
     cached_endpoint: &std::sync::Arc<tokio::sync::Mutex<Option<(String, String)>>>,
     app: &tauri::AppHandle,
 ) -> Result<usize, String> {
-    if EXPORT_CANCEL_REQUESTED.load(Ordering::SeqCst) {
-        return Err("Sinkronisasi dibatalkan oleh pengguna.".to_string());
+    if is_user_cancelled() {
+        return Err("__USER_CANCELLED__".to_string());
+    }
+    if is_aborted() {
+        return Err("__WORKER_ABORTED__".to_string());
     }
 
     let table_start = std::time::Instant::now();
@@ -1492,8 +1505,11 @@ async fn stream_export_single_table(
 
     'endpoint_loop: for export_url in &export_urls {
         for compression_mode in &compressions {
-            if EXPORT_CANCEL_REQUESTED.load(Ordering::SeqCst) {
-                return Err("Sinkronisasi dibatalkan oleh pengguna.".to_string());
+            if is_user_cancelled() {
+                return Err("__USER_CANCELLED__".to_string());
+            }
+            if is_aborted() {
+                return Err("__WORKER_ABORTED__".to_string());
             }
             let is_gz = compression_mode == "gzip";
             let is_incremental = pma_config.sync_mode.as_deref() == Some("incremental");
@@ -1754,8 +1770,11 @@ async fn stream_export_single_table(
         }
     }
 
-    if EXPORT_CANCEL_REQUESTED.load(Ordering::SeqCst) {
-        return Err("Sinkronisasi dibatalkan oleh pengguna.".to_string());
+    if is_user_cancelled() {
+        return Err("__USER_CANCELLED__".to_string());
+    }
+    if is_aborted() {
+        return Err("__WORKER_ABORTED__".to_string());
     }
 
     // Read export body once. Detect real GZIP signature; PMA may label plain SQL as application/x-gzip.
@@ -1841,8 +1860,11 @@ async fn stream_export_single_table(
     while attempt < max_retries {
         attempt += 1;
 
-        if EXPORT_CANCEL_REQUESTED.load(Ordering::SeqCst) {
-            return Err("Sinkronisasi dibatalkan oleh pengguna.".to_string());
+        if is_user_cancelled() {
+            return Err("__USER_CANCELLED__".to_string());
+        }
+        if is_aborted() {
+            return Err("__WORKER_ABORTED__".to_string());
         }
 
         // Spawn child process `mysql` CLI
@@ -2076,7 +2098,8 @@ pub async fn export_pma_database(
     local_config: LocalDbConfig,
     app: tauri::AppHandle,
 ) -> Result<String, String> {
-    EXPORT_CANCEL_REQUESTED.store(false, Ordering::SeqCst);
+    USER_CANCEL_REQUESTED.store(false, Ordering::SeqCst);
+    WORKER_ABORT_REQUESTED.store(false, Ordering::SeqCst);
 
     emit_log(
         &app,
@@ -2131,14 +2154,38 @@ pub async fn export_pma_database(
         pma_config.tables_with_updated_at = Some(tables_with_updated_at);
     }
 
+/// Menghitung jumlah worker paralel yang optimal & aman berdasarkan core CPU hardware
+fn calculate_optimal_workers(total_tables: usize) -> (usize, usize) {
+    let cpu_cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2);
+
+    // Alokasi worker yang aman untuk performa maksimal tanpa membuat CPU/RAM/MySQL freeze:
+    // - 1 core: 1 worker
+    // - 2-3 core: 2 worker (mempertahankan 1 core untuk OS & Local MySQL daemon)
+    // - 4-6 core: 3 worker (aman & optimal)
+    // - 7-12 core: 4 worker
+    // - >12 core: 5 worker (dibatasi maks 5 agar remote PMA web server / HTTP connection pool tidak overload)
+    let optimal = match cpu_cores {
+        1 => 1,
+        2..=3 => 2,
+        4..=6 => 3,
+        7..=12 => 4,
+        _ => 5,
+    };
+
+    let workers = optimal.min(total_tables).max(1);
+    (workers, cpu_cores)
+}
+
     let total_tables = tables.len();
-    let concurrency = 3usize;
+    let (concurrency, cpu_cores) = calculate_optimal_workers(total_tables);
     emit_log(
         &app,
         "info",
         format!(
-            "🚀 Memulai ekspor paralel {} tabel (menggunakan {} worker simultan)...",
-            total_tables, concurrency
+            "🚀 Memulai ekspor paralel {} tabel (terdeteksi {} CPU cores, menggunakan {} worker simultan)...",
+            total_tables, cpu_cores, concurrency
         ),
     );
 
@@ -2168,14 +2215,20 @@ pub async fn export_pma_database(
         let app_handle = app.clone();
 
         let handle = tokio::spawn(async move {
-            if EXPORT_CANCEL_REQUESTED.load(Ordering::SeqCst) {
-                return Err("Sinkronisasi dibatalkan oleh pengguna.".to_string());
+            if is_user_cancelled() {
+                return Err("__USER_CANCELLED__".to_string());
+            }
+            if is_aborted() {
+                return Err("__WORKER_ABORTED__".to_string());
             }
 
             let _permit = sem.acquire().await.map_err(|e| e.to_string())?;
 
-            if EXPORT_CANCEL_REQUESTED.load(Ordering::SeqCst) {
-                return Err("Sinkronisasi dibatalkan oleh pengguna.".to_string());
+            if is_user_cancelled() {
+                return Err("__USER_CANCELLED__".to_string());
+            }
+            if is_aborted() {
+                return Err("__WORKER_ABORTED__".to_string());
             }
 
             let imported_rows = stream_export_single_table(
@@ -2209,30 +2262,34 @@ pub async fn export_pma_database(
         join_handles.push(handle);
     }
 
-    let mut cancel_or_err: Option<String> = None;
+    let mut real_error: Option<String> = None;
     for handle in join_handles {
         match handle.await {
             Ok(Ok(_)) => {},
             Ok(Err(e)) => {
-                EXPORT_CANCEL_REQUESTED.store(true, Ordering::SeqCst);
-                if cancel_or_err.is_none() {
-                    cancel_or_err = Some(e);
+                WORKER_ABORT_REQUESTED.store(true, Ordering::SeqCst);
+                if e != "__USER_CANCELLED__" && e != "__WORKER_ABORTED__" && !e.contains("dibatalkan oleh pengguna") && real_error.is_none() {
+                    real_error = Some(e);
                 }
             },
             Err(e) => {
-                EXPORT_CANCEL_REQUESTED.store(true, Ordering::SeqCst);
-                if cancel_or_err.is_none() {
-                    cancel_or_err = Some(format!("Worker execution error: {}", e));
+                WORKER_ABORT_REQUESTED.store(true, Ordering::SeqCst);
+                if real_error.is_none() {
+                    real_error = Some(format!("Worker execution error: {}", e));
                 }
             }
         }
     }
 
-    if let Some(err) = cancel_or_err {
-        if EXPORT_CANCEL_REQUESTED.load(Ordering::SeqCst) || err.contains("dibatalkan") {
-            emit_progress(&app, completed_tables.load(Ordering::SeqCst), total_tables, "", 0, total_rows.load(Ordering::SeqCst), "cancelled");
-            return Err("Sinkronisasi dibatalkan oleh pengguna.".to_string());
-        }
+    if is_user_cancelled() {
+        emit_progress(&app, completed_tables.load(Ordering::SeqCst), total_tables, "", 0, total_rows.load(Ordering::SeqCst), "cancelled");
+        emit_log(&app, "warn", "🛑 Sinkronisasi telah dihentikan oleh pengguna.");
+        return Err("Sinkronisasi dibatalkan oleh pengguna.".to_string());
+    }
+
+    if let Some(err) = real_error {
+        emit_progress(&app, completed_tables.load(Ordering::SeqCst), total_tables, "", 0, total_rows.load(Ordering::SeqCst), "error");
+        emit_log(&app, "error", format!("Sinkronisasi gagal: {}", err));
         return Err(err);
     }
 
@@ -2252,14 +2309,14 @@ pub async fn export_pma_database(
         &app,
         "success",
         format!(
-            "🎉 Direct SQL/GZIP Stream Sync Berhasil! {} tabel telah disinkronkan dengan 3 worker paralel.",
-            total_tables
+            "🎉 Direct SQL/GZIP Stream Sync Berhasil! {} tabel telah disinkronkan dengan {} worker paralel.",
+            total_tables, concurrency
         ),
     );
 
     Ok(format!(
-        "Berhasil menyinkronkan {} tabel via Direct GZIP Stream (3 Workers).",
-        total_tables
+        "Berhasil menyinkronkan {} tabel via Direct GZIP Stream ({} Workers).",
+        total_tables, concurrency
     ))
 }
 

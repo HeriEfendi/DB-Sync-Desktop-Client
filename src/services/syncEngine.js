@@ -255,8 +255,8 @@ export class SyncEngine {
         this.isSyncing = false;
         if (typeof unlistenLog === 'function') unlistenLog();
         if (typeof unlistenProgress === 'function') unlistenProgress();
-        const errMsg = err.message || String(err);
-        if (this.shouldStop || errMsg.toLowerCase().includes('dibatalkan')) {
+        const errMsg = err?.message || String(err);
+        if (this.shouldStop) {
           this.log('warning', '🛑 Sinkronisasi telah dihentikan oleh pengguna.');
           return { success: false, cancelled: true, error: 'Dibatalkan oleh pengguna' };
         }

@@ -1,0 +1,77 @@
+# ==============================================================================
+# Antigravity Ignore Rules (.antigravityignore)
+# Mencegah AI Agent meng-index / membaca direktori dependensi, build artifacts,
+# file biner, media besar, file log, dan file cache/arsip.
+# ==============================================================================
+
+# Dependencies & Package Managers
+node_modules/
+.pnpm-store/
+vendor/
+
+# Build & Distribution Artifacts
+dist/
+dist-ssr/
+build/
+out/
+pkg/
+src/target/
+src-tauri/target/
+src-tauri/gen/
+*.pkg.tar.zst
+*.deb
+*.rpm
+*.appimage
+*.exe
+*.dmg
+
+# Git, IDE, & OS Files
+.git/
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Logs & Debugging
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Large Media & Binary Assets (Images, Audio, Video, Archives, Fonts)
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.ico
+*.svg
+*.mp3
+*.wav
+*.ogg
+*.mp4
+*.mkv
+*.webm
+*.avi
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.rar
+*.7z
+*.pdf
+*.wasm
+*.woff
+*.woff2
+*.ttf
+*.eot
+
+# Database & SQLite dumps / cache
+*.sqlite
+*.sqlite3
+*.db
+*.dump
+*.sql.gz
