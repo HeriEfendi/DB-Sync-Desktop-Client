@@ -22,15 +22,23 @@ jobs:
           - name: Linux
             os: ubuntu-24.04
             bundles: deb,rpm
+            rust_target: ""
+            tauri_args: ""
           - name: Windows
             os: windows-latest
             bundles: nsis,msi
+            rust_target: ""
+            tauri_args: ""
           - name: macOS-Intel
-            os: macos-13
+            os: macos-15
             bundles: dmg,app
+            rust_target: x86_64-apple-darwin
+            tauri_args: --target x86_64-apple-darwin
           - name: macOS-Silicon
             os: macos-15
             bundles: dmg,app
+            rust_target: aarch64-apple-darwin
+            tauri_args: --target aarch64-apple-darwin
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -46,6 +54,9 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libfuse2
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+      - name: Add Rust target
+        if: matrix.rust_target != ''
+        run: rustup target add ${{ matrix.rust_target }}
       - name: Sync version from tag
         shell: bash
         run: |
@@ -62,7 +73,7 @@ jobs:
         with:
           projectPath: .
           tauriScript: npm run tauri
-          args: --bundles ${{ matrix.bundles }}
+          args: --bundles ${{ matrix.bundles }} ${{ matrix.tauri_args }}
           tagName: ${{ github.ref_name }}
           releaseName: ${{ github.ref_name }}
           releaseBody: Automatic build for ${{ github.ref_name }}
