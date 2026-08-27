@@ -51,10 +51,10 @@
         v-for="(log, idx) in filteredLogs"
         :key="idx"
         class="log-row"
-        :class="`log-${log.type}`"
+        :class="`log-${log.type === 'warn' ? 'warning' : log.type}`"
       >
         <span class="log-time">[{{ log.timestamp }}]</span>
-        <span class="log-level-badge">{{ log.type.toUpperCase() }}</span>
+        <span class="log-level-badge">{{ (log.type === 'warn' ? 'WARNING' : log.type).toUpperCase() }}</span>
         <span class="log-msg">{{ log.message }}</span>
       </div>
     </div>
@@ -82,7 +82,8 @@ const filteredLogs = computed(() => {
 
   for (let i = props.logs.length - 1; i >= 0 && result.length < 100; i--) {
     const log = props.logs[i];
-    if (filter !== 'all' && log.type !== filter) continue;
+    const normalizedType = log.type === 'warn' ? 'warning' : log.type;
+    if (filter !== 'all' && normalizedType !== filter) continue;
     if (query && !log.message.toLowerCase().includes(query)) continue;
     result.push(log);
   }

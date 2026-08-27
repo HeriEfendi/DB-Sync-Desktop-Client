@@ -117,7 +117,8 @@ export class SyncEngine {
       const unlistenLog = await safeListen('pma-log', (event) => {
         const payload = event.payload;
         if (payload && payload.message) {
-          this.log(payload.type || 'info', payload.message);
+          const logType = payload.type === 'warn' ? 'warning' : (payload.type || 'info');
+          this.log(logType, payload.message);
         }
       });
 

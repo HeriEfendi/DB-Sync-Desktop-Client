@@ -75,8 +75,9 @@ fn current_timestamp() -> String {
 
 fn emit_log(app: &tauri::AppHandle, log_type: &str, message: impl Into<String>) {
     let msg = message.into();
+    let norm_type = if log_type == "warn" { "warning" } else { log_type };
 
-    let noisy_http = log_type == "info"
+    let noisy_http = norm_type == "info"
         && [
             "Inisialisasi HTTP Session",
             "PMA final URL setelah redirect",
@@ -93,24 +94,23 @@ fn emit_log(app: &tauri::AppHandle, log_type: &str, message: impl Into<String>) 
             "POST request ke export",
             "Endpoint PMA valid ditemukan",
             "Export menerima",
-
         ]
         .iter()
         .any(|prefix| msg.starts_with(prefix) || msg.contains(prefix));
 
     let noisy_fallback =
-        log_type == "warn" && msg.contains("mengembalikan HTML response: 404 Not Found");
+        norm_type == "warning" && (msg.contains("mengembalikan HTML response: 404 Not Found") || msg.contains("tidak menghasilkan PK"));
 
     if noisy_http || noisy_fallback {
-        println!("[PMA-LOG] [{}]: {}", log_type, msg);
+        println!("[PMA-LOG] [{}]: {}", norm_type, msg);
         return;
     }
 
-    println!("[PMA-LOG] [{}]: {}", log_type, msg);
+    println!("[PMA-LOG] [{}]: {}", norm_type, msg);
     let _ = app.emit(
         "pma-log",
         LogPayload {
-            r#type: log_type.to_string(),
+            r#type: norm_type.to_string(),
             message: msg,
             timestamp: current_timestamp(),
         },
@@ -833,7 +833,7 @@ async fn fetch_all_primary_keys(
     base_url: &str,
     csrf_token: &str,
     db: &str,
-    app: &tauri::AppHandle,
+    _app: &tauri::AppHandle,
 ) -> HashMap<String, String> {
     let mut pk_map: HashMap<String, String> = HashMap::new();
 
@@ -876,8 +876,7 @@ async fn fetch_all_primary_keys(
             .await
         {
             Ok(r) => r,
-            Err(e) => {
-                emit_log(app, "warn", format!("[PK detect] Request ke {} gagal: {}", sql_url, e));
+            Err(_) => {
                 continue;
             }
         };
@@ -890,7 +889,6 @@ async fn fetch_all_primary_keys(
         let json_val = match serde_json::from_str::<serde_json::Value>(&raw_text) {
             Ok(v) => v,
             Err(_) => {
-                emit_log(app, "warn", "[PK detect] Response bukan JSON valid, skip.");
                 continue;
             }
         };
@@ -900,9 +898,6 @@ async fn fetch_all_primary_keys(
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         if !success {
-            let err = json_val.get("error").or_else(|| json_val.get("message"))
-                .and_then(|v| v.as_str()).unwrap_or("unknown");
-            emit_log(app, "warn", &format!("[PK detect] Query gagal: {}", err));
             continue;
         }
 
@@ -982,8 +977,6 @@ async fn fetch_all_primary_keys(
 
         if !pk_map.is_empty() {
             break;
-        } else {
-            emit_log(app, "warn", format!("[PK detect] Endpoint {} tidak menghasilkan PK, coba endpoint lain.", sql_url));
         }
     }
 
@@ -1638,21 +1631,12 @@ async fn download_export_payload(
         guard.clone().unzip()
     };
 
-    let default_urls = if base_url.contains("/public") {
-        vec![
-            format!("{}/index.php?route=/table/export", base_url),
-            format!("{}/index.php?route=/export", base_url),
-            format!("{}/index.php?route=/database/export", base_url),
-            format!("{}/export.php", base_url),
-        ]
-    } else {
-        vec![
-            format!("{}/export.php", base_url),
-            format!("{}/index.php?route=/table/export", base_url),
-            format!("{}/index.php?route=/export", base_url),
-            format!("{}/index.php?route=/database/export", base_url),
-        ]
-    };
+    let default_urls = vec![
+        format!("{}/export.php", base_url),
+        format!("{}/index.php?route=/export", base_url),
+        format!("{}/index.php?route=/database/export", base_url),
+        format!("{}/index.php?route=/table/export", base_url),
+    ];
     let default_compressions = vec!["gzip".to_string(), "none".to_string()];
 
     let mut candidates = Vec::new();
@@ -1796,13 +1780,9 @@ async fn download_export_payload(
             if content_type.contains("text/html") {
                 let err_html = response.text().await.unwrap_or_default();
                 last_html_err = sanitize_html_error(&err_html);
-                emit_log(
-                    app,
-                    "warn",
-                    format!(
-                        "[Tabel '{}'] Endpoint {} (comp={}) mengembalikan HTML response: {}",
-                        table_name, export_url, compression_mode, last_html_err
-                    ),
+                println!(
+                    "[PMA-DEBUG] Endpoint {} (comp={}) mengembalikan HTML response: {}",
+                    export_url, compression_mode, last_html_err
                 );
                 let mut guard = cached_endpoint.lock().await;
                 if guard.as_ref().map(|(u, _)| u == &export_url).unwrap_or(false) {
@@ -2239,11 +2219,48 @@ fn get_mysql_cli_binary() -> &'static str {
     })
 }
 
-/// Tahap 2 (Consumer): Mendekompresi GZIP secara real-time dan mengalirkan langsung ke STDIN MySQL Lokal
-async fn import_table_to_local(
+/// Helper deteksi error ketidakcocokan skema / kolom / struktur tabel MySQL
+fn is_schema_mismatch_error(err: &str) -> bool {
+    let lower = err.to_lowercase();
+    lower.contains("unknown column")
+        || lower.contains("error 1054")
+        || lower.contains("doesn't exist")
+        || lower.contains("error 1146")
+        || lower.contains("column count doesn't match")
+        || lower.contains("error 1136")
+        || lower.contains("doesn't have a default value")
+        || lower.contains("error 1364")
+        || lower.contains("cannot be null")
+        || lower.contains("error 1048")
+        || lower.contains("data too long")
+        || lower.contains("error 1406")
+        || lower.contains("data truncated")
+        || lower.contains("error 1265")
+        || lower.contains("duplicate column")
+        || lower.contains("error 1060")
+        || lower.contains("incorrect integer value")
+        || lower.contains("incorrect decimal value")
+        || lower.contains("incorrect date")
+        || lower.contains("error 1366")
+        || lower.contains("error 1292")
+}
+
+/// Ekstrak ringkasan baris error MySQL untuk log yang bersih
+fn extract_short_schema_error(err: &str) -> String {
+    for line in err.lines() {
+        if line.contains("ERROR ") || line.contains("Unknown column") || line.contains("doesn't exist") {
+            return line.trim().to_string();
+        }
+    }
+    err.lines().next().unwrap_or(err).trim().to_string()
+}
+
+/// Tahap 2 (Consumer Internal): Mendekompresi GZIP secara real-time dan mengalirkan langsung ke STDIN MySQL Lokal
+async fn import_table_to_local_internal(
     pma_config: &PmaExportConfig,
     local_config: &LocalDbConfig,
     data: DownloadedTableData,
+    force_fresh: bool,
     app: &tauri::AppHandle,
 ) -> Result<usize, String> {
     if is_user_cancelled() {
@@ -2299,7 +2316,7 @@ async fn import_table_to_local(
 
     let imported_rows = count_imported_sql_rows(&sql_bytes);
     let has_create_table = sql_bytes.windows(12).any(|w| w == b"CREATE TABLE");
-    let is_fresh = pma_config.sync_mode.as_deref() == Some("fresh");
+    let is_fresh = force_fresh || pma_config.sync_mode.as_deref() == Some("fresh");
 
     // Zero-Row Fast Skip: jika 0 baris data dan tidak butuh membuat struktur tabel baru, lewati seketika
     if imported_rows == 0 && (!is_fresh || !has_create_table) {
@@ -2490,12 +2507,16 @@ async fn import_table_to_local(
             .unwrap_or_default();
         last_error = format!("MySQL CLI import error: {}{}", stderr_tail, write_context);
 
-        if (stderr_full.contains("1205") || stderr_full.contains("Lock wait timeout exceeded") || stderr_full.contains("1213") || stderr_full.contains("Deadlock found"))
-            && attempt < max_retries
-        {
+        let is_real_deadlock = (stderr_full.contains("ERROR 1205")
+            || stderr_full.contains("Lock wait timeout exceeded")
+            || stderr_full.contains("ERROR 1213")
+            || stderr_full.contains("Deadlock found"))
+            && !is_schema_mismatch_error(&stderr_full);
+
+        if is_real_deadlock && attempt < max_retries {
             emit_log(
                 app,
-                "warn",
+                "warning",
                 format!(
                     "[Tabel '{}'] Lock / Deadlock timeout (Percobaan {}/{}). Menunggu 2 detik lalu mencoba kembali...",
                     table_name, attempt, max_retries
@@ -2505,14 +2526,17 @@ async fn import_table_to_local(
             continue;
         }
 
-        emit_log(
-            app,
-            "error",
-            format!(
-                "[Tabel '{}'] Executable MySQL gagal:\n{}{}",
-                table_name, stderr_tail, write_context
-            ),
-        );
+        let will_auto_fallback = !is_fresh && is_schema_mismatch_error(&stderr_full);
+        if !will_auto_fallback {
+            emit_log(
+                app,
+                "error",
+                format!(
+                    "[Tabel '{}'] Executable MySQL gagal:\n{}{}",
+                    table_name, stderr_tail, write_context
+                ),
+            );
+        }
         return Err(last_error);
     }
 
@@ -2529,15 +2553,7 @@ async fn import_table_to_local(
         format!("{:.2}s", elapsed.as_secs_f64())
     };
 
-    let rows_fmt = {
-        let s = imported_rows.to_string();
-        let mut out = String::with_capacity(s.len() + s.len() / 3);
-        for (i, c) in s.chars().rev().enumerate() {
-            if i > 0 && i % 3 == 0 { out.push('.'); }
-            out.push(c);
-        }
-        out.chars().rev().collect::<String>()
-    };
+    let rows_fmt = format_number(imported_rows);
 
     emit_log(
         app,
@@ -2549,6 +2565,126 @@ async fn import_table_to_local(
     );
 
     Ok(imported_rows)
+}
+
+/// Tahap 2 (Consumer with Auto-Fallback): Mencoba import data, dan jika gagal akibat Schema Mismatch, otomatis fallback ke Fresh Sync khusus tabel ini
+async fn import_table_to_local_with_fallback(
+    client: &reqwest::Client,
+    base_url: &str,
+    csrf_token: &str,
+    cached_endpoint: &std::sync::Arc<tokio::sync::Mutex<Option<(String, String)>>>,
+    table_row_counts: &std::sync::Arc<HashMap<String, usize>>,
+    pma_config: &PmaExportConfig,
+    local_config: &LocalDbConfig,
+    data: DownloadedTableData,
+    app: &tauri::AppHandle,
+) -> Result<usize, String> {
+    let table_name = data.table_name.clone();
+    let is_initially_fresh = pma_config.sync_mode.as_deref() == Some("fresh");
+
+    let initial_res = import_table_to_local_internal(
+        pma_config,
+        local_config,
+        data,
+        false,
+        app,
+    )
+    .await;
+
+    match initial_res {
+        Ok(rows) => Ok(rows),
+        Err(err) => {
+            if is_user_cancelled() {
+                return Err("__USER_CANCELLED__".to_string());
+            }
+            if is_aborted() {
+                return Err("__WORKER_ABORTED__".to_string());
+            }
+
+            // Jika bukan fresh mode dan terdeteksi ketidakcocokan skema (unknown column / structure mismatch)
+            if !is_initially_fresh && is_schema_mismatch_error(&err) {
+                let short_err = extract_short_schema_error(&err);
+                emit_log(
+                    app,
+                    "warn",
+                    format!(
+                        "[Tabel '{}'] ⚠️ Terdeteksi ketidakcocokan skema tabel lokal dan server ({}). Melakukan auto-fallback ke FRESH SYNC untuk menyelaraskan skema dan data...",
+                        table_name, short_err
+                    ),
+                );
+
+                let mut fresh_pma_config = (*pma_config).clone();
+                fresh_pma_config.sync_mode = Some("fresh".to_string());
+                if let Some(ref mut wm) = fresh_pma_config.incremental_watermarks {
+                    wm.remove(&table_name);
+                }
+
+                let fresh_download_res = fetch_table_export_stream(
+                    client,
+                    base_url,
+                    csrf_token,
+                    &fresh_pma_config,
+                    &table_name,
+                    cached_endpoint,
+                    table_row_counts,
+                    app,
+                )
+                .await;
+
+                match fresh_download_res {
+                    Ok(Some(fresh_data)) => {
+                        let fresh_import_res = import_table_to_local_internal(
+                            &fresh_pma_config,
+                            local_config,
+                            fresh_data,
+                            true, // force_fresh = true -> DROP TABLE + CREATE TABLE
+                            app,
+                        )
+                        .await;
+
+                        match fresh_import_res {
+                            Ok(fresh_rows) => {
+                                emit_log(
+                                    app,
+                                    "success",
+                                    format!(
+                                        "[Tabel '{}'] ✅ Auto-fallback Fresh Sync berhasil! Skema tabel telah diselaraskan dengan server dan ~{} row disinkronkan.",
+                                        table_name, format_number(fresh_rows)
+                                    ),
+                                );
+                                Ok(fresh_rows)
+                            }
+                            Err(fresh_err) => {
+                                emit_log(
+                                    app,
+                                    "error",
+                                    format!(
+                                        "[Tabel '{}'] Auto-fallback Fresh Sync gagal saat impor ke MySQL lokal: {}",
+                                        table_name, fresh_err
+                                    ),
+                                );
+                                Err(fresh_err)
+                            }
+                        }
+                    }
+                    Ok(None) => Ok(0),
+                    Err(download_err) => {
+                        emit_log(
+                            app,
+                            "error",
+                            format!(
+                                "[Tabel '{}'] Gagal mengunduh fresh export untuk auto-fallback: {}",
+                                table_name, download_err
+                            ),
+                        );
+                        Err(download_err)
+                    }
+                }
+            } else {
+                Err(err)
+            }
+        }
+    }
 }
 
 fn sanitize_html_error(html: &str) -> String {
@@ -2716,8 +2852,6 @@ pub async fn export_pma_database(
             }
         }
         pma_config.table_primary_keys = Some(merged);
-    } else {
-        emit_log(&app, "warn", "Primary key server tidak terdeteksi via metadata; memakai fallback per tabel.");
     }
 
     let tables_with_updated_at = fetch_tables_with_updated_at(&client, &base_url, &csrf_token, &pma_config.database, &app).await;
@@ -2856,6 +2990,11 @@ pub async fn export_pma_database(
         let local_config_c = local_config.clone();
         let completed_c = completed_tables.clone();
         let total_rows_c = total_rows.clone();
+        let client_c = client.clone();
+        let base_url_c = base_url.clone();
+        let csrf_token_c = csrf_token.clone();
+        let cached_endpoint_c = cached_endpoint.clone();
+        let table_row_counts_c = table_row_counts.clone();
         let app_c = app.clone();
 
         let handle = tokio::spawn(async move {
@@ -2885,7 +3024,12 @@ pub async fn export_pma_database(
                 match maybe_item {
                     Some(Some(data)) => {
                         let table_name = data.table_name.clone();
-                        let import_res = import_table_to_local(
+                        let import_res = import_table_to_local_with_fallback(
+                            &client_c,
+                            &base_url_c,
+                            &csrf_token_c,
+                            &cached_endpoint_c,
+                            &table_row_counts_c,
                             &pma_config_c,
                             &local_config_c,
                             data,

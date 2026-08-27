@@ -366,7 +366,8 @@ const fetchTablesFromPma = async () => {
       try {
         pmaLogUnlisten = await safeListen('pma-log', (event) => {
           const { type: t, message } = event.payload || {};
-          addLog({ type: t || 'info', message: `[PMA] ${message}`, timestamp: new Date().toLocaleTimeString() });
+          const logType = t === 'warn' ? 'warning' : (t || 'info');
+          addLog({ type: logType, message: `[PMA] ${message}`, timestamp: new Date().toLocaleTimeString() });
         });
       } catch (_) {}
 
