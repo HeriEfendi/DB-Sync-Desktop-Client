@@ -158,7 +158,7 @@ Hasil build lokal tersimpan di direktori: `src-tauri/target/release/bundle/`.
 npm run build:pacman
 ```
 
-### Rilis Otomatis (Windows & Linux via GitHub Actions)
+### Rilis Otomatis (Windows, Linux, & macOS via GitHub Actions)
 
 Proyek ini telah dilengkapi skrip rilis otomatis yang menyinkronkan versi di `package.json`, `package-lock.json`, `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml`, dan `PKGBUILD`, lalu melakukan tag & push ke Git untuk memicu GitHub Actions:
 
@@ -170,6 +170,7 @@ npm run release 0.8.2
 Workflow [.github/workflows/release.yml](file:///home/lenovo/www/DB-Sync-Desktop-Client/.github/workflows/release.yml) akan otomatis:
 - **Build Linux**: Membuat paket `.deb`, `.rpm`, dan `.pkg.tar.zst` (Arch Linux).
 - **Build Windows**: Membuat installer `.msi` dan `.exe` (NSIS).
+- **Build macOS**: Membuat installer `.dmg` dan paket `.app` untuk arsitektur **Intel (x86_64)** dan **Apple Silicon (M1/M2/M3/M4/arm64)**.
 - **GitHub Release**: Membuat entri Release baru dan melampirkan seluruh installer secara otomatis.
 
 ---

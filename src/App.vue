@@ -150,14 +150,19 @@ const addLog = (entry) => {
   const tableName = tableMatch ? tableMatch[1] : null;
 
   const isTransientProgress =
-    msg.includes('Mengunduh stream:') ||
+    msg.includes('Mengunduh stream') ||
     msg.includes('Menunggu server remote PMA') ||
-    msg.includes('Mengalirkan ke MySQL:');
+    msg.includes('Mengalirkan ke MySQL:') ||
+    msg.includes('Mengunduh dalam cicilan') ||
+    msg.includes('selesai diunduh: ~');
 
   const isTableFinished =
     msg.includes('Selesai! ~') ||
     msg.includes('Melewati proses import lokal') ||
-    msg.includes('Di-skip pada sinkronisasi');
+    msg.includes('Di-skip pada sinkronisasi') ||
+    msg.includes('Export GAGAL') ||
+    msg.includes('MySQL CLI import error') ||
+    msg.includes('Gagal:');
 
   if (tableName && isTransientProgress) {
     // If there is already an active progress log for this table, update it in place

@@ -1093,6 +1093,138 @@ async fn fetch_tables_with_updated_at(
     updated_at_set
 }
 
+/// Fetch estimated row counts for all tables in the database from INFORMATION_SCHEMA.TABLES
+async fn fetch_table_row_counts(
+    client: &reqwest::Client,
+    base_url: &str,
+    csrf_token: &str,
+    db: &str,
+    _app: &tauri::AppHandle,
+) -> HashMap<String, usize> {
+    let mut row_counts: HashMap<String, usize> = HashMap::new();
+
+    let safe_db = db.replace('\'', "''");
+    let query = format!(
+        "SELECT TABLE_NAME, TABLE_ROWS FROM information_schema.TABLES \
+         WHERE LOWER(TABLE_SCHEMA) = LOWER('{}') LIMIT 10000",
+        safe_db
+    );
+
+    let sql_endpoints = vec![
+        format!("{}/index.php?route=/sql", base_url),
+        format!("{}/sql.php", base_url),
+    ];
+
+    for sql_url in &sql_endpoints {
+        let mut form_data: Vec<(&str, String)> = vec![
+            ("db", db.to_string()),
+            ("table", String::new()),
+            ("server", "1".to_string()),
+            ("sql_query", query.clone()),
+            ("sql_delimiter", ";".to_string()),
+            ("ajax_request", "true".to_string()),
+            ("ajax_page_request", "true".to_string()),
+            ("submit_query", "Go".to_string()),
+            ("session_max_rows", "all".to_string()),
+            ("max_rows", "100000".to_string()),
+        ];
+        if !csrf_token.is_empty() {
+            form_data.push(("token", csrf_token.to_string()));
+        }
+
+        let resp = match client
+            .post(sql_url)
+            .header("X-Requested-With", "XMLHttpRequest")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .form(&form_data)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+
+        let raw_text = match resp.text().await {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+
+        let json_val = match serde_json::from_str::<serde_json::Value>(&raw_text) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let success = json_val
+            .get("success")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if !success {
+            continue;
+        }
+
+        if let (Some(fields), Some(rows)) = (
+            json_val.get("fields").and_then(|v| v.as_array()),
+            json_val.get("rows").and_then(|v| v.as_array()),
+        ) {
+            let col_names: Vec<String> = fields
+                .iter()
+                .map(|f| {
+                    f.get("name")
+                        .or_else(|| f.get("Name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_uppercase()
+                })
+                .collect();
+
+            let tbl_idx = col_names.iter().position(|c| c == "TABLE_NAME");
+            let rows_idx = col_names.iter().position(|c| c == "TABLE_ROWS");
+
+            if let (Some(ti), Some(ri)) = (tbl_idx, rows_idx) {
+                for row in rows {
+                    if let Some(arr) = row.as_array() {
+                        let tbl = arr.get(ti).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let r_cnt = arr.get(ri).and_then(|v| {
+                            if let Some(n) = v.as_u64() {
+                                Some(n as usize)
+                            } else if let Some(s) = v.as_str() {
+                                s.parse::<usize>().ok()
+                            } else {
+                                None
+                            }
+                        }).unwrap_or(0);
+                        if !tbl.is_empty() {
+                            row_counts.insert(tbl, r_cnt);
+                        }
+                    } else if let Some(obj) = row.as_object() {
+                        let tbl = obj.get("TABLE_NAME").or_else(|| obj.get("table_name"))
+                            .and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let r_cnt = obj.get("TABLE_ROWS").or_else(|| obj.get("table_rows"))
+                            .and_then(|v| {
+                                if let Some(n) = v.as_u64() {
+                                    Some(n as usize)
+                                } else if let Some(s) = v.as_str() {
+                                    s.parse::<usize>().ok()
+                                } else {
+                                    None
+                                }
+                            }).unwrap_or(0);
+                        if !tbl.is_empty() {
+                            row_counts.insert(tbl, r_cnt);
+                        }
+                    }
+                }
+            }
+        }
+
+        if !row_counts.is_empty() {
+            break;
+        }
+    }
+
+    row_counts
+}
+
 /// Extract table names from PMA AJAX SQL JSON response
 fn extract_tables_from_json(json_val: &serde_json::Value, db: &str) -> Vec<String> {
     let mut tables = Vec::new();
@@ -1438,6 +1570,27 @@ fn count_imported_sql_rows(bytes: &[u8]) -> usize {
     count
 }
 
+fn format_number(n: usize) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            out.push('.');
+        }
+        out.push(c);
+    }
+    out.chars().rev().collect()
+}
+
+fn decompress_gzip_bytes(bytes: &[u8]) -> Result<Vec<u8>, std::io::Error> {
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+    let mut decoder = GzDecoder::new(bytes);
+    let mut decompressed = Vec::new();
+    decoder.read_to_end(&mut decompressed)?;
+    Ok(decompressed)
+}
+
 fn format_byte_size(bytes: usize) -> String {
     const KB: f64 = 1024.0;
     const MB: f64 = 1024.0 * 1024.0;
@@ -1463,143 +1616,23 @@ struct DownloadedTableData {
     table_start: std::time::Instant,
 }
 
-/// Tahap 1 (Producer): Mengunduh export SQL/GZIP dari phpMyAdmin server ke dalam memory buffer terkompresi
-async fn fetch_table_export_stream(
+/// Helper download low-level payload dari phpMyAdmin server
+async fn download_export_payload(
     client: &reqwest::Client,
     base_url: &str,
     csrf_token: &str,
     pma_config: &PmaExportConfig,
     table_name: &str,
+    struct_or_data: &str,
+    sql_structure: &str,
+    sql_create: &str,
+    sql_type_val: &str,
+    custom_query_opt: Option<String>,
     cached_endpoint: &std::sync::Arc<tokio::sync::Mutex<Option<(String, String)>>>,
     app: &tauri::AppHandle,
+    chunk_label: Option<&str>,
 ) -> Result<Option<DownloadedTableData>, String> {
-    if is_user_cancelled() {
-        return Err("__USER_CANCELLED__".to_string());
-    }
-    if is_aborted() {
-        return Err("__WORKER_ABORTED__".to_string());
-    }
-
     let table_start = std::time::Instant::now();
-
-    emit_log(
-        app,
-        "info",
-        format!("[Tabel '{}'] Mengunduh export SQL dari server PMA...", table_name),
-    );
-
-    let pk_col_opt = pma_config
-        .table_primary_keys
-        .as_ref()
-        .and_then(|m| m.get(table_name))
-        .map(|s| s.trim())
-        .filter(|pk| !pk.is_empty())
-        .or_else(|| pma_config.primary_key.as_deref().map(str::trim).filter(|pk| !pk.is_empty()));
-
-    let has_updated_at = pma_config
-        .tables_with_updated_at
-        .as_ref()
-        .map(|set| set.contains(table_name))
-        .unwrap_or(false);
-
-    let has_incremental_watermark = pma_config.sync_mode.as_deref() == Some("incremental")
-        && pma_config.incremental_watermarks.as_ref()
-            .is_some_and(|watermarks| watermarks.contains_key(table_name));
-
-    // Optimasi: Jika mode incremental dan watermark sudah ada, tetapi tabel TIDAK punya PK dan TIDAK punya updated_at
-    if pma_config.sync_mode.as_deref() == Some("incremental") && has_incremental_watermark && pk_col_opt.is_none() && !has_updated_at {
-        emit_log(
-            app,
-            "info",
-            format!("[Tabel '{}'] Tidak memiliki kolom Primary Key (ID) maupun 'updated_at'. Di-skip pada sinkronisasi incremental untuk mencegah error.", table_name),
-        );
-        return Ok(None);
-    }
-
-    let sql_type_val = if pma_config.sync_mode.as_deref() == Some("fresh") {
-        "INSERT"
-    } else {
-        "REPLACE"
-    };
-
-    let is_incremental = pma_config.sync_mode.as_deref() == Some("incremental");
-    let struct_or_data = if is_incremental { "data" } else { "structure_and_data" };
-    let sql_structure = if is_incremental { "0" } else { "1" };
-    let sql_create = if is_incremental { "false" } else { "true" };
-
-    let custom_query_opt = if pma_config.row_limit.filter(|limit| *limit > 0).is_some() || has_incremental_watermark {
-        let limit = pma_config.row_limit.filter(|limit| *limit > 0).unwrap_or(usize::MAX);
-        let safe_table = table_name.replace('`', "``");
-
-        let limited_query = if let Some(watermark) = pma_config
-            .incremental_watermarks
-            .as_ref()
-            .and_then(|watermarks| watermarks.get(table_name))
-            .filter(|_| pma_config.sync_mode.as_deref() == Some("incremental"))
-        {
-            let last_id_str = match &watermark.last_synced_id {
-                serde_json::Value::Number(value) => Some(value.to_string()),
-                serde_json::Value::String(value) => Some(format!("'{}'", value.replace('\'', "''"))),
-                _ => None,
-            };
-            let last_sync = watermark.last_sync_time.replace('\'', "''");
-
-            let mut conditions = Vec::new();
-
-            if let (Some(pk_col), Some(last_id)) = (pk_col_opt, last_id_str) {
-                let safe_pk = pk_col.replace('`', "``");
-                conditions.push(format!("`{}` > {}", safe_pk, last_id));
-            }
-
-            if has_updated_at && !last_sync.is_empty() {
-                conditions.push(format!("`updated_at` > '{}'", last_sync));
-            }
-
-            let where_clause = if !conditions.is_empty() {
-                format!("WHERE {}", conditions.join(" OR "))
-            } else {
-                String::new()
-            };
-
-            let order_clause = if let Some(pk_col) = pk_col_opt {
-                format!("ORDER BY `{}` ASC", pk_col.replace('`', "``"))
-            } else if has_updated_at {
-                "ORDER BY `updated_at` ASC".to_string()
-            } else {
-                String::new()
-            };
-
-            let limit_clause = if limit != usize::MAX {
-                format!("LIMIT {}", limit)
-            } else {
-                String::new()
-            };
-
-            format!(
-                "SELECT * FROM `{}` {} {} {}",
-                safe_table, where_clause, order_clause, limit_clause
-            ).split_whitespace().collect::<Vec<_>>().join(" ")
-        } else {
-            let order_clause = if let Some(pk_col) = pk_col_opt {
-                format!("ORDER BY `{}` DESC", pk_col.replace('`', "``"))
-            } else {
-                String::new()
-            };
-            let limit_clause = if limit != usize::MAX {
-                format!("LIMIT {}", limit)
-            } else {
-                String::new()
-            };
-            format!(
-                "SELECT * FROM `{}` {} {}",
-                safe_table, order_clause, limit_clause
-            ).split_whitespace().collect::<Vec<_>>().join(" ")
-        };
-        Some(limited_query)
-    } else {
-        None
-    };
-
     let (cached_url, cached_comp) = {
         let guard = cached_endpoint.lock().await;
         guard.clone().unzip()
@@ -1717,12 +1750,13 @@ async fn fetch_table_export_stream(
                     _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
                         let elapsed_wait = send_start.elapsed().as_secs();
                         if elapsed_wait >= 5 && last_wait_log.elapsed().as_secs() >= 5 {
+                            let label_str = chunk_label.map(|lbl| format!(" ({})", lbl)).unwrap_or_default();
                             emit_log(
                                 app,
                                 "info",
                                 format!(
-                                    "[Tabel '{}'] Menunggu server remote PMA memproses & menyiapkan export SQL... ({}s)",
-                                    table_name, elapsed_wait
+                                    "[Tabel '{}'] Menunggu server remote PMA memproses & menyiapkan export SQL{}... ({}s)",
+                                    table_name, label_str, elapsed_wait
                                 ),
                             );
                             last_wait_log = std::time::Instant::now();
@@ -1798,12 +1832,14 @@ async fn fetch_table_export_stream(
                             let delta_bytes = response_bytes.len() - last_logged_bytes;
                             let delta_secs = last_progress_log.elapsed().as_secs_f64();
                             let speed_mb = (delta_bytes as f64 / (1024.0 * 1024.0)) / delta_secs.max(0.1);
+                            let label_str = chunk_label.map(|lbl| format!(" ({})", lbl)).unwrap_or_default();
                             emit_log(
                                 app,
                                 "info",
                                 format!(
-                                    "[Tabel '{}'] Mengunduh stream: {} diterima (~{:.2} MB/s)...",
+                                    "[Tabel '{}'] Mengunduh stream{}: {} diterima (~{:.2} MB/s)...",
                                     table_name,
+                                    label_str,
                                     format_byte_size(response_bytes.len()),
                                     speed_mb
                                 ),
@@ -1869,6 +1905,338 @@ async fn fetch_table_export_stream(
         format!("Export GAGAL untuk tabel '{}'. Tidak ada data yang berhasil diunduh dari server PMA.", table_name)
     };
     Err(err_msg)
+}
+
+/// Tahap 1 (Producer): Mengunduh export SQL/GZIP dari phpMyAdmin server ke dalam memory buffer terkompresi
+async fn fetch_table_export_stream(
+    client: &reqwest::Client,
+    base_url: &str,
+    csrf_token: &str,
+    pma_config: &PmaExportConfig,
+    table_name: &str,
+    cached_endpoint: &std::sync::Arc<tokio::sync::Mutex<Option<(String, String)>>>,
+    table_row_counts: &std::sync::Arc<HashMap<String, usize>>,
+    app: &tauri::AppHandle,
+) -> Result<Option<DownloadedTableData>, String> {
+    if is_user_cancelled() {
+        return Err("__USER_CANCELLED__".to_string());
+    }
+    if is_aborted() {
+        return Err("__WORKER_ABORTED__".to_string());
+    }
+
+    let table_start = std::time::Instant::now();
+
+    emit_log(
+        app,
+        "info",
+        format!("[Tabel '{}'] Mengunduh export SQL dari server PMA...", table_name),
+    );
+
+    let pk_col_opt = pma_config
+        .table_primary_keys
+        .as_ref()
+        .and_then(|m| m.get(table_name))
+        .map(|s| s.trim())
+        .filter(|pk| !pk.is_empty())
+        .or_else(|| pma_config.primary_key.as_deref().map(str::trim).filter(|pk| !pk.is_empty()));
+
+    let has_updated_at = pma_config
+        .tables_with_updated_at
+        .as_ref()
+        .map(|set| set.contains(table_name))
+        .unwrap_or(false);
+
+    let has_incremental_watermark = pma_config.sync_mode.as_deref() == Some("incremental")
+        && pma_config.incremental_watermarks.as_ref()
+            .is_some_and(|watermarks| watermarks.contains_key(table_name));
+
+    // Optimasi: Jika mode incremental dan watermark sudah ada, tetapi tabel TIDAK punya PK dan TIDAK punya updated_at
+    if pma_config.sync_mode.as_deref() == Some("incremental") && has_incremental_watermark && pk_col_opt.is_none() && !has_updated_at {
+        emit_log(
+            app,
+            "info",
+            format!("[Tabel '{}'] Tidak memiliki kolom Primary Key (ID) maupun 'updated_at'. Di-skip pada sinkronisasi incremental untuk mencegah error.", table_name),
+        );
+        return Ok(None);
+    }
+
+    let sql_type_val = if pma_config.sync_mode.as_deref() == Some("fresh") {
+        "INSERT"
+    } else {
+        "REPLACE"
+    };
+
+    let is_incremental = pma_config.sync_mode.as_deref() == Some("incremental");
+    let est_rows = table_row_counts.get(table_name).copied().unwrap_or(0);
+    let explicit_row_limit = pma_config.row_limit.filter(|limit| *limit > 0);
+
+    // Kriteria chunking:
+    // Tabel besar (est_rows >= 150_000), tanpa incremental watermark sempit, dan row_limit tidak di-set kecil (< 150_000)
+    let should_chunk = est_rows >= 150_000
+        && !has_incremental_watermark
+        && explicit_row_limit.map(|l| l >= 150_000).unwrap_or(true);
+
+    if should_chunk {
+        let chunk_size = 100_000usize;
+        let total_chunks = (est_rows + chunk_size - 1) / chunk_size;
+        let safe_table = table_name.replace('`', "``");
+
+        let order_clause = if let Some(pk_col) = pk_col_opt {
+            format!("ORDER BY `{}` ASC", pk_col.replace('`', "``"))
+        } else {
+            String::new()
+        };
+
+        emit_log(
+            app,
+            "info",
+            format!(
+                "[Tabel '{}'] Tabel berukuran besar (~{} row). Mengunduh dalam cicilan {} chunk ({} row per chunk)...",
+                table_name,
+                format_number(est_rows),
+                total_chunks,
+                format_number(chunk_size)
+            ),
+        );
+
+        let mut combined_sql = Vec::new();
+        let mut chunk_idx = 0usize;
+        let max_safe_chunks = 500usize;
+
+        while chunk_idx < max_safe_chunks {
+            if is_user_cancelled() {
+                return Err("__USER_CANCELLED__".to_string());
+            }
+            if is_aborted() {
+                return Err("__WORKER_ABORTED__".to_string());
+            }
+
+            let offset = chunk_idx * chunk_size;
+            let chunk_struct = if chunk_idx == 0 && !is_incremental { "structure_and_data" } else { "data" };
+            let chunk_sql_struct = if chunk_idx == 0 && !is_incremental { "1" } else { "0" };
+            let chunk_sql_create = if chunk_idx == 0 && !is_incremental { "true" } else { "false" };
+
+            let chunk_query = format!(
+                "SELECT * FROM `{}` {} LIMIT {} OFFSET {}",
+                safe_table, order_clause, chunk_size, offset
+            ).split_whitespace().collect::<Vec<_>>().join(" ");
+
+            let display_total = total_chunks.max(chunk_idx + 1);
+            let chunk_label = format!("chunk {}/{}", chunk_idx + 1, display_total);
+
+            let chunk_res = download_export_payload(
+                client,
+                base_url,
+                csrf_token,
+                pma_config,
+                table_name,
+                chunk_struct,
+                chunk_sql_struct,
+                chunk_sql_create,
+                sql_type_val,
+                Some(chunk_query),
+                cached_endpoint,
+                app,
+                Some(&chunk_label),
+            ).await?;
+
+            if let Some(chunk_data) = chunk_res {
+                let raw_chunk_sql = if chunk_data.is_gzip {
+                    decompress_gzip_bytes(&chunk_data.response_bytes)
+                        .unwrap_or(chunk_data.response_bytes)
+                } else {
+                    chunk_data.response_bytes
+                };
+
+                let chunk_len = raw_chunk_sql.len();
+                let row_count_in_chunk = count_imported_sql_rows(&raw_chunk_sql);
+                let has_insert = raw_chunk_sql.windows(11).any(|w| w == b"INSERT INTO")
+                    || raw_chunk_sql.windows(12).any(|w| w == b"REPLACE INTO");
+
+                if !combined_sql.is_empty() {
+                    combined_sql.push(b'\n');
+                }
+                combined_sql.extend_from_slice(&raw_chunk_sql);
+
+                emit_log(
+                    app,
+                    "info",
+                    format!(
+                        "[Tabel '{}'] Chunk {}/{} selesai diunduh: ~{} row ({})",
+                        table_name,
+                        chunk_idx + 1,
+                        display_total,
+                        format_number(row_count_in_chunk),
+                        format_byte_size(chunk_len)
+                    ),
+                );
+
+                chunk_idx += 1;
+
+                // Jika chunk tidak memiliki data INSERT atau baris kurang dari chunk_size, berarti seluruh isi tabel telah selesai
+                if !has_insert || row_count_in_chunk < chunk_size {
+                    break;
+                }
+
+                // Jeda throttling singkat antar chunk agar memory & I/O remote server PMA tidak overload
+                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+            } else {
+                break;
+            }
+        }
+
+        return Ok(Some(DownloadedTableData {
+            table_name: table_name.to_string(),
+            response_bytes: combined_sql,
+            is_gzip: false,
+            table_start,
+        }));
+    }
+
+    let struct_or_data = if is_incremental { "data" } else { "structure_and_data" };
+    let sql_structure = if is_incremental { "0" } else { "1" };
+    let sql_create = if is_incremental { "false" } else { "true" };
+
+    let custom_query_opt = if pma_config.row_limit.filter(|limit| *limit > 0).is_some() || has_incremental_watermark {
+        let limit = pma_config.row_limit.filter(|limit| *limit > 0).unwrap_or(usize::MAX);
+        let safe_table = table_name.replace('`', "``");
+
+        let limited_query = if let Some(watermark) = pma_config
+            .incremental_watermarks
+            .as_ref()
+            .and_then(|watermarks| watermarks.get(table_name))
+            .filter(|_| pma_config.sync_mode.as_deref() == Some("incremental"))
+        {
+            let last_id_str = match &watermark.last_synced_id {
+                serde_json::Value::Number(value) => Some(value.to_string()),
+                serde_json::Value::String(value) => Some(format!("'{}'", value.replace('\'', "''"))),
+                _ => None,
+            };
+            let last_sync = watermark.last_sync_time.replace('\'', "''");
+
+            let mut conditions = Vec::new();
+
+            if let (Some(pk_col), Some(last_id)) = (pk_col_opt, last_id_str) {
+                let safe_pk = pk_col.replace('`', "``");
+                conditions.push(format!("`{}` > {}", safe_pk, last_id));
+            }
+
+            if has_updated_at && !last_sync.is_empty() {
+                conditions.push(format!("`updated_at` > '{}'", last_sync));
+            }
+
+            let where_clause = if !conditions.is_empty() {
+                format!("WHERE {}", conditions.join(" OR "))
+            } else {
+                String::new()
+            };
+
+            let order_clause = if let Some(pk_col) = pk_col_opt {
+                format!("ORDER BY `{}` ASC", pk_col.replace('`', "``"))
+            } else if has_updated_at {
+                "ORDER BY `updated_at` ASC".to_string()
+            } else {
+                String::new()
+            };
+
+            let limit_clause = if limit != usize::MAX {
+                format!("LIMIT {}", limit)
+            } else {
+                String::new()
+            };
+
+            format!(
+                "SELECT * FROM `{}` {} {} {}",
+                safe_table, where_clause, order_clause, limit_clause
+            ).split_whitespace().collect::<Vec<_>>().join(" ")
+        } else {
+            let order_clause = if let Some(pk_col) = pk_col_opt {
+                format!("ORDER BY `{}` DESC", pk_col.replace('`', "``"))
+            } else {
+                String::new()
+            };
+            let limit_clause = if limit != usize::MAX {
+                format!("LIMIT {}", limit)
+            } else {
+                String::new()
+            };
+            format!(
+                "SELECT * FROM `{}` {} {}",
+                safe_table, order_clause, limit_clause
+            ).split_whitespace().collect::<Vec<_>>().join(" ")
+        };
+        Some(limited_query)
+    } else {
+        None
+    };
+
+    download_export_payload(
+        client,
+        base_url,
+        csrf_token,
+        pma_config,
+        table_name,
+        struct_or_data,
+        sql_structure,
+        sql_create,
+        sql_type_val,
+        custom_query_opt,
+        cached_endpoint,
+        app,
+        None,
+    ).await
+}
+
+fn get_mysql_cli_binary() -> &'static str {
+    static BINARY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    BINARY.get_or_init(|| {
+        // 1. Coba perintah di PATH
+        if std::process::Command::new("mariadb").arg("--version").output().is_ok() {
+            return "mariadb".to_string();
+        }
+        if std::process::Command::new("mysql").arg("--version").output().is_ok() {
+            return "mysql".to_string();
+        }
+
+        // 2. Cek lokasi instalasi umum di macOS, Linux, dan Windows
+        let candidates = [
+            // macOS Homebrew (Apple Silicon)
+            "/opt/homebrew/bin/mariadb",
+            "/opt/homebrew/bin/mysql",
+            "/opt/homebrew/opt/mysql-client/bin/mysql",
+            "/opt/homebrew/opt/mariadb/bin/mariadb",
+            // macOS Homebrew (Intel) & Standard Unix
+            "/usr/local/bin/mariadb",
+            "/usr/local/bin/mysql",
+            "/usr/local/opt/mysql-client/bin/mysql",
+            // macOS Official MySQL Package
+            "/usr/local/mysql/bin/mysql",
+            // macOS MAMP / XAMPP
+            "/Applications/MAMP/Library/bin/mysql",
+            "/Applications/XAMPP/xamppfiles/bin/mysql",
+            // Linux standard & XAMPP
+            "/usr/bin/mariadb",
+            "/usr/bin/mysql",
+            "/opt/lampp/bin/mysql",
+            // Windows XAMPP / Laragon / Official Installer
+            r"C:\xampp\mysql\bin\mysql.exe",
+            r"C:\xampp\mysql\bin\mariadb.exe",
+            r"C:\laragon\bin\mysql\current\bin\mysql.exe",
+            r"C:\Program Files\MySQL\MySQL Server 8.4\bin\mysql.exe",
+            r"C:\Program Files\MySQL\MySQL Server 8.0\bin\mysql.exe",
+            r"C:\Program Files\MariaDB 11.4\bin\mariadb.exe",
+            r"C:\Program Files\MariaDB 10.11\bin\mariadb.exe",
+        ];
+
+        for path in candidates {
+            if std::path::Path::new(path).exists() {
+                return path.to_string();
+            }
+        }
+
+        "mysql".to_string()
+    })
 }
 
 /// Tahap 2 (Consumer): Mendekompresi GZIP secara real-time dan mengalirkan langsung ke STDIN MySQL Lokal
@@ -1946,38 +2314,6 @@ async fn import_table_to_local(
         return Ok(0);
     }
 
-    if is_fresh && (has_create_table || imported_rows > 0) {
-        let mut drop_cmd = Command::new("mysql");
-        drop_cmd
-            .arg("--skip-ssl")
-            .arg("--connect-timeout=60")
-            .arg("-h")
-            .arg(host)
-            .arg("-P")
-            .arg(&port_str)
-            .arg("-u")
-            .arg(&local_config.username);
-        if !local_config.password.is_empty() {
-            drop_cmd.arg(format!("-p{}", local_config.password));
-        }
-        drop_cmd.arg(db_name).arg("-e").arg(format!(
-            "SET FOREIGN_KEY_CHECKS=0; SET lock_wait_timeout=600; SET innodb_lock_wait_timeout=600; DROP TABLE IF EXISTS `{}`; SET FOREIGN_KEY_CHECKS=1;",
-            table_name.replace('`', "``")
-        ));
-        let drop_output = drop_cmd
-            .output()
-            .await
-            .map_err(|e| format!("Gagal menjalankan DROP TABLE untuk '{}': {}", table_name, e))?;
-        if !drop_output.status.success() {
-            let stderr = String::from_utf8_lossy(&drop_output.stderr);
-            return Err(format!(
-                "Gagal menghapus tabel lokal '{}': {}",
-                table_name,
-                stderr.trim()
-            ));
-        }
-    }
-
     emit_log(
         app,
         "info",
@@ -1992,6 +2328,7 @@ async fn import_table_to_local(
     let max_retries = 3;
     let mut attempt = 0;
     let mut last_error = String::new();
+    let cli_bin = get_mysql_cli_binary();
 
     while attempt < max_retries {
         attempt += 1;
@@ -2003,7 +2340,7 @@ async fn import_table_to_local(
             return Err("__WORKER_ABORTED__".to_string());
         }
 
-        let mut cmd = Command::new("mysql");
+        let mut cmd = Command::new(cli_bin);
         cmd.arg("--skip-ssl")
             .arg("--binary-mode")
             .arg("--quick")
@@ -2030,8 +2367,8 @@ async fn import_table_to_local(
             Ok(c) => c,
             Err(e) => {
                 return Err(format!(
-                    "Gagal menjalankan perintah CLI 'mysql'. Pastikan client MySQL/MariaDB terinstall dan ada di PATH system. Error: {}",
-                    e
+                    "Gagal menjalankan perintah CLI '{}'. Pastikan client MySQL/MariaDB terinstall dan ada di PATH system. Error: {}",
+                    cli_bin, e
                 ));
             }
         };
@@ -2052,10 +2389,17 @@ async fn import_table_to_local(
 
         let stdin_task = tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
-            let prelude = b"SET SESSION sql_log_bin=0;\nSET SESSION foreign_key_checks=0;\nSET SESSION unique_checks=0;\nSET SESSION autocommit=0;\nSET SESSION sql_mode='';\nSET SESSION net_read_timeout=600;\nSET SESSION net_write_timeout=600;\nSET SESSION wait_timeout=600;\nSET SESSION lock_wait_timeout=600;\nSET SESSION innodb_lock_wait_timeout=600;\n";
-            let postlude = b"\nCOMMIT;\nSET SESSION foreign_key_checks=1;\nSET SESSION unique_checks=1;\nSET SESSION autocommit=1;\n";
+            let drop_clause = if is_fresh {
+                format!("DROP TABLE IF EXISTS `{}`;\n", table_name_clone.replace('`', "``"))
+            } else {
+                String::new()
+            };
+            let prelude_str = format!(
+                "SET SESSION sql_log_bin=0;\nSET SESSION foreign_key_checks=0;\nSET SESSION unique_checks=0;\nSET SESSION autocommit=0;\nSET SESSION sql_mode='';\nSET SESSION net_read_timeout=600;\nSET SESSION net_write_timeout=600;\nSET SESSION wait_timeout=600;\nSET SESSION lock_wait_timeout=600;\nSET SESSION innodb_lock_wait_timeout=600;\n{}",
+                drop_clause
+            );
 
-            if let Err(e) = child_stdin.write_all(prelude).await {
+            if let Err(e) = child_stdin.write_all(prelude_str.as_bytes()).await {
                 return Err(e);
             }
 
@@ -2092,6 +2436,7 @@ async fn import_table_to_local(
                 }
             }
 
+            let postlude = b"\nCOMMIT;\nSET SESSION foreign_key_checks=1;\nSET SESSION unique_checks=1;\nSET SESSION autocommit=1;\n";
             if let Err(e) = child_stdin.write_all(postlude).await {
                 return Err(e);
             }
@@ -2241,7 +2586,8 @@ async fn ensure_local_database_exists(local_config: &LocalDbConfig, app: &tauri:
         local_config.port.to_string()
     };
 
-    let mut cmd = Command::new("mysql");
+    let cli_bin = get_mysql_cli_binary();
+    let mut cmd = Command::new(cli_bin);
     cmd.arg("--skip-ssl")
         .arg("--connect-timeout=60")
         .arg("-h")
@@ -2380,10 +2726,22 @@ pub async fn export_pma_database(
         pma_config.tables_with_updated_at = Some(tables_with_updated_at);
     }
 
+    let table_row_counts = std::sync::Arc::new(
+        fetch_table_row_counts(&client, &base_url, &csrf_token, &pma_config.database, &app).await
+    );
+    if !table_row_counts.is_empty() {
+        emit_log(
+            &app,
+            "info",
+            format!("Estimasi baris database terdeteksi untuk {} tabel.", table_row_counts.len())
+        );
+    }
+
     let total_tables = tables.len();
     let (concurrency, cpu_cores) = calculate_optimal_workers(total_tables);
     let buffer_capacity = 8.min(total_tables).max(2);
-    let download_concurrency = (cpu_cores / 3).clamp(2, 4).min(total_tables);
+    // Remote PMA download concurrency dibatasi maksimal 2 worker agar session file remote tidak terkunci dan CPU remote hosting tidak di-throttle
+    let download_concurrency = (cpu_cores / 4).clamp(1, 2).min(total_tables);
 
     emit_log(
         &app,
@@ -2419,6 +2777,7 @@ pub async fn export_pma_database(
         let csrf_token_p = csrf_token.clone();
         let pma_config_p = pma_config.clone();
         let cached_endpoint_p = cached_endpoint.clone();
+        let table_row_counts_p = table_row_counts.clone();
         let app_p = app.clone();
         let tx_c = tx.clone();
 
@@ -2448,6 +2807,7 @@ pub async fn export_pma_database(
                     &pma_config_p,
                     &table_name,
                     &cached_endpoint_p,
+                    &table_row_counts_p,
                     &app_p,
                 )
                 .await;
@@ -2471,6 +2831,9 @@ pub async fn export_pma_database(
                                 }
                             }
                         }
+
+                        // Jeda throttling antar tabel (300ms) agar server remote hosting tidak kehabisan CPU / terkena CloudLinux LVE throttle
+                        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
                     }
                     Err(e) => {
                         WORKER_ABORT_REQUESTED.store(true, Ordering::SeqCst);

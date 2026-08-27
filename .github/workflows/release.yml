@@ -20,11 +20,17 @@ jobs:
       matrix:
         include:
           - name: Linux
-            os: ubuntu-26.04
+            os: ubuntu-24.04
             bundles: deb,rpm
           - name: Windows
             os: windows-latest
             bundles: nsis,msi
+          - name: macOS-Intel
+            os: macos-13
+            bundles: dmg,app
+          - name: macOS-Silicon
+            os: macos-15
+            bundles: dmg,app
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -44,8 +50,7 @@ jobs:
         shell: bash
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          node -e "const fs=require('fs'); const v=process.argv[1]; for (const file of ['package.json','src-tauri/tauri.conf.json']) { const data=JSON.parse(fs.readFileSync(file)); data.version=v; fs.writeFileSync(file, JSON.stringify(data, null, 2)+'\\n'); }" "$VERSION"
-          sed -i -E "s/^version = \".*\"/version = \"$VERSION\"/" src-tauri/Cargo.toml
+          node -e "const fs=require('fs'); const v=process.argv[1]; for (const file of ['package.json','src-tauri/tauri.conf.json']) { const data=JSON.parse(fs.readFileSync(file)); data.version=v; fs.writeFileSync(file, JSON.stringify(data, null, 2)+'\\n'); } const cargo='src-tauri/Cargo.toml'; fs.writeFileSync(cargo, fs.readFileSync(cargo, 'utf8').replace(/^version\\s*=\\s*\"[^\"]+\"/m, 'version = \"' + v + '\"'));" "$VERSION"
       - name: Install frontend dependencies
         run: npm ci
       - name: Build frontend
