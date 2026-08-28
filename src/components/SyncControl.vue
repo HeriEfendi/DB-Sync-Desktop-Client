@@ -129,7 +129,7 @@
           Reset Semua State
         </button>
       </div>
-      <div v-show="showSyncStates" id="sync-states-table" class="states-table-wrapper">
+      <div v-if="showSyncStates" id="sync-states-table" class="states-table-wrapper">
         <table class="states-table">
           <thead>
             <tr>
@@ -141,7 +141,7 @@
             </tr>
           </thead>
           <tbody>
-            <tr v-for="st in syncTableStates" :key="st.key">
+            <tr v-for="st in visibleStates" :key="st.key">
               <td class="font-mono text-dim">{{ st.server }} / {{ st.database }}</td>
               <td class="font-mono text-emerald"><strong>{{ st.table }}</strong></td>
               <td class="font-mono text-amber">
@@ -157,13 +157,18 @@
             </tr>
           </tbody>
         </table>
+        <!-- Sentinel: saat elemen ini terlihat, muat 20 item berikutnya -->
+        <div ref="sentinelRef" class="scroll-sentinel"></div>
+        <div v-if="visibleStates.length < syncTableStates.length" class="load-more-hint">
+          Menampilkan {{ visibleStates.length }} / {{ syncTableStates.length }} — scroll untuk muat lebih banyak
+        </div>
       </div>
     </div>
   </div>
 </template>
 
 <script setup>
-import { ref, watch, computed, onUnmounted } from 'vue';
+import { ref, watch, computed, onMounted, onUnmounted } from 'vue';
 const props = defineProps({
   isSyncing: { type: Boolean, default: false },
   autoSyncInterval: { type: Number, default: 0 },
@@ -207,6 +212,64 @@ const emit = defineEmits([
 const elapsedSeconds = ref(0);
 const showSyncStates = ref(false);
 let elapsedTimer = null;
+
+// --- Progressive load dengan IntersectionObserver ---
+const PAGE_SIZE = 20;
+const sentinelRef = ref(null);
+const visibleCount = ref(PAGE_SIZE);
+let observer = null;
+
+function loadMore() {
+  if (visibleCount.value < props.syncTableStates.length) {
+    visibleCount.value = Math.min(
+      visibleCount.value + PAGE_SIZE,
+      props.syncTableStates.length
+    );
+  }
+}
+
+function setupObserver() {
+  if (observer) { observer.disconnect(); observer = null; }
+  // Tunggu DOM render dulu
+  setTimeout(() => {
+    if (!sentinelRef.value) return;
+    observer = new IntersectionObserver(
+      (entries) => {
+        if (entries[0]?.isIntersecting) loadMore();
+      },
+      { threshold: 0.1 }
+    );
+    observer.observe(sentinelRef.value);
+  }, 100);
+}
+
+function teardownObserver() {
+  if (observer) { observer.disconnect(); observer = null; }
+}
+
+// Setup observer saat panel dibuka, teardown saat ditutup
+watch(showSyncStates, (val) => {
+  if (val) {
+    visibleCount.value = PAGE_SIZE;
+    setupObserver();
+  } else {
+    teardownObserver();
+  }
+});
+
+// Reset saat data baru masuk
+watch(() => props.syncTableStates, () => {
+  visibleCount.value = PAGE_SIZE;
+});
+
+const visibleStates = computed(() =>
+  props.syncTableStates.slice(0, visibleCount.value)
+);
+
+onUnmounted(() => {
+  teardownObserver();
+});
+// --- End progressive load ---
 
 watch(() => props.isSyncing, (syncing) => {
   if (syncing) {
@@ -602,9 +665,9 @@ const formatDuration = (ms) => {
 .text-rose { color: var(--accent-rose); }
 
 .states-table-wrapper {
-  overflow-x: auto;
-  max-height: 200px;
+  max-height: 240px;
   overflow-y: auto;
+  overflow-x: auto;
   overscroll-behavior: contain;
 }
 
@@ -622,14 +685,37 @@ const formatDuration = (ms) => {
 }
 
 .states-table th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: rgba(10, 17, 35, 0.95);
+  backdrop-filter: blur(4px);
   color: var(--text-dim);
   font-weight: 600;
   text-transform: uppercase;
   font-size: 0.68rem;
+  letter-spacing: 0.03em;
 }
 
-.states-table tr:hover {
+.states-table tr:hover td {
   background: rgba(255, 255, 255, 0.03);
+}
+
+/* Sentinel div untuk IntersectionObserver — tidak terlihat */
+.scroll-sentinel {
+  height: 1px;
+  width: 100%;
+}
+
+.load-more-hint {
+  text-align: center;
+  padding: 5px 10px;
+  font-size: 0.7rem;
+  color: var(--text-dim);
+  border-top: 1px solid rgba(255, 255, 255, 0.05);
+  background: rgba(10, 17, 35, 0.4);
+  position: sticky;
+  bottom: 0;
 }
 
 @media (max-width: 768px) {

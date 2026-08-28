@@ -604,7 +604,7 @@ const handleStartSync = async () => {
     });
 
     const countSynced = (res && res.totalRowsSynced !== undefined ? res.totalRowsSynced : res?.count) || syncProgress.value.totalSyncedAllTables || 0;
-    if (countSynced > 0) stats.value.totalSynced += countSynced;
+    stats.value.totalSynced = countSynced;
     if (res && res.durationMs) stats.value.lastDuration = res.durationMs;
     stats.value.lastSyncTime = new Date().toLocaleTimeString();
 
