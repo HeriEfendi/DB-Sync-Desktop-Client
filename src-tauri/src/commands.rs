@@ -336,6 +336,98 @@ pub async fn get_last_local_id(
     Ok(None)
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct TableLastIdInfo {
+    pub table: String,
+    pub primary_key: String,
+    pub last_id: Option<serde_json::Value>,
+}
+
+/// Batch query to fetch latest ID and Primary Key for multiple tables in a single connection pool
+#[tauri::command]
+pub async fn get_all_tables_last_local_ids(
+    config: LocalDbConfig,
+    tables: Vec<String>,
+) -> Result<HashMap<String, TableLastIdInfo>, String> {
+    let conn_str = build_connection_string(&config);
+    let pool = MySqlPoolOptions::new()
+        .max_connections(2)
+        .connect(&conn_str)
+        .await
+        .map_err(|e| format!("Koneksi ke MySQL lokal gagal: {}", e))?;
+
+    // Ambil semua primary key untuk seluruh tabel di schema lokal sekaligus
+    let pk_query = "SELECT TABLE_NAME, COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND COLUMN_KEY = 'PRI' ORDER BY ORDINAL_POSITION ASC";
+    let pk_rows = sqlx::query(pk_query).fetch_all(&pool).await.unwrap_or_default();
+    let mut table_pk_map: HashMap<String, String> = HashMap::new();
+    for r in pk_rows {
+        if let (Ok(tbl), Ok(col)) = (r.try_get::<String, _>(0), r.try_get::<String, _>(1)) {
+            table_pk_map.entry(tbl).or_insert(col);
+        }
+    }
+
+    let mut result = HashMap::new();
+
+    for table_name in tables {
+        if !table_exists(&pool, &table_name).await.unwrap_or(false) {
+            continue;
+        }
+
+        let effective_pk = if let Some(pk) = table_pk_map.get(&table_name) {
+            pk.clone()
+        } else {
+            let cols = get_local_table_columns(&pool, &table_name).await.unwrap_or_default();
+            if cols.is_empty() {
+                continue;
+            }
+            if let Some(found_pk) = cols.iter().find(|c| c.eq_ignore_ascii_case("id") || c.to_ascii_lowercase().ends_with("_id") || c.to_ascii_lowercase().starts_with("id_")).cloned() {
+                found_pk
+            } else if let Some(first_col) = cols.first().cloned() {
+                first_col
+            } else {
+                continue;
+            }
+        };
+
+        let safe_table = match sanitize_identifier(&table_name) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let safe_pk = match sanitize_identifier(&effective_pk) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        let query = format!("SELECT MAX({}) AS max_id FROM {}", safe_pk, safe_table);
+        let row_opt = sqlx::query(&query).fetch_optional(&pool).await.ok().flatten();
+
+        let mut last_id_val = None;
+        if let Some(r) = row_opt {
+            if let Ok(val) = r.try_get::<u64, _>(0) {
+                last_id_val = Some(serde_json::Value::Number(val.into()));
+            } else if let Ok(val) = r.try_get::<i64, _>(0) {
+                last_id_val = Some(serde_json::Value::Number(val.into()));
+            } else if let Ok(val) = r.try_get::<f64, _>(0) {
+                if let Some(num) = serde_json::Number::from_f64(val) {
+                    last_id_val = Some(serde_json::Value::Number(num));
+                }
+            } else if let Ok(val) = r.try_get::<String, _>(0) {
+                last_id_val = Some(serde_json::Value::String(val));
+            }
+        }
+
+        result.insert(table_name.clone(), TableLastIdInfo {
+            table: table_name,
+            primary_key: effective_pk,
+            last_id: last_id_val,
+        });
+    }
+
+    pool.close().await;
+
+    Ok(result)
+}
+
 /// Delete local rows newer than the last server-confirmed primary key.
 #[tauri::command]
 pub async fn delete_local_rows_after_id(

@@ -23,6 +23,9 @@ export async function safeInvoke(cmd, args = {}) {
     if (cmd === 'get_last_local_id') {
       return null;
     }
+    if (cmd === 'get_all_tables_last_local_ids') {
+      return {};
+    }
     if (cmd === 'get_local_table_preview') {
       return [];
     }

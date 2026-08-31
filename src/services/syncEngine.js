@@ -206,24 +206,45 @@ export class SyncEngine {
         });
 
         const lastSyncTime = formatMySQLDateTime();
-        await Promise.all(tableNames.map(async (tableName) => {
-          const primaryKey = tablePrimaryKeys[tableName] || this.pmaConfig.primaryKey?.trim() || 'id';
+        
+        let batchResults = null;
+        try {
+          batchResults = await safeInvoke('get_all_tables_last_local_ids', {
+            config: {
+              host: this.localDbConfig.host || '127.0.0.1',
+              port: parseInt(this.localDbConfig.port || 3306, 10),
+              username: this.localDbConfig.username || 'root',
+              password: this.localDbConfig.password || '',
+              database: this.localDbConfig.database || '',
+            },
+            tables: tableNames,
+          });
+        } catch (batchErr) {
+          console.warn('[Sync state] Batch last ID query gagal, fallback ke sequential:', batchErr);
+        }
+
+        for (const tableName of tableNames) {
+          const tableInfo = batchResults ? batchResults[tableName] : null;
+          const detectedPk = tableInfo?.primary_key || tablePrimaryKeys[tableName] || this.pmaConfig.primaryKey?.trim() || 'id';
           const existingState = getTableState(this.serverHost, this.database, tableName);
-          let lastSyncedId = null;
-          try {
-            lastSyncedId = await safeInvoke('get_last_local_id', {
-              config: {
-                host: this.localDbConfig.host || '127.0.0.1',
-                port: parseInt(this.localDbConfig.port || 3306, 10),
-                username: this.localDbConfig.username || 'root',
-                password: this.localDbConfig.password || '',
-                database: this.localDbConfig.database || '',
-              },
-              tableName,
-              primaryKey,
-            });
-          } catch (error) {
-            console.warn(`[Sync state] Gagal membaca MAX(${primaryKey}) untuk '${tableName}':`, error);
+          let lastSyncedId = tableInfo?.last_id ?? null;
+
+          if (!tableInfo) {
+            try {
+              lastSyncedId = await safeInvoke('get_last_local_id', {
+                config: {
+                  host: this.localDbConfig.host || '127.0.0.1',
+                  port: parseInt(this.localDbConfig.port || 3306, 10),
+                  username: this.localDbConfig.username || 'root',
+                  password: this.localDbConfig.password || '',
+                  database: this.localDbConfig.database || '',
+                },
+                tableName,
+                primaryKey: detectedPk,
+              });
+            } catch (error) {
+              console.warn(`[Sync state] Gagal membaca MAX(${detectedPk}) untuk '${tableName}':`, error);
+            }
           }
 
           const isValidNewId = lastSyncedId !== null && lastSyncedId !== undefined && lastSyncedId !== 0 && lastSyncedId !== '0';
@@ -233,10 +254,10 @@ export class SyncEngine {
             lastSyncedId: finalLastSyncedId,
             lastSyncTime,
             rowsSynced: 0,
-            primaryKey,
+            primaryKey: detectedPk,
           });
           this.onTableSynced(tableName);
-        }));
+        }
 
         const elapsed = Math.round(performance.now() - startTime);
         this.log('success', `🎉 Sinkronisasi Selesai! (Waktu: ${elapsed}ms)`);
