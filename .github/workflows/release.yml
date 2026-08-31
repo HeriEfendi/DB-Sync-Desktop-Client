@@ -31,12 +31,12 @@ jobs:
             tauri_args: ""
           - name: macOS-Intel
             os: macos-15
-            bundles: dmg,app
+            bundles: app
             rust_target: x86_64-apple-darwin
             tauri_args: --target x86_64-apple-darwin
           - name: macOS-Silicon
             os: macos-15
-            bundles: dmg,app
+            bundles: app
             rust_target: aarch64-apple-darwin
             tauri_args: --target aarch64-apple-darwin
     steps:
@@ -79,6 +79,38 @@ jobs:
           releaseBody: Automatic build for ${{ github.ref_name }}
           releaseDraft: false
           prerelease: false
+
+      - name: Create and upload macOS DMG package (.dmg)
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          TARGET="${{ matrix.rust_target }}"
+          APP_PATH="src-tauri/target/${TARGET}/release/bundle/macos/DB-Sync Client.app"
+          if [ ! -d "$APP_PATH" ]; then
+            APP_PATH="src-tauri/target/release/bundle/macos/DB-Sync Client.app"
+          fi
+          
+          ARCH_LABEL="x64"
+          if [ "$TARGET" = "aarch64-apple-darwin" ]; then
+            ARCH_LABEL="aarch64"
+          fi
+          
+          DMG_NAME="DB-Sync-Client_${VERSION}_${ARCH_LABEL}.dmg"
+          echo "Packaging $APP_PATH into $DMG_NAME..."
+          
+          DMG_STAGING_DIR="dmg_staging_${ARCH_LABEL}"
+          rm -rf "$DMG_STAGING_DIR"
+          mkdir -p "$DMG_STAGING_DIR"
+          cp -R "$APP_PATH" "$DMG_STAGING_DIR/"
+          ln -s /Applications "$DMG_STAGING_DIR/Applications"
+          
+          hdiutil create -volname "DB-Sync Client" -srcfolder "$DMG_STAGING_DIR" -ov -format UDZO "$DMG_NAME"
+          rm -rf "$DMG_STAGING_DIR"
+          
+          gh release upload "${GITHUB_REF_NAME}" "$DMG_NAME" --clobber
 
       - name: Create and upload Arch Linux package (.pkg.tar.zst)
         if: runner.os == 'Linux'
