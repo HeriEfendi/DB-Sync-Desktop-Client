@@ -1897,6 +1897,7 @@ async fn fetch_table_export_stream(
     cached_endpoint: &std::sync::Arc<tokio::sync::Mutex<Option<(String, String)>>>,
     table_row_counts: &std::sync::Arc<HashMap<String, usize>>,
     app: &tauri::AppHandle,
+    row_limit_override: Option<usize>,
 ) -> Result<Option<DownloadedTableData>, String> {
     if is_user_cancelled() {
         return Err("__USER_CANCELLED__".to_string());
@@ -1949,17 +1950,31 @@ async fn fetch_table_export_stream(
 
     let is_incremental = pma_config.sync_mode.as_deref() == Some("incremental");
     let est_rows = table_row_counts.get(table_name).copied().unwrap_or(0);
-    let explicit_row_limit = pma_config.row_limit.filter(|limit| *limit > 0);
+    // row_limit_override menimpa pma_config.row_limit saat retry timeout dengan limit dikurangi
+    let effective_row_limit = row_limit_override.or(pma_config.row_limit).filter(|limit| *limit > 0);
+
+    if row_limit_override.is_some() {
+        emit_log(
+            app,
+            "info",
+            format!(
+                "[Tabel '{}'] Retry dengan limit dikurangi: {} row",
+                table_name,
+                format_number(row_limit_override.unwrap())
+            ),
+        );
+    }
 
     // Kriteria chunking:
     // Tabel besar (est_rows >= 150_000), tanpa incremental watermark sempit, dan row_limit tidak di-set kecil (< 150_000)
     let should_chunk = est_rows >= 150_000
         && !has_incremental_watermark
-        && explicit_row_limit.map(|l| l >= 150_000).unwrap_or(true);
+        && effective_row_limit.map(|l| l >= 150_000).unwrap_or(true);
 
     if should_chunk {
         let chunk_size = 100_000usize;
-        let total_chunks = (est_rows + chunk_size - 1) / chunk_size;
+        let effective_est = effective_row_limit.map(|l| l.min(est_rows)).unwrap_or(est_rows);
+        let total_chunks = (effective_est + chunk_size - 1) / chunk_size;
         let safe_table = table_name.replace('`', "``");
 
         let order_clause = if let Some(pk_col) = pk_col_opt {
@@ -1982,7 +1997,8 @@ async fn fetch_table_export_stream(
 
         let mut combined_sql = Vec::new();
         let mut chunk_idx = 0usize;
-        let max_safe_chunks = 500usize;
+        let max_chunks_by_limit = effective_row_limit.map(|l| (l + chunk_size - 1) / chunk_size).unwrap_or(500);
+        let max_safe_chunks = max_chunks_by_limit.min(500);
 
         while chunk_idx < max_safe_chunks {
             if is_user_cancelled() {
@@ -2078,8 +2094,8 @@ async fn fetch_table_export_stream(
     let sql_structure = if is_incremental { "0" } else { "1" };
     let sql_create = if is_incremental { "false" } else { "true" };
 
-    let custom_query_opt = if pma_config.row_limit.filter(|limit| *limit > 0).is_some() || has_incremental_watermark {
-        let limit = pma_config.row_limit.filter(|limit| *limit > 0).unwrap_or(usize::MAX);
+    let custom_query_opt = if effective_row_limit.is_some() || has_incremental_watermark {
+        let limit = effective_row_limit.unwrap_or(usize::MAX);
         let safe_table = table_name.replace('`', "``");
 
         let limited_query = if let Some(watermark) = pma_config
@@ -2628,6 +2644,7 @@ async fn import_table_to_local_with_fallback(
                     cached_endpoint,
                     table_row_counts,
                     app,
+                    None, // Tidak ada limit override pada fallback fresh re-download
                 )
                 .await;
 
@@ -2934,45 +2951,138 @@ pub async fn export_pma_database(
                     None => break,
                 };
 
-                let download_res = fetch_table_export_stream(
-                    &client_p,
-                    &base_url_p,
-                    &csrf_token_p,
-                    &pma_config_p,
-                    &table_name,
-                    &cached_endpoint_p,
-                    &table_row_counts_p,
-                    &app_p,
-                )
-                .await;
+                // === Retry dengan limit dikurangi setengah setiap timeout ===
+                // Percobaan 1: limit asli (misal 500.000)
+                // Percobaan 2: limit / 2 (250.000)
+                // Percobaan 3: limit / 4 (125.000)
+                // Jika 3x timeout berturut-turut → tabel di-skip
+                let per_table_timeout = std::time::Duration::from_secs(120);
+                let base_limit = pma_config_p.row_limit.filter(|l| *l > 0)
+                    .or_else(|| table_row_counts_p.get(&table_name).copied().filter(|r| *r > 0));
+                let max_timeout_retries = 3u32;
+                let mut timeout_attempt = 0u32;
+                let mut maybe_data: Option<DownloadedTableData> = None;
+                let mut table_succeeded = false;
 
-                match download_res {
-                    Ok(maybe_data) => {
-                        let mut sent = false;
-                        while !sent {
-                            if is_user_cancelled() || is_aborted() {
-                                return Err("__WORKER_ABORTED__".to_string());
+                loop {
+                    if is_user_cancelled() {
+                        return Err("__USER_CANCELLED__".to_string());
+                    }
+                    if is_aborted() {
+                        return Err("__WORKER_ABORTED__".to_string());
+                    }
+
+                    // Hitung limit override: bagi 2 setiap kali timeout
+                    let current_limit_override = if timeout_attempt == 0 {
+                        None // Percobaan pertama pakai limit asli dari config
+                    } else {
+                        // Setengah dari limit sebelumnya: base / 2^attempt
+                        let divisor = 1usize << timeout_attempt; // 2, 4, 8, ...
+                        let reduced = base_limit
+                            .map(|bl| (bl / divisor).max(1000)) // minimal 1000 row
+                            .or(Some(50_000 / divisor as usize)); // fallback jika tidak ada estimasi
+                        reduced
+                    };
+
+                    let download_res = tokio::time::timeout(
+                        per_table_timeout,
+                        fetch_table_export_stream(
+                            &client_p,
+                            &base_url_p,
+                            &csrf_token_p,
+                            &pma_config_p,
+                            &table_name,
+                            &cached_endpoint_p,
+                            &table_row_counts_p,
+                            &app_p,
+                            current_limit_override,
+                        ),
+                    )
+                    .await;
+
+                    match download_res {
+                        Ok(Ok(data)) => {
+                            // Berhasil — keluar dari retry loop
+                            maybe_data = data;
+                            table_succeeded = true;
+                            break;
+                        }
+                        Ok(Err(e)) => {
+                            // Download error (bukan timeout) — skip tabel ini
+                            emit_log(
+                                &app_p,
+                                "warn",
+                                format!(
+                                    "⚠️ [Tabel '{}'] Gagal mengunduh export: {}. Tabel di-skip, melanjutkan ke tabel berikutnya...",
+                                    table_name, e
+                                ),
+                            );
+                            break; // keluar retry loop, table_succeeded tetap false
+                        }
+                        Err(_elapsed) => {
+                            timeout_attempt += 1;
+                            if timeout_attempt >= max_timeout_retries {
+                                // 3x timeout berturut-turut → skip tabel
+                                emit_log(
+                                    &app_p,
+                                    "warn",
+                                    format!(
+                                        "⏱️ [Tabel '{}'] TIMEOUT {}x berturut-turut (masing-masing 2 menit). Tabel di-skip, melanjutkan ke tabel berikutnya...",
+                                        table_name, max_timeout_retries
+                                    ),
+                                );
+                                break; // keluar retry loop, table_succeeded tetap false
                             }
-                            tokio::select! {
-                                send_res = tx_c.send(maybe_data.clone()) => {
-                                    if send_res.is_err() {
-                                        return Ok(());
-                                    }
-                                    sent = true;
+
+                            let next_limit = {
+                                let divisor = 1usize << timeout_attempt;
+                                base_limit
+                                    .map(|bl| (bl / divisor).max(1000))
+                                    .unwrap_or(50_000 / divisor)
+                            };
+                            emit_log(
+                                &app_p,
+                                "warn",
+                                format!(
+                                    "⏱️ [Tabel '{}'] TIMEOUT (percobaan {}/{}): Server membutuhkan lebih dari 2 menit. Mencoba ulang dengan limit dikurangi setengah → {} row...",
+                                    table_name, timeout_attempt, max_timeout_retries,
+                                    format_number(next_limit)
+                                ),
+                            );
+                            // Jeda singkat sebelum retry
+                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                        }
+                    }
+                }
+
+                if !table_succeeded {
+                    // Kirim None ke consumer agar counter completed tetap bertambah
+                    let _ = tx_c.send(None).await;
+                    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+                    continue;
+                }
+
+                {
+                    let mut sent = false;
+                    while !sent {
+                        if is_user_cancelled() || is_aborted() {
+                            return Err("__WORKER_ABORTED__".to_string());
+                        }
+                        tokio::select! {
+                            send_res = tx_c.send(maybe_data.clone()) => {
+                                if send_res.is_err() {
+                                    return Ok(());
                                 }
-                                _ = tokio::time::sleep(tokio::time::Duration::from_millis(150)) => {
-                                    // Periodic cancellation check
-                                }
+                                sent = true;
+                            }
+                            _ = tokio::time::sleep(tokio::time::Duration::from_millis(150)) => {
+                                // Periodic cancellation check
                             }
                         }
+                    }
 
-                        // Jeda throttling antar tabel (300ms) agar server remote hosting tidak kehabisan CPU / terkena CloudLinux LVE throttle
-                        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-                    }
-                    Err(e) => {
-                        WORKER_ABORT_REQUESTED.store(true, Ordering::SeqCst);
-                        return Err(e);
-                    }
+                    // Jeda throttling antar tabel (300ms) agar server remote hosting tidak kehabisan CPU / terkena CloudLinux LVE throttle
+                    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
                 }
             }
             Ok::<(), String>(())
