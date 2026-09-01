@@ -66,6 +66,41 @@ jobs:
         run: npm ci
       - name: Build frontend
         run: npm run build
+      - name: Fetch all tags for changelog
+        run: git fetch --tags --force
+
+      - name: Generate release notes from commits
+        id: release_notes
+        shell: bash
+        run: |
+          # Cari tag sebelumnya
+          CURRENT_TAG="${GITHUB_REF_NAME}"
+          PREVIOUS_TAG=$(git tag --sort=-creatordate | grep -v "^${CURRENT_TAG}$" | head -n 1)
+
+          echo "Current tag: $CURRENT_TAG"
+          echo "Previous tag: $PREVIOUS_TAG"
+
+          # Generate daftar commit
+          if [ -n "$PREVIOUS_TAG" ]; then
+            COMMITS=$(git log "${PREVIOUS_TAG}..${CURRENT_TAG}" --pretty=format:"- %s (%h)" --no-merges)
+            HEADER="## 📋 Changelog (since ${PREVIOUS_TAG})"
+          else
+            COMMITS=$(git log --pretty=format:"- %s (%h)" --no-merges -20)
+            HEADER="## 📋 Changelog"
+          fi
+
+          # Tulis multi-line output ke GITHUB_OUTPUT dengan heredoc delimiter
+          {
+            echo "body<<RELEASE_EOF"
+            echo "$HEADER"
+            echo ""
+            echo "$COMMITS"
+            echo ""
+            echo "---"
+            echo "_Automatic build for ${CURRENT_TAG}_"
+            echo "RELEASE_EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Build and publish Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
@@ -76,7 +111,7 @@ jobs:
           args: --bundles ${{ matrix.bundles }} ${{ matrix.tauri_args }}
           tagName: ${{ github.ref_name }}
           releaseName: ${{ github.ref_name }}
-          releaseBody: Automatic build for ${{ github.ref_name }}
+          releaseBody: ${{ steps.release_notes.outputs.body }}
           releaseDraft: false
           prerelease: false
 
