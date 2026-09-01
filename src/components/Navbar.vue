@@ -85,9 +85,10 @@ defineEmits(['trigger-sync']);
   align-items: center;
   justify-content: space-between;
   padding: 12px 24px;
-  background: rgba(15, 23, 42, 0.85);
-  backdrop-filter: blur(12px);
+  background: #11141b;
   border-bottom: 1px solid var(--border-color);
+  transform: translateZ(0);
+  z-index: 10;
 }
 
 .nav-brand {

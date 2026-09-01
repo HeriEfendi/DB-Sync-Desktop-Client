@@ -669,6 +669,9 @@ const formatDuration = (ms) => {
   overflow-y: auto;
   overflow-x: auto;
   overscroll-behavior: contain;
+  transform: translateZ(0);
+  contain: content;
+  -webkit-overflow-scrolling: touch;
 }
 
 .states-table {
@@ -688,8 +691,7 @@ const formatDuration = (ms) => {
   position: sticky;
   top: 0;
   z-index: 2;
-  background: rgba(10, 17, 35, 0.95);
-  backdrop-filter: blur(4px);
+  background: #0e1526;
   color: var(--text-dim);
   font-weight: 600;
   text-transform: uppercase;

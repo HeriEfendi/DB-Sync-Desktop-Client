@@ -369,6 +369,9 @@ const deleteTableTemplate = () => {
   overflow-x: hidden;
   overflow-y: auto;
   overscroll-behavior: contain;
+  transform: translateZ(0);
+  contain: content;
+  -webkit-overflow-scrolling: touch;
 }
 
 .empty-tables-hint {

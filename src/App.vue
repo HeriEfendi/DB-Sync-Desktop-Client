@@ -627,8 +627,10 @@ const handleStartSync = async () => {
 };
 </script>
 
+<style>
 .app-layout { display:flex; flex-direction:column; width:100%; height:100vh; min-width:0; overflow:hidden; }
 .desktop-frame { flex:1 1 auto; width:100%; min-width:0; }
 .desktop-content { width:100%; min-width:0; }
 .browser-banner { flex:0 0 auto; }
+</style>
 

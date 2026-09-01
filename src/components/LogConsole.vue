@@ -193,6 +193,9 @@ const copyLogs = () => {
   line-height: 1.6;
   background: #090d16;
   overscroll-behavior: contain;
+  transform: translateZ(0);
+  contain: content;
+  -webkit-overflow-scrolling: touch;
   user-select: text !important;
   -webkit-user-select: text !important;
   cursor: text;
