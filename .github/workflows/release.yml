@@ -42,6 +42,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
       - name: Setup Node
         uses: actions/setup-node@v5
         with:
@@ -80,13 +82,22 @@ jobs:
           echo "Current tag: $CURRENT_TAG"
           echo "Previous tag: $PREVIOUS_TAG"
 
-          # Generate daftar commit
+          # Generate daftar commit & merge
           if [ -n "$PREVIOUS_TAG" ]; then
-            COMMITS=$(git log "${PREVIOUS_TAG}..${CURRENT_TAG}" --pretty=format:"- %s (%h)" --no-merges)
-            HEADER="## 📋 Changelog (since ${PREVIOUS_TAG})"
+            HEADER="### 📋 Changelog (since ${PREVIOUS_TAG})"
+            RAW_COMMITS=$(git log "${PREVIOUS_TAG}..${CURRENT_TAG}" --pretty=format:"- %s (%h)")
           else
-            COMMITS=$(git log --pretty=format:"- %s (%h)" --no-merges -20)
-            HEADER="## 📋 Changelog"
+            HEADER="### 📋 Changelog"
+            RAW_COMMITS=$(git log --pretty=format:"- %s (%h)" -20)
+          fi
+
+          # Filter commit release bump agar daftar perubahan fitur/merge lebih jelas terlihat
+          COMMITS=$(echo "$RAW_COMMITS" | grep -v -E "^- Release v[0-9]" || true)
+          if [ -z "$COMMITS" ]; then
+            COMMITS="$RAW_COMMITS"
+          fi
+          if [ -z "$COMMITS" ]; then
+            COMMITS="- No new changes documented."
           fi
 
           # Tulis multi-line output ke GITHUB_OUTPUT dengan heredoc delimiter
