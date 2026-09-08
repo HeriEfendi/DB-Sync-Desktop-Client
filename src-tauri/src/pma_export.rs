@@ -1,8 +1,6 @@
 use crate::commands::LocalDbConfig;
-use flate2::read::MultiGzDecoder;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::io::Read;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -1576,9 +1574,9 @@ fn format_number(n: usize) -> String {
 }
 
 fn decompress_gzip_bytes(bytes: &[u8]) -> Result<Vec<u8>, std::io::Error> {
-    use flate2::read::GzDecoder;
+    use flate2::read::MultiGzDecoder;
     use std::io::Read;
-    let mut decoder = GzDecoder::new(bytes);
+    let mut decoder = MultiGzDecoder::new(bytes);
     let mut decompressed = Vec::new();
     decoder.read_to_end(&mut decompressed)?;
     Ok(decompressed)
@@ -2312,12 +2310,8 @@ async fn import_table_to_local_internal(
         response_bytes.len() >= 2 && response_bytes[0] == 0x1f && response_bytes[1] == 0x8b;
 
     let sql_bytes = if is_actual_gzip {
-        let mut decoder = MultiGzDecoder::new(std::io::Cursor::new(response_bytes));
-        let mut decoded = Vec::new();
-        decoder
-            .read_to_end(&mut decoded)
-            .map_err(|e| format!("GZIP export tidak valid: {}", e))?;
-        decoded
+        decompress_gzip_bytes(&response_bytes)
+            .map_err(|e| format!("GZIP export tidak valid: {}", e))?
     } else {
         response_bytes
     };
@@ -2357,6 +2351,9 @@ async fn import_table_to_local_internal(
             if is_actual_gzip { "GZIP" } else { "SQL/raw" }
         ),
     );
+
+    let sql_bytes_arc = std::sync::Arc::new(sql_bytes);
+    let total_sql_len = sql_bytes_arc.len();
 
     let max_retries = 3;
     let mut attempt = 0;
@@ -2415,10 +2412,9 @@ async fn import_table_to_local_internal(
             .take()
             .ok_or_else(|| "Gagal membuka STDERR child process mysql".to_string())?;
 
-        let sql_bytes_clone = sql_bytes.clone();
+        let sql_bytes_task = sql_bytes_arc.clone();
         let app_handle = app.clone();
         let table_name_clone = table_name.to_string();
-        let total_sql_len = sql_bytes_clone.len();
 
         let stdin_task = tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
@@ -2442,8 +2438,11 @@ async fn import_table_to_local_internal(
             let mut last_logged_written = 0usize;
 
             while written < total_sql_len {
+                if is_user_cancelled() || is_aborted() {
+                    return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "Interrupted by user"));
+                }
                 let end = (written + chunk_size).min(total_sql_len);
-                child_stdin.write_all(&sql_bytes_clone[written..end]).await?;
+                child_stdin.write_all(&sql_bytes_task[written..end]).await?;
                 written = end;
 
                 // Log live import streaming progress every 3 seconds for large SQL (> 3 MB)
@@ -2485,11 +2484,28 @@ async fn import_table_to_local_internal(
             err_buf
         });
 
-        let (status_res, stdin_res, stderr_res) = tokio::join!(
-            child.wait(),
-            stdin_task,
-            stderr_task
-        );
+        let mut cancelled = false;
+        let status_res = loop {
+            tokio::select! {
+                status = child.wait() => {
+                    break status;
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(150)) => {
+                    if is_user_cancelled() || is_aborted() {
+                        cancelled = true;
+                        let _ = child.start_kill();
+                        break child.wait().await;
+                    }
+                }
+            }
+        };
+
+        let stdin_res = stdin_task.await;
+        let stderr_res = stderr_task.await;
+
+        if cancelled {
+            return Err("__USER_CANCELLED__".to_string());
+        }
 
         let status = status_res.map_err(|e| format!("Gagal menunggu child process mysql: {}", e))?;
         let write_res = stdin_res.unwrap_or_else(|e| Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())));
@@ -2560,7 +2576,6 @@ async fn import_table_to_local_internal(
         return Err(last_error);
     }
 
-    let imported_rows = count_imported_sql_rows(&sql_bytes);
 
     let elapsed = table_start.elapsed();
     let elapsed_str = if elapsed.as_secs() >= 60 {
@@ -3269,21 +3284,4 @@ pub async fn export_pma_database(
         "Berhasil menyinkronkan {} tabel via Direct GZIP Stream ({} Workers).",
         total_tables, concurrency
     ))
-}
-
-mod urlencoding {
-    pub fn encode(s: &str) -> String {
-        let mut result = String::new();
-        for c in s.chars() {
-            match c {
-                'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' | '~' => result.push(c),
-                _ => {
-                    for b in c.to_string().bytes() {
-                        result.push_str(&format!("%{:02X}", b));
-                    }
-                }
-            }
-        }
-        result
-    }
 }

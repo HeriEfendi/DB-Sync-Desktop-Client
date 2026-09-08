@@ -68,7 +68,6 @@ import ConnectionConfigSection from './components/ConnectionConfigSection.vue';
 import TableConfig from './components/TableConfig.vue';
 import SyncControl from './components/SyncControl.vue';
 import LogConsole from './components/LogConsole.vue';
-// import DataPreview from './components/DataPreview.vue';
 import { PmaClient } from './services/pmaClient.js';
 import { SyncEngine } from './services/syncEngine.js';
 import { isTauriEnvironment, safeInvoke } from './services/tauriHelper.js';
@@ -78,26 +77,7 @@ import { getVersion } from '@tauri-apps/api/app';
 
 const isTauri = ref(isTauriEnvironment());
 const appVersion = ref(packageJson.version);
-const activeNav = ref('connections');
 const tableStates = ref([]);
-
-const selectNav = (item) => {
-  activeNav.value = item;
-
-  if (item === 'connections') {
-    document.querySelector('[data-tab="remote"]')?.click();
-    document.querySelector('.grid-top')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-    return;
-  }
-
-  if (item === 'tables') {
-    document.querySelector('[data-tab="tables"]')?.click();
-    document.querySelector('.grid-top')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-    return;
-  }
-
-  document.querySelector('.sync-control-card')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-};
 
 // Connection state
 const pmaConfig = ref({
@@ -500,46 +480,6 @@ const testLocalConnection = async () => {
   }
 };
 
-// Fetch preview of local MySQL table
-const fetchLocalPreview = async () => {
-  const targetTable = (selectedTables.value && selectedTables.value.length > 0)
-    ? selectedTables.value[0]
-    : (localConfig.value.table || pmaConfig.value.table);
-
-  addLog({
-    type: 'info',
-    message: `Mengambil data preview dari tabel MySQL lokal: ${targetTable}...`,
-    timestamp: new Date().toLocaleTimeString(),
-  });
-
-  try {
-    const rows = await safeInvoke('get_local_table_preview', {
-      config: {
-        host: localConfig.value.host || '127.0.0.1',
-        port: parseInt(localConfig.value.port || 3306, 10),
-        username: localConfig.value.username || 'root',
-        password: localConfig.value.password || '',
-        database: localConfig.value.database || '',
-      },
-      tableName: targetTable,
-      limit: 20,
-    });
-
-    previewRows.value = rows;
-    addLog({
-      type: 'success',
-      message: `Berhasil mengambil ${rows.length} baris preview dari tabel lokal '${targetTable}'.`,
-      timestamp: new Date().toLocaleTimeString(),
-    });
-  } catch (err) {
-    addLog({
-      type: 'error',
-      message: `Gagal mengambil data preview lokal: ${err.message || err}`,
-      timestamp: new Date().toLocaleTimeString(),
-    });
-  }
-};
-
 // Live sync progress tracking
 let activeEngineInstance = null;
 
@@ -611,7 +551,6 @@ const handleStartSync = async () => {
     if (res && res.success) {
       pmaStatus.value.connected = true;
       localStatus.value.connected = true;
-      if (res.fetchedRows && res.fetchedRows.length > 0) previewRows.value = res.fetchedRows;
     }
   } catch (err) {
     addLog({

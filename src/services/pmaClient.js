@@ -1,11 +1,5 @@
 import { safeFetch } from './tauriHelper.js';
 
-/**
- * Strip PMA sort-order indicators from field names.
- * PMA sometimes appends " 1", " 2" etc. to column names in AJAX responses
- * to indicate sort position. Example: "id 1" → "id", "name 2" → "name".
- * Only strips trailing " <digit(s)>" — leaves names like "address2" untouched.
- */
 function cleanFieldName(name) {
   if (!name || typeof name !== 'string') return name;
   return name.replace(/\s+\d+$/, '').trim();
@@ -25,7 +19,6 @@ export class PmaClient {
     this.primaryKey = config.primaryKey || 'id';
     this.cookieHeader = '';
     this.token = '';
-    this._columnCache = new Map();
   }
 
   /**
@@ -352,163 +345,9 @@ export class PmaClient {
     return Array.from(new Set(tables)).map((t) => ({ table_name: t }));
   }
 
-  /**
-   * Resolve the actual primary key column for a table from PMA information_schema.
-   * Returns the configured fallback if metadata lookup fails.
-   */
-  async resolvePrimaryKey(tableName) {
-    if (!this.database || !tableName) {
-      return this.primaryKey || null;
-    }
-
-    const escapedDb = this.database.replace(/'/g, "''");
-    const escapedTable = tableName.replace(/'/g, "''");
-    const pkQuery = `SELECT COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA = '${escapedDb}' AND TABLE_NAME = '${escapedTable}' AND CONSTRAINT_NAME = 'PRIMARY' ORDER BY ORDINAL_POSITION ASC LIMIT 1`;
-
-    try {
-      const rows = await this.executePmaAjaxSql(pkQuery);
-      const pk = this._extractPrimaryKeyName(rows);
-      if (pk) return pk;
-    } catch (err) {
-      console.warn('[PMA] resolvePrimaryKey via AJAX failed:', err.message);
-    }
-
-    return this.primaryKey || null;
-  }
 
   /**
-   * Resolve stable table column names from information_schema to keep SQL fragment explicit and lightweight.
-   */
-  async resolveTableColumns(tableName) {
-    if (!this.database || !tableName) return [];
-
-    const safeTableName = String(tableName).trim();
-    if (this._columnCache.has(safeTableName)) {
-      return this._columnCache.get(safeTableName);
-    }
-
-    const escapedDb = this.database.replace(/'/g, "''");
-    const escapedTable = safeTableName.replace(/'/g, "''");
-    const columnsQuery = `SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = '${escapedDb}' AND TABLE_NAME = '${escapedTable}' ORDER BY ORDINAL_POSITION ASC`;
-    const showColumnsQuery = `SHOW COLUMNS FROM \`${escapedTable}\``;
-
-    let resolvedCols = [];
-
-    try {
-      const rows = await this.executePmaAjaxSql(columnsQuery);
-      const cols = [];
-      for (const row of rows) {
-        const colName = row.COLUMN_NAME ?? row.column_name ?? row.Field ?? row.field ?? row.name ?? null;
-        if (typeof colName === 'string' && colName.trim()) {
-          cols.push(colName.trim());
-        }
-      }
-      if (cols.length > 0) {
-        resolvedCols = cols;
-      }
-    } catch (err) {
-      console.warn('[PMA] resolveTableColumns via information_schema failed:', err.message);
-    }
-
-    if (resolvedCols.length === 0) {
-      try {
-        const rows = await this.executePmaAjaxSql(showColumnsQuery);
-        const cols = [];
-        for (const row of rows) {
-          const colName = row.COLUMN_NAME ?? row.column_name ?? row.Field ?? row.field ?? row.name ?? null;
-          if (typeof colName === 'string' && colName.trim()) {
-            cols.push(colName.trim());
-          }
-        }
-        if (cols.length > 0) {
-          resolvedCols = cols;
-        }
-      } catch (err) {
-        console.warn('[PMA] resolveTableColumns via SHOW COLUMNS failed:', err.message);
-      }
-    }
-
-    if (resolvedCols.length > 0) {
-      this._columnCache.set(safeTableName, resolvedCols);
-    }
-
-    return resolvedCols;
-  }
-
-  _extractPrimaryKeyName(rows) {
-    if (!Array.isArray(rows)) return null;
-    for (const row of rows) {
-      const val = row.COLUMN_NAME ?? row.column_name ?? row.Field ?? row.field ?? row.name ?? null;
-      if (typeof val === 'string' && val.trim()) {
-        return val.trim();
-      }
-    }
-    return null;
-  }
-
-  /**
-   * Execute incremental query SELECT * FROM table WHERE pk > lastId ORDER BY pk ASC LIMIT fetchLimit
-   */
-  async fetchIncrementalData(lastId = 0, limit = 500) {
-    if (!this.database || !this.table) {
-      throw new Error('Nama database dan tabel remote PMA belum dikonfigurasi.');
-    }
-
-    const columns = await this.resolveTableColumns(this.table);
-    if (!Array.isArray(columns) || columns.length === 0) {
-      throw new Error(`Tidak dapat mengekstrak metadata kolom tabel '${this.table}' untuk query incremental yang aman.`);
-    }
-
-    const selectClause = columns.map((col) => `\`${col}\``).join(', ');
-
-    let sqlQuery = '';
-    if (this.primaryKey && typeof this.primaryKey === 'string' && this.primaryKey.trim()) {
-      if (lastId !== null && lastId !== undefined && lastId !== '') {
-        const formattedLastId = typeof lastId === 'number' ? lastId : `'${lastId}'`;
-        sqlQuery = `SELECT ${selectClause} FROM \`${this.table}\` WHERE \`${this.primaryKey}\` > ${formattedLastId} ORDER BY \`${this.primaryKey}\` ASC LIMIT ${limit}`;
-      } else {
-        sqlQuery = `SELECT ${selectClause} FROM \`${this.table}\` ORDER BY \`${this.primaryKey}\` ASC LIMIT ${limit}`;
-      }
-    } else {
-      sqlQuery = `SELECT ${selectClause} FROM \`${this.table}\` LIMIT ${limit}`;
-    }
-
-    console.debug('[PMA] fetchIncrementalData SQL:', sqlQuery);
-    const ajaxResult = await this.executePmaAjaxSql(sqlQuery);
-    console.debug(`[PMA] fetchIncrementalData via /sql: ${ajaxResult?.length ?? 0} rows`);
-    return ajaxResult;
-  }
-
-  /**
-   * Fetch rows from PMA where updated_at > sinceTimestamp (for update detection in incremental mode).
-   * Returns empty array if table has no updated_at column or no newer rows found.
-   */
-  async fetchUpdatedRows(sinceTimestamp, limit = 500, offsetRows = 0) {
-    if (!this.database || !this.table) {
-      throw new Error('Nama database dan tabel remote PMA belum dikonfigurasi.');
-    }
-
-    if (sinceTimestamp === null || sinceTimestamp === undefined || sinceTimestamp === '') {
-      return [];
-    }
-
-    const safeTs = String(sinceTimestamp).replace(/'/g, "''");
-    const columns = await this.resolveTableColumns(this.table);
-    if (!Array.isArray(columns) || columns.length === 0) {
-      return [];
-    }
-
-    const selectClause = columns.map((col) => `\`${col}\``).join(', ');
-    const sqlQuery = `SELECT ${selectClause} FROM \`${this.table}\` WHERE \`updated_at\` > '${safeTs}' ORDER BY \`updated_at\` ASC LIMIT ${limit} OFFSET ${offsetRows}`;
-
-    console.debug('[PMA] fetchUpdatedRows SQL:', sqlQuery);
-    const ajaxResult = await this.executePmaAjaxSql(sqlQuery);
-    return ajaxResult || [];
-  }
-
-  /**
-   * Execute SQL query via PMA AJAX SQL execution route.
-   * Expected response shape is structured JSON from PMA's /sql endpoint.
+   * Execute SQL query via PMA AJAX SQL execution route (used as fallback for table listing).
    */
   async executePmaAjaxSql(sqlQuery) {
     const sqlUrl = this.getEndpoint('index.php?route=/sql');

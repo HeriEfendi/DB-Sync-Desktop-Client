@@ -4,10 +4,6 @@
       <div class="title-wrap">
         <div class="title-row">
           <h3>Daftar Tabel</h3>
-          <!-- <span class="selection-badge">
-            <span class="badge-dot"></span>
-            <strong>{{ selectedTables.length }}</strong> dari {{ availableTables.length }} tabel dipilih
-          </span> -->
         </div>
         <p class="subtitle">Pilih tabel yang akan disinkronkan dan simpan template centangan untuk reuse.</p>
       </div>
@@ -114,10 +110,6 @@ const tableStateMap = computed(() => {
   }
   return map;
 });
-
-const getTableState = (tableName) => {
-  return tableStateMap.value.get(tableName) || null;
-};
 
 const formatDate = (isoString) => {
   if (!isoString) return '-';

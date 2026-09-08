@@ -1,3 +1,7 @@
+import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
+import { fetch as tauriFetch } from '@tauri-apps/plugin-http';
+
 /**
  * Helper utility to detect Tauri environment and execute safe IPC invokes and HTTP fetches
  */
@@ -26,25 +30,15 @@ export async function safeInvoke(cmd, args = {}) {
     if (cmd === 'get_all_tables_last_local_ids') {
       return {};
     }
-    if (cmd === 'get_local_table_preview') {
-      return [];
-    }
-    if (cmd === 'sync_to_local_db') {
-      throw new Error(
-        'Sinkronisasi ke MySQL lokal port 3306 memerlukan runtime Tauri. Jalankan `npm run tauri dev` pada terminal.'
-      );
-    }
     throw new Error('Fitur ini memerlukan runtime desktop Tauri.');
   }
 
-  const { invoke } = await import('@tauri-apps/api/core');
   return await invoke(cmd, args);
 }
 
 export async function safeFetch(url, options = {}) {
   if (isTauriEnvironment()) {
     try {
-      const { fetch: tauriFetch } = await import('@tauri-apps/plugin-http');
       return await tauriFetch(url, options);
     } catch (e) {
       console.warn('Tauri HTTP fetch error:', e);
@@ -59,7 +53,6 @@ export async function safeListen(eventName, handler) {
     return () => {};
   }
   try {
-    const { listen } = await import('@tauri-apps/api/event');
     return await listen(eventName, handler);
   } catch (e) {
     console.warn(`[Tauri Event] Gagal mendaftarkan listener '${eventName}':`, e);

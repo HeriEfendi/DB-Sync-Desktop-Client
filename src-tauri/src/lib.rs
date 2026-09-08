@@ -13,10 +13,6 @@ pub fn run() {
             commands::get_last_local_id,
             commands::get_all_tables_last_local_ids,
             commands::delete_local_rows_after_id,
-            commands::get_local_max_updated_at,
-            commands::sync_to_local_db,
-            commands::get_local_table_preview,
-            commands::truncate_local_table,
             pma_export::export_pma_database,
             pma_export::get_pma_tables,
             pma_export::cancel_pma_export
