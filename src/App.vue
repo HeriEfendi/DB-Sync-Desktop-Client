@@ -96,6 +96,8 @@ const localConfig = ref({
   password: '',
   database: 'sample_db',
   table: 'users',
+  use_docker: false,
+  docker_container: '',
 });
 
 // Multi-table & Sync options state
@@ -445,9 +447,13 @@ const testPmaConnection = async () => {
 // Test Local MySQL connection via Rust IPC
 const testLocalConnection = async () => {
   testingLocal.value = true;
+  const targetDesc = localConfig.value.use_docker && localConfig.value.docker_container
+    ? `Docker [${localConfig.value.docker_container}] & ${localConfig.value.host}:${localConfig.value.port || 3306}`
+    : `${localConfig.value.host}:${localConfig.value.port || 3306}`;
+
   addLog({
     type: 'info',
-    message: `Menguji koneksi port native MySQL lokal (${localConfig.value.host}:${localConfig.value.port || 3306})...`,
+    message: `Menguji koneksi port native MySQL lokal (${targetDesc})...`,
     timestamp: new Date().toLocaleTimeString(),
   });
 
@@ -459,6 +465,8 @@ const testLocalConnection = async () => {
         username: localConfig.value.username || 'root',
         password: localConfig.value.password || '',
         database: localConfig.value.database || '',
+        use_docker: Boolean(localConfig.value.use_docker),
+        docker_container: localConfig.value.docker_container || '',
       },
     });
 

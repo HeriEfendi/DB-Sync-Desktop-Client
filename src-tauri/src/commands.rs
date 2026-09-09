@@ -12,6 +12,10 @@ pub struct LocalDbConfig {
     pub username: String,
     pub password: String,
     pub database: String,
+    #[serde(default)]
+    pub use_docker: bool,
+    #[serde(default)]
+    pub docker_container: String,
 }
 
 /// Helper function to build MySQL connection URL
@@ -108,6 +112,44 @@ pub async fn test_local_connection(config: LocalDbConfig) -> Result<String, Stri
         .map_err(|e| format!("Gagal mengambil versi MySQL: {}", e))?;
 
     pool.close().await;
+
+    if config.use_docker {
+        let container = config.docker_container.trim();
+        if container.is_empty() {
+            return Err("Opsi Docker diaktifkan, namun 'Nama / ID Kontainer Docker' masih kosong.".to_string());
+        }
+
+        let docker_check = std::process::Command::new("docker")
+            .arg("exec")
+            .arg(container)
+            .arg("mysql")
+            .arg("--version")
+            .output();
+
+        match docker_check {
+            Ok(out) => {
+                if out.status.success() {
+                    let docker_ver = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    return Ok(format!(
+                        "Koneksi TCP berhasil (Server: {}) | Docker [{}]: {}",
+                        row.0, container, docker_ver
+                    ));
+                } else {
+                    let err_msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                    return Err(format!(
+                        "Koneksi TCP MySQL berhasil ({}), tetapi 'docker exec' ke kontainer '{}' gagal: {}",
+                        row.0, container, err_msg
+                    ));
+                }
+            }
+            Err(e) => {
+                return Err(format!(
+                    "Koneksi TCP MySQL berhasil ({}), tetapi gagal menjalankan perintah 'docker' pada host: {}",
+                    row.0, e
+                ));
+            }
+        }
+    }
 
     Ok(format!("Koneksi berhasil! Versi Server: {}", row.0))
 }

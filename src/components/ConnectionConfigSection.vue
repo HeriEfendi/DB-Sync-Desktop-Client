@@ -95,6 +95,33 @@
         </div>
       </div>
 
+      <div class="form-row docker-row" style="margin-top: 6px; padding-top: 10px; border-top: 1px dashed rgba(255, 255, 255, 0.08); align-items: flex-start;">
+        <div class="form-group flex-1">
+          <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none;">
+            <input
+              v-model="localConfig.use_docker"
+              type="checkbox"
+              style="cursor: pointer; accent-color: #3b82f6; width: 15px; height: 15px;"
+              @change="$emit('update:local-config', localConfig)"
+            />
+            <span style="font-size: 0.8rem; font-weight: 550; color: var(--text-main, #e5e7eb);">Gunakan Docker Container (docker exec)</span>
+          </label>
+          <p style="font-size: 0.72rem; color: var(--text-muted, #9ca3af); margin-top: 4px; margin-bottom: 0;">
+            Gunakan opsi ini jika MySQL berjalan di Docker dan OS host tidak memiliki client CLI 'mysql'.
+          </p>
+        </div>
+        <div v-if="localConfig.use_docker" class="form-group flex-1">
+          <label class="form-label">Nama / ID Kontainer Docker</label>
+          <input
+            v-model="localConfig.docker_container"
+            type="text"
+            class="form-input"
+            placeholder="misal: my-mysql atau mysql-server"
+            @change="$emit('update:local-config', localConfig)"
+          />
+        </div>
+      </div>
+
       <div class="action-bar">
         <button class="btn btn-secondary btn-sm" :disabled="testingLocal" @click="$emit('test-local')">
           <span v-if="testingLocal" class="spin-sm"></span>

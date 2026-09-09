@@ -35,6 +35,8 @@ export class SyncEngine {
       username: this.localDbConfig?.username || 'root',
       password: this.localDbConfig?.password || '',
       database: this.localDbConfig?.database || '',
+      use_docker: Boolean(this.localDbConfig?.use_docker),
+      docker_container: this.localDbConfig?.docker_container || '',
     };
   }
 

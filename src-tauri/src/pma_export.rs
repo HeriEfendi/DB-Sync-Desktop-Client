@@ -2359,6 +2359,8 @@ async fn import_table_to_local_internal(
     let mut attempt = 0;
     let mut last_error = String::new();
     let cli_bin = get_mysql_cli_binary();
+    let use_docker = local_config.use_docker && !local_config.docker_container.trim().is_empty();
+    let container_name = local_config.docker_container.trim();
 
     while attempt < max_retries {
         attempt += 1;
@@ -2370,25 +2372,50 @@ async fn import_table_to_local_internal(
             return Err("__WORKER_ABORTED__".to_string());
         }
 
-        let mut cmd = Command::new(cli_bin);
-        cmd.arg("--skip-ssl")
-            .arg("--binary-mode")
-            .arg("--quick")
-            .arg("--max-allowed-packet=512M")
-            .arg("--connect-timeout=60")
-            .arg("--default-character-set=utf8mb4")
-            .arg("-h")
-            .arg(host)
-            .arg("-P")
-            .arg(&port_str)
-            .arg("-u")
-            .arg(&local_config.username);
+        let mut cmd = if use_docker {
+            let mut c = Command::new("docker");
+            c.arg("exec")
+                .arg("-i")
+                .arg(container_name)
+                .arg("mysql")
+                .arg("--skip-ssl")
+                .arg("--binary-mode")
+                .arg("--quick")
+                .arg("--max-allowed-packet=512M")
+                .arg("--connect-timeout=60")
+                .arg("--default-character-set=utf8mb4")
+                .arg("-u")
+                .arg(&local_config.username);
 
-        if !local_config.password.is_empty() {
-            cmd.arg(format!("-p{}", local_config.password));
-        }
+            if !local_config.password.is_empty() {
+                c.arg(format!("-p{}", local_config.password));
+            }
 
-        cmd.arg(db_name);
+            c.arg(db_name);
+            c
+        } else {
+            let mut c = Command::new(cli_bin);
+            c.arg("--skip-ssl")
+                .arg("--binary-mode")
+                .arg("--quick")
+                .arg("--max-allowed-packet=512M")
+                .arg("--connect-timeout=60")
+                .arg("--default-character-set=utf8mb4")
+                .arg("-h")
+                .arg(host)
+                .arg("-P")
+                .arg(&port_str)
+                .arg("-u")
+                .arg(&local_config.username);
+
+            if !local_config.password.is_empty() {
+                c.arg(format!("-p{}", local_config.password));
+            }
+
+            c.arg(db_name);
+            c
+        };
+
         cmd.stdin(Stdio::piped());
         cmd.stderr(Stdio::piped());
         cmd.stdout(Stdio::null());
@@ -2396,10 +2423,17 @@ async fn import_table_to_local_internal(
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
-                return Err(format!(
-                    "Gagal menjalankan perintah CLI '{}'. Pastikan client MySQL/MariaDB terinstall dan ada di PATH system. Error: {}",
-                    cli_bin, e
-                ));
+                if use_docker {
+                    return Err(format!(
+                        "Gagal menjalankan perintah 'docker exec -i {} mysql'. Pastikan Docker service berjalan dan nama kontainer benar. Error: {}",
+                        container_name, e
+                    ));
+                } else {
+                    return Err(format!(
+                        "Gagal menjalankan perintah CLI '{}'. Pastikan client MySQL/MariaDB terinstall dan ada di PATH system. Error: {}",
+                        cli_bin, e
+                    ));
+                }
             }
         };
 
@@ -2754,20 +2788,8 @@ async fn ensure_local_database_exists(local_config: &LocalDbConfig, app: &tauri:
         local_config.port.to_string()
     };
 
-    let cli_bin = get_mysql_cli_binary();
-    let mut cmd = Command::new(cli_bin);
-    cmd.arg("--skip-ssl")
-        .arg("--connect-timeout=60")
-        .arg("-h")
-        .arg(host)
-        .arg("-P")
-        .arg(&port_str)
-        .arg("-u")
-        .arg(&local_config.username);
-
-    if !local_config.password.is_empty() {
-        cmd.arg(format!("-p{}", local_config.password));
-    }
+    let use_docker = local_config.use_docker && !local_config.docker_container.trim().is_empty();
+    let container_name = local_config.docker_container.trim();
 
     let db_name = if local_config.database.is_empty() {
         "db_sync"
@@ -2779,7 +2801,47 @@ async fn ensure_local_database_exists(local_config: &LocalDbConfig, app: &tauri:
         db_name.replace('`', "``")
     );
 
-    cmd.arg("-e").arg(&create_sql);
+    let mut cmd = if use_docker {
+        let mut c = Command::new("docker");
+        c.arg("exec")
+            .arg(container_name)
+            .arg("mysql")
+            .arg("--skip-ssl")
+            .arg("--connect-timeout=60")
+            .arg("-u")
+            .arg(&local_config.username);
+
+        if !local_config.password.is_empty() {
+            c.arg(format!("-p{}", local_config.password));
+        }
+
+        c.arg("-e").arg(&create_sql);
+        c
+    } else {
+        let cli_bin = get_mysql_cli_binary();
+        let mut c = Command::new(cli_bin);
+        c.arg("--skip-ssl")
+            .arg("--connect-timeout=60")
+            .arg("-h")
+            .arg(host)
+            .arg("-P")
+            .arg(&port_str)
+            .arg("-u")
+            .arg(&local_config.username);
+
+        if !local_config.password.is_empty() {
+            c.arg(format!("-p{}", local_config.password));
+        }
+
+        c.arg("-e").arg(&create_sql);
+        c
+    };
+
+    let target_desc = if use_docker {
+        format!("Docker ('{}')", container_name)
+    } else {
+        "MySQL CLI".to_string()
+    };
 
     match cmd.output().await {
         Ok(out) => {
@@ -2789,8 +2851,9 @@ async fn ensure_local_database_exists(local_config: &LocalDbConfig, app: &tauri:
                     app,
                     "warn",
                     format!(
-                        "Gagal membuat database lokal '{}' via MySQL CLI: {}",
+                        "Gagal membuat database lokal '{}' via {}: {}",
                         db_name,
+                        target_desc,
                         err.trim()
                     ),
                 );
@@ -2807,8 +2870,8 @@ async fn ensure_local_database_exists(local_config: &LocalDbConfig, app: &tauri:
                 app,
                 "warn",
                 format!(
-                    "Gagal mengecek/membuat database lokal '{}': {}",
-                    db_name, e
+                    "Gagal mengecek/membuat database lokal '{}' via {}: {}",
+                    db_name, target_desc, e
                 ),
             );
         }
