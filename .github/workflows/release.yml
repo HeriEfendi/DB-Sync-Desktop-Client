@@ -83,11 +83,10 @@ jobs:
           echo "Previous tag: $PREVIOUS_TAG"
 
           # Generate daftar commit & merge
+          HEADER="### What's Changed"
           if [ -n "$PREVIOUS_TAG" ]; then
-            HEADER="### 📋 Changelog (since ${PREVIOUS_TAG})"
             RAW_COMMITS=$(git log "${PREVIOUS_TAG}..${CURRENT_TAG}" --pretty=format:"- %s (%h)")
           else
-            HEADER="### 📋 Changelog"
             RAW_COMMITS=$(git log --pretty=format:"- %s (%h)" -20)
           fi
 
