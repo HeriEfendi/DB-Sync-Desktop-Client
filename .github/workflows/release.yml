@@ -105,9 +105,6 @@ jobs:
             echo "$HEADER"
             echo ""
             echo "$COMMITS"
-            echo ""
-            echo "---"
-            echo "_Automatic build for ${CURRENT_TAG}_"
             echo "RELEASE_EOF"
           } >> "$GITHUB_OUTPUT"
 
