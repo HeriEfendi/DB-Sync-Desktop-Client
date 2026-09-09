@@ -2233,6 +2233,52 @@ fn get_mysql_cli_binary() -> &'static str {
     })
 }
 
+pub fn get_docker_mysql_cli(container: &str) -> String {
+    static DOCKER_CLI_CACHE: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+    if let Ok(cache) = DOCKER_CLI_CACHE.lock() {
+        if let Some(cli) = cache.get(container) {
+            return cli.clone();
+        }
+    }
+
+    let detected = if let Ok(out) = std::process::Command::new("docker")
+        .arg("exec")
+        .arg(container)
+        .arg("mysql")
+        .arg("--version")
+        .output()
+    {
+        if out.status.success() {
+            "mysql".to_string()
+        } else if let Ok(out_m) = std::process::Command::new("docker")
+            .arg("exec")
+            .arg(container)
+            .arg("mariadb")
+            .arg("--version")
+            .output()
+        {
+            if out_m.status.success() {
+                "mariadb".to_string()
+            } else {
+                "mysql".to_string()
+            }
+        } else {
+            "mysql".to_string()
+        }
+    } else {
+        "mysql".to_string()
+    };
+
+    if let Ok(mut cache) = DOCKER_CLI_CACHE.lock() {
+        cache.insert(container.to_string(), detected.clone());
+    }
+
+    detected
+}
+
+
 /// Helper deteksi error ketidakcocokan skema / kolom / struktur tabel MySQL
 fn is_schema_mismatch_error(err: &str) -> bool {
     let lower = err.to_lowercase();
@@ -2372,12 +2418,18 @@ async fn import_table_to_local_internal(
             return Err("__WORKER_ABORTED__".to_string());
         }
 
+        let docker_cli = if use_docker {
+            get_docker_mysql_cli(container_name)
+        } else {
+            String::new()
+        };
+
         let mut cmd = if use_docker {
             let mut c = Command::new("docker");
             c.arg("exec")
                 .arg("-i")
                 .arg(container_name)
-                .arg("mysql")
+                .arg(&docker_cli)
                 .arg("--skip-ssl")
                 .arg("--binary-mode")
                 .arg("--quick")
@@ -2425,8 +2477,8 @@ async fn import_table_to_local_internal(
             Err(e) => {
                 if use_docker {
                     return Err(format!(
-                        "Gagal menjalankan perintah 'docker exec -i {} mysql'. Pastikan Docker service berjalan dan nama kontainer benar. Error: {}",
-                        container_name, e
+                        "Gagal menjalankan perintah 'docker exec -i {} {}'. Pastikan Docker service berjalan dan nama kontainer benar. Error: {}",
+                        container_name, docker_cli, e
                     ));
                 } else {
                     return Err(format!(
@@ -2802,10 +2854,11 @@ async fn ensure_local_database_exists(local_config: &LocalDbConfig, app: &tauri:
     );
 
     let mut cmd = if use_docker {
+        let docker_cli = get_docker_mysql_cli(container_name);
         let mut c = Command::new("docker");
         c.arg("exec")
             .arg(container_name)
-            .arg("mysql")
+            .arg(&docker_cli)
             .arg("--skip-ssl")
             .arg("--connect-timeout=60")
             .arg("-u")
@@ -2846,7 +2899,19 @@ async fn ensure_local_database_exists(local_config: &LocalDbConfig, app: &tauri:
     match cmd.output().await {
         Ok(out) => {
             if !out.status.success() {
-                let err = String::from_utf8_lossy(&out.stderr);
+                let err = {
+                    let s = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                    if s.is_empty() {
+                        let st = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                        if st.is_empty() {
+                            format!("Status keluar: {:?}", out.status.code())
+                        } else {
+                            st
+                        }
+                    } else {
+                        s
+                    }
+                };
                 emit_log(
                     app,
                     "warn",
@@ -2854,7 +2919,7 @@ async fn ensure_local_database_exists(local_config: &LocalDbConfig, app: &tauri:
                         "Gagal membuat database lokal '{}' via {}: {}",
                         db_name,
                         target_desc,
-                        err.trim()
+                        err
                     ),
                 );
             } else {

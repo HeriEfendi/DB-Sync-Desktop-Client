@@ -119,32 +119,85 @@ pub async fn test_local_connection(config: LocalDbConfig) -> Result<String, Stri
             return Err("Opsi Docker diaktifkan, namun 'Nama / ID Kontainer Docker' masih kosong.".to_string());
         }
 
-        let docker_check = std::process::Command::new("docker")
+        let extract_output = |out: &std::process::Output| -> String {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !stderr.is_empty() {
+                stderr
+            } else if !stdout.is_empty() {
+                stdout
+            } else {
+                format!("Kode status keluar: {:?}", out.status.code().unwrap_or(-1))
+            }
+        };
+
+        // 1. Coba perintah 'mysql --version' di dalam kontainer
+        let docker_check_mysql = std::process::Command::new("docker")
             .arg("exec")
             .arg(container)
             .arg("mysql")
             .arg("--version")
             .output();
 
-        match docker_check {
-            Ok(out) => {
-                if out.status.success() {
-                    let docker_ver = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                    return Ok(format!(
-                        "Koneksi TCP berhasil (Server: {}) | Docker [{}]: {}",
-                        row.0, container, docker_ver
-                    ));
-                } else {
-                    let err_msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                    return Err(format!(
-                        "Koneksi TCP MySQL berhasil ({}), tetapi 'docker exec' ke kontainer '{}' gagal: {}",
-                        row.0, container, err_msg
-                    ));
+        match docker_check_mysql {
+            Ok(out) if out.status.success() => {
+                let docker_ver = {
+                    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    if s.is_empty() {
+                        String::from_utf8_lossy(&out.stderr).trim().to_string()
+                    } else {
+                        s
+                    }
+                };
+                return Ok(format!(
+                    "Koneksi TCP berhasil (Server: {}) | Docker [{}] (MySQL CLI): {}",
+                    row.0, container, docker_ver
+                ));
+            }
+            Ok(out_mysql) => {
+                // 2. Jika 'mysql' gagal, coba 'mariadb --version' (image MariaDB baru seperti Ubuntu 24.04 menggunakan binary 'mariadb')
+                let docker_check_mariadb = std::process::Command::new("docker")
+                    .arg("exec")
+                    .arg(container)
+                    .arg("mariadb")
+                    .arg("--version")
+                    .output();
+
+                match docker_check_mariadb {
+                    Ok(out_maria) if out_maria.status.success() => {
+                        let docker_ver = {
+                            let s = String::from_utf8_lossy(&out_maria.stdout).trim().to_string();
+                            if s.is_empty() {
+                                String::from_utf8_lossy(&out_maria.stderr).trim().to_string()
+                            } else {
+                                s
+                            }
+                        };
+                        return Ok(format!(
+                            "Koneksi TCP berhasil (Server: {}) | Docker [{}] (MariaDB CLI): {}",
+                            row.0, container, docker_ver
+                        ));
+                    }
+                    Ok(out_maria) => {
+                        let err_mysql = extract_output(&out_mysql);
+                        let err_maria = extract_output(&out_maria);
+                        return Err(format!(
+                            "Koneksi TCP MySQL berhasil ({}), tetapi 'docker exec' ke kontainer '{}' gagal.\n• mysql: {}\n• mariadb: {}",
+                            row.0, container, err_mysql, err_maria
+                        ));
+                    }
+                    Err(e) => {
+                        let err_mysql = extract_output(&out_mysql);
+                        return Err(format!(
+                            "Koneksi TCP MySQL berhasil ({}), tetapi 'docker exec' ke kontainer '{}' gagal: {}\n(Error sistem: {})",
+                            row.0, container, err_mysql, e
+                        ));
+                    }
                 }
             }
             Err(e) => {
                 return Err(format!(
-                    "Koneksi TCP MySQL berhasil ({}), tetapi gagal menjalankan perintah 'docker' pada host: {}",
+                    "Koneksi TCP MySQL berhasil ({}), tetapi gagal menjalankan perintah 'docker' pada host: {}. Pastikan Docker terinstall dan ada di PATH sistem.",
                     row.0, e
                 ));
             }
