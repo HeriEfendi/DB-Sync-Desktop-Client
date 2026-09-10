@@ -80,7 +80,8 @@ const filteredLogs = computed(() => {
   const filter = currentFilter.value;
   const result = [];
 
-  for (let i = props.logs.length - 1; i >= 0 && result.length < 100; i--) {
+  const startIdx = Math.max(0, props.logs.length - 100);
+  for (let i = startIdx; i < props.logs.length; i++) {
     const log = props.logs[i];
     const normalizedType = log.type === 'warn' ? 'warning' : log.type;
     if (filter !== 'all' && normalizedType !== filter) continue;
@@ -90,13 +91,13 @@ const filteredLogs = computed(() => {
   return result;
 });
 
-// Auto-scroll to top on new log entry (since newest logs are at the top)
+// Auto-scroll to bottom on new log entry (standard terminal behavior)
 watch(
   () => props.logs.length,
   async () => {
     await nextTick();
     if (logContainer.value) {
-      logContainer.value.scrollTop = 0;
+      logContainer.value.scrollTop = logContainer.value.scrollHeight;
     }
   }
 );
