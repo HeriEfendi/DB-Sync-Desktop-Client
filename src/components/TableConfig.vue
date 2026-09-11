@@ -85,6 +85,7 @@
 import { ref, computed, watch, onMounted } from 'vue';
 
 const props = defineProps({
+  serverKey: { type: String, default: 'default' },
   selectedTables: { type: Array, default: () => [] },
   availableTables: { type: Array, default: () => [] },
   fetchingTables: { type: Boolean, default: false },
@@ -131,8 +132,47 @@ watch(tableSearchQuery, () => {
   displayLimit.value = 60;
 });
 
+const getTemplatesStorageKey = () => `db_sync_table_templates_${props.serverKey || 'default'}`;
+const getLastTemplateStorageKey = () => `db_sync_last_table_template_${props.serverKey || 'default'}`;
+
+watch(selectedTemplateName, (name) => {
+  const lastKey = getLastTemplateStorageKey();
+  if (name) {
+    localStorage.setItem(lastKey, name);
+  } else {
+    localStorage.removeItem(lastKey);
+  }
+});
+
+watch(() => props.serverKey, (newKey) => {
+  loadTableTemplateList();
+  const lastKey = `db_sync_last_table_template_${newKey || 'default'}`;
+  let lastTemplate = localStorage.getItem(lastKey);
+  if (!lastTemplate && newKey === 'default') {
+    lastTemplate = localStorage.getItem('db_sync_last_table_template');
+  }
+  if (lastTemplate && tableTemplates.value[lastTemplate]) {
+    selectedTemplateName.value = lastTemplate;
+  } else {
+    selectedTemplateName.value = '';
+  }
+});
+
 onMounted(() => {
   loadTableTemplateList();
+  const lastKey = getLastTemplateStorageKey();
+  let lastTemplate = localStorage.getItem(lastKey);
+  if (!lastTemplate) {
+    lastTemplate = localStorage.getItem('db_sync_last_table_template');
+  }
+  if (lastTemplate && tableTemplates.value[lastTemplate]) {
+    selectedTemplateName.value = lastTemplate;
+    if ((!props.selectedTables || props.selectedTables.length === 0) && tableTemplates.value[lastTemplate]?.length > 0) {
+      emit('update:selectedTables', [...tableTemplates.value[lastTemplate]]);
+    }
+  } else {
+    selectedTemplateName.value = '';
+  }
 });
 
 const filteredTables = computed(() => {
@@ -185,10 +225,15 @@ const addManualTable = () => {
 
 const loadTableTemplateList = () => {
   try {
-    const raw = localStorage.getItem('db_sync_table_templates');
-    if (raw) tableTemplates.value = JSON.parse(raw);
+    const key = getTemplatesStorageKey();
+    let raw = localStorage.getItem(key);
+    if (!raw) {
+      raw = localStorage.getItem('db_sync_table_templates');
+    }
+    tableTemplates.value = raw ? JSON.parse(raw) : {};
   } catch (e) {
     console.error('Failed loading table templates:', e);
+    tableTemplates.value = {};
   }
 };
 
@@ -204,7 +249,7 @@ const createTableTemplate = () => {
 
   const trimmed = name.trim();
   tableTemplates.value[trimmed] = [...props.selectedTables];
-  localStorage.setItem('db_sync_table_templates', JSON.stringify(tableTemplates.value));
+  localStorage.setItem(getTemplatesStorageKey(), JSON.stringify(tableTemplates.value));
   selectedTemplateName.value = trimmed;
 };
 
@@ -212,7 +257,7 @@ const updateTableTemplate = () => {
   const name = selectedTemplateName.value;
   if (!name) return;
   tableTemplates.value[name] = [...props.selectedTables];
-  localStorage.setItem('db_sync_table_templates', JSON.stringify(tableTemplates.value));
+  localStorage.setItem(getTemplatesStorageKey(), JSON.stringify(tableTemplates.value));
 };
 
 const deleteTableTemplate = () => {
@@ -220,7 +265,7 @@ const deleteTableTemplate = () => {
   if (!name || !tableTemplates.value[name]) return;
   if (!confirm(`Hapus template "${name}"? Tindakan ini tidak bisa dibatalkan.`)) return;
   delete tableTemplates.value[name];
-  localStorage.setItem('db_sync_table_templates', JSON.stringify(tableTemplates.value));
+  localStorage.setItem(getTemplatesStorageKey(), JSON.stringify(tableTemplates.value));
   selectedTemplateName.value = '';
 };
 </script>

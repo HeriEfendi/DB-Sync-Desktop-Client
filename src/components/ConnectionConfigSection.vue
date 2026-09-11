@@ -138,6 +138,7 @@ import { ref, onMounted, watch, nextTick } from 'vue';
 const props = defineProps({
   pmaConfig: { type: Object, required: true },
   localConfig: { type: Object, required: true },
+  selectedPreset: { type: String, default: '' },
   testingPma: { type: Boolean, default: false },
   testingLocal: { type: Boolean, default: false },
 });
@@ -145,6 +146,7 @@ const props = defineProps({
 const emit = defineEmits([
   'update:pma-config',
   'update:local-config',
+  'update:selected-preset',
   'test-pma',
   'test-local',
   'preset-changed',
@@ -165,9 +167,38 @@ watch(() => props.localConfig, (val) => {
   localConfig.value = { ...val };
 }, { deep: true });
 
+watch(() => props.selectedPreset, (val) => {
+  if (val !== undefined && val !== selectedPresetName.value) {
+    selectedPresetName.value = val;
+  }
+});
+
+watch(selectedPresetName, (name) => {
+  if (name) {
+    localStorage.setItem('db_sync_last_preset', name);
+  } else {
+    localStorage.removeItem('db_sync_last_preset');
+  }
+  emit('update:selected-preset', name);
+});
+
 onMounted(() => {
-  selectedPresetName.value = '';
   loadPresetList();
+  const lastPreset = localStorage.getItem('db_sync_last_preset');
+  if (lastPreset && presets.value[lastPreset]) {
+    selectedPresetName.value = lastPreset;
+    emit('update:selected-preset', lastPreset);
+    const p = presets.value[lastPreset];
+    if ((!props.pmaConfig?.url || !props.pmaConfig?.database) && p?.pmaConfig) {
+      emit('update:pma-config', { ...p.pmaConfig });
+    }
+    if (!props.localConfig?.database && p?.localConfig) {
+      emit('update:local-config', { ...p.localConfig });
+    }
+  } else {
+    selectedPresetName.value = '';
+    emit('update:selected-preset', '');
+  }
 });
 
 const loadPresetList = () => {
@@ -191,6 +222,8 @@ const createPreset = () => {
 
   localStorage.setItem('db_sync_presets', JSON.stringify(presets.value));
   selectedPresetName.value = trimmed;
+  emit('update:selected-preset', trimmed);
+  emit('preset-changed', trimmed);
 };
 
 const updatePreset = () => {
@@ -213,14 +246,16 @@ const deletePreset = () => {
   delete presets.value[name];
   localStorage.setItem('db_sync_presets', JSON.stringify(presets.value));
   selectedPresetName.value = '';
-  emit('preset-changed');
+  emit('update:selected-preset', '');
+  emit('preset-changed', '');
   emit('update:pma-config', { url: '', username: '', password: '', database: '' });
   emit('update:local-config', { host: '', port: 3306, username: '', password: '', database: '' });
 };
 
 const loadPreset = async () => {
   const name = selectedPresetName.value;
-  emit('preset-changed');
+  emit('update:selected-preset', name);
+  emit('preset-changed', name);
 
   if (!name) {
     emit('update:pma-config', { url: '', username: '', password: '', database: '' });

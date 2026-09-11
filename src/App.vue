@@ -19,6 +19,7 @@
             <ConnectionConfigSection
               v-model:pma-config="pmaConfig"
               v-model:local-config="localConfig"
+              v-model:selected-preset="currentPresetName"
               :testing-pma="testingPma"
               :testing-local="testingLocal"
               @test-pma="testPmaConnection"
@@ -27,6 +28,7 @@
             />
 
             <TableConfig
+              :server-key="currentServerKey"
               v-model:selected-tables="selectedTables"
               v-model:available-tables="availableTables"
               :fetching-tables="fetchingTables"
@@ -62,7 +64,7 @@
 </template>
 
 <script setup>
-import { ref, watch, onMounted, onUnmounted } from 'vue';
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue';
 import Navbar from './components/Navbar.vue';
 import ConnectionConfigSection from './components/ConnectionConfigSection.vue';
 import TableConfig from './components/TableConfig.vue';
@@ -219,12 +221,71 @@ const handleResetAllTableStates = () => {
   });
 };
 
+const currentPresetName = ref(localStorage.getItem('db_sync_last_preset') || '');
+
+const computeServerKey = (pma, preset = '') => {
+  const p = (preset || '').trim();
+  if (p) {
+    return `preset_${p.replace(/[^a-zA-Z0-9_\-]/g, '_')}`;
+  }
+  const u = (pma?.url || '').trim().toLowerCase().replace(/https?:\/\//, '').replace(/[^a-zA-Z0-9_\-]/g, '_');
+  const d = (pma?.database || '').trim().toLowerCase().replace(/[^a-zA-Z0-9_\-]/g, '_');
+  if (!u && !d) return 'default';
+  return `server_${u}___${d}`;
+};
+
+const currentServerKey = computed(() => computeServerKey(pmaConfig.value, currentPresetName.value));
+
+const saveTablesForServerKey = (key, available, selected) => {
+  if (!key) return;
+  try {
+    const data = {
+      availableTables: Array.isArray(available) ? available : [],
+      selectedTables: Array.isArray(selected) ? selected : [],
+    };
+    localStorage.setItem(`db_sync_tables_${key}`, JSON.stringify(data));
+  } catch (e) {
+    console.error('Failed saving tables for server key:', key, e);
+  }
+};
+
+const loadTablesForServerKey = (key) => {
+  if (!key) return;
+  try {
+    const raw = localStorage.getItem(`db_sync_tables_${key}`);
+    if (raw) {
+      const data = JSON.parse(raw);
+      availableTables.value = Array.isArray(data.availableTables) ? data.availableTables : [];
+      selectedTables.value = Array.isArray(data.selectedTables) ? data.selectedTables : [];
+      return;
+    }
+
+    // Fallback migrasi jika belum ada penyimpanan per serverKey tapi ada data lama di global
+    const globalAvail = localStorage.getItem('db_sync_available_tables');
+    const globalSel = localStorage.getItem('db_sync_selected_tables');
+    if (globalAvail) {
+      try {
+        availableTables.value = JSON.parse(globalAvail);
+        selectedTables.value = globalSel ? JSON.parse(globalSel) : [];
+        saveTablesForServerKey(key, availableTables.value, selectedTables.value);
+        return;
+      } catch (e) {}
+    }
+
+    // Server baru: kosongkan daftar tabel
+    availableTables.value = [];
+    selectedTables.value = [];
+  } catch (e) {
+    console.error('Failed loading tables for server key:', key, e);
+    availableTables.value = [];
+    selectedTables.value = [];
+  }
+};
+
 onMounted(async () => {
   try {
     const savedPma = localStorage.getItem('db_sync_pma_config');
     const savedLocal = localStorage.getItem('db_sync_local_config');
-    const savedTables = localStorage.getItem('db_sync_selected_tables');
-    const savedAvailable = localStorage.getItem('db_sync_available_tables');
     const savedMode = localStorage.getItem('db_sync_mode');
     const savedLimit = localStorage.getItem('db_sync_row_limit');
     const savedStats = localStorage.getItem('db_sync_stats');
@@ -232,8 +293,6 @@ onMounted(async () => {
 
     if (savedPma) Object.assign(pmaConfig.value, JSON.parse(savedPma));
     if (savedLocal) Object.assign(localConfig.value, JSON.parse(savedLocal));
-    if (savedAvailable) availableTables.value = JSON.parse(savedAvailable);
-    if (savedTables) selectedTables.value = JSON.parse(savedTables);
     if (savedMode) syncMode.value = savedMode;
     if (savedLimit !== null && savedLimit !== undefined) rowLimit.value = parseInt(savedLimit, 10);
     if (savedStats) Object.assign(stats.value, JSON.parse(savedStats));
@@ -247,6 +306,7 @@ onMounted(async () => {
     console.error('Failed reading saved config:', e);
   }
 
+  loadTablesForServerKey(currentServerKey.value);
   refreshTableStates();
 
   if (isTauri.value) {
@@ -285,20 +345,37 @@ const debounceStorageSave = (key, value) => {
   }, 300);
 };
 
+watch(currentServerKey, (newKey, oldKey) => {
+  if (oldKey && oldKey !== newKey) {
+    saveTablesForServerKey(oldKey, availableTables.value, selectedTables.value);
+  }
+  if (newKey) {
+    loadTablesForServerKey(newKey);
+  }
+  refreshTableStates();
+});
+
 watch(pmaConfig, (val) => {
   debounceStorageSave('db_sync_pma_config', val);
   refreshTableStates();
 }, { deep: true });
 watch(localConfig, (val) => debounceStorageSave('db_sync_local_config', val), { deep: true });
-watch(availableTables, (val) => debounceStorageSave('db_sync_available_tables', val), { deep: true });
-watch(selectedTables, (val) => debounceStorageSave('db_sync_selected_tables', val), { deep: true });
+watch(availableTables, (val) => {
+  saveTablesForServerKey(currentServerKey.value, val, selectedTables.value);
+}, { deep: true });
+watch(selectedTables, (val) => {
+  saveTablesForServerKey(currentServerKey.value, availableTables.value, val);
+}, { deep: true });
 watch(syncMode, (val) => debounceStorageSave('db_sync_mode', val));
 watch(rowLimit, (val) => debounceStorageSave('db_sync_row_limit', String(val)));
 watch(stats, (val) => debounceStorageSave('db_sync_stats', val), { deep: true });
 
-const handlePresetChanged = () => {
+const handlePresetChanged = (presetName) => {
   pmaStatus.value.connected = false;
   localStatus.value.connected = false;
+  if (presetName !== undefined && presetName !== null) {
+    currentPresetName.value = presetName;
+  }
   refreshTableStates();
 };
 
@@ -385,8 +462,6 @@ const fetchTablesFromPma = async () => {
 
     if (tables && tables.length > 0) {
       availableTables.value = tables;
-      // Default: check all tables
-      selectedTables.value = [...tables];
       pmaStatus.value.connected = true;
 
       addLog({
@@ -394,6 +469,135 @@ const fetchTablesFromPma = async () => {
         message: `✅ Berhasil mengekstrak ${tables.length} tabel dari PMA: ${tables.slice(0, 10).join(', ')}${tables.length > 10 ? ` ... +${tables.length - 10} lainnya` : ''}`,
         timestamp: new Date().toLocaleTimeString(),
       });
+
+      // Bandingkan dengan tabel di database MySQL lokal
+      if (isTauri.value && localConfig.value.database) {
+        try {
+          addLog({
+            type: 'info',
+            message: `Memeriksa perbedaan skema tabel dengan database MySQL lokal (${localConfig.value.database})...`,
+            timestamp: new Date().toLocaleTimeString(),
+          });
+
+          const localTables = await safeInvoke('get_local_tables', {
+            config: {
+              host: localConfig.value.host || '127.0.0.1',
+              port: parseInt(localConfig.value.port || 3306, 10),
+              username: localConfig.value.username || 'root',
+              password: localConfig.value.password || '',
+              database: localConfig.value.database || '',
+              use_docker: Boolean(localConfig.value.use_docker),
+              docker_container: localConfig.value.docker_container || '',
+            },
+          });
+
+          if (Array.isArray(localTables)) {
+            const pmaTableSet = new Set(tables);
+            const localTableSet = new Set(localTables);
+
+            // Daftar tabel yang sebelumnya pernah terdaftar pada server PMA ini
+            const prevServerTables = new Set(availableTables.value || []);
+
+            // Drop: HANYA tabel yang sebelumnya memang pernah terdaftar di server PMA ini,
+            // dan ada di MySQL lokal, namun sekarang sudah tidak ada lagi di PMA server ini.
+            // Ini mencegah terhapusnya tabel lokal yang berasal dari server PMA lain!
+            const droppedTables = localTables.filter((t) => prevServerTables.has(t) && !pmaTableSet.has(t));
+            const newTables = tables.filter((t) => !localTableSet.has(t));
+
+            // 1. Drop tabel lokal yang sudah tidak ada di PMA
+            if (droppedTables.length > 0) {
+              addLog({
+                type: 'warning',
+                message: `🗑️ Menghapus ${droppedTables.length} tabel di MySQL lokal yang sudah tidak ada di PMA: ${droppedTables.join(', ')}...`,
+                timestamp: new Date().toLocaleTimeString(),
+              });
+
+              await safeInvoke('drop_local_tables', {
+                config: {
+                  host: localConfig.value.host || '127.0.0.1',
+                  port: parseInt(localConfig.value.port || 3306, 10),
+                  username: localConfig.value.username || 'root',
+                  password: localConfig.value.password || '',
+                  database: localConfig.value.database || '',
+                  use_docker: Boolean(localConfig.value.use_docker),
+                  docker_container: localConfig.value.docker_container || '',
+                },
+                tables: droppedTables,
+              });
+
+              droppedTables.forEach((t) => {
+                clearTableState(pmaConfig.value.url, pmaConfig.value.database, t);
+              });
+
+              addLog({
+                type: 'success',
+                message: `✅ Selesai menghapus ${droppedTables.length} tabel usang dari MySQL lokal.`,
+                timestamp: new Date().toLocaleTimeString(),
+              });
+            }
+
+            // 2. Tambahkan tabel baru dari PMA yang belum ada di local
+            if (newTables.length > 0) {
+              addLog({
+                type: 'info',
+                message: `📥 Ditemukan ${newTables.length} tabel baru di PMA yang belum ada di lokal: ${newTables.join(', ')}. Mengimpor struktur & data ke MySQL lokal...`,
+                timestamp: new Date().toLocaleTimeString(),
+              });
+
+              const syncEngine = new SyncEngine(pmaConfig.value, localConfig.value, {
+                onLog: addLog,
+                onTableSynced: refreshTableStates,
+                onProgress: () => {},
+              });
+
+              await syncEngine.runMultiTableSync({
+                tables: newTables,
+                syncMode: 'fresh',
+                rowLimit: 0,
+              });
+
+              addLog({
+                type: 'success',
+                message: `✅ Selesai menambahkan ${newTables.length} tabel baru ke MySQL lokal.`,
+                timestamp: new Date().toLocaleTimeString(),
+              });
+            }
+
+            if (droppedTables.length === 0 && newTables.length === 0) {
+              addLog({
+                type: 'info',
+                message: `✨ Semua ${tables.length} tabel di PMA dan MySQL lokal sudah sinkron dan selaras.`,
+                timestamp: new Date().toLocaleTimeString(),
+              });
+            }
+
+            // Perbarui selectedTables
+            const currentSelected = new Set(selectedTables.value || []);
+            droppedTables.forEach((t) => currentSelected.delete(t));
+            newTables.forEach((t) => currentSelected.add(t));
+            if (currentSelected.size === 0) {
+              selectedTables.value = [...tables];
+            } else {
+              selectedTables.value = tables.filter((t) => currentSelected.has(t));
+            }
+          } else {
+            selectedTables.value = [...tables];
+          }
+        } catch (localErr) {
+          addLog({
+            type: 'warning',
+            message: `Pengecekan database MySQL lokal dilewati: ${localErr.message || localErr}`,
+            timestamp: new Date().toLocaleTimeString(),
+          });
+          selectedTables.value = [...tables];
+        }
+      } else {
+        selectedTables.value = [...tables];
+      }
+
+      availableTables.value = tables;
+      saveTablesForServerKey(currentServerKey.value, tables, selectedTables.value);
+      refreshTableStates();
     } else {
       addLog({
         type: 'error',

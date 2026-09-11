@@ -452,3 +452,71 @@ pub async fn delete_local_rows_after_id(
     pool.close().await;
     Ok(result.rows_affected())
 }
+
+/// Get list of table names currently in local MySQL database
+#[tauri::command]
+pub async fn get_local_tables(config: LocalDbConfig) -> Result<Vec<String>, String> {
+    let conn_str = build_connection_string(&config);
+    let pool = MySqlPoolOptions::new()
+        .max_connections(2)
+        .connect(&conn_str)
+        .await
+        .map_err(|e| format!("Koneksi ke MySQL lokal gagal: {}", e))?;
+
+    let rows = sqlx::query("SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_TYPE = 'BASE TABLE' ORDER BY TABLE_NAME ASC")
+        .fetch_all(&pool)
+        .await
+        .map_err(|e| format!("Gagal membaca daftar tabel lokal: {}", e))?;
+
+    pool.close().await;
+
+    let mut tables = Vec::new();
+    for row in rows {
+        if let Ok(name) = row.try_get::<String, _>(0) {
+            tables.push(name);
+        }
+    }
+    Ok(tables)
+}
+
+/// Drop specified tables from local MySQL database
+#[tauri::command]
+pub async fn drop_local_tables(config: LocalDbConfig, tables: Vec<String>) -> Result<Vec<String>, String> {
+    if tables.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let conn_str = build_connection_string(&config);
+    let pool = MySqlPoolOptions::new()
+        .max_connections(2)
+        .connect(&conn_str)
+        .await
+        .map_err(|e| format!("Koneksi ke MySQL lokal gagal: {}", e))?;
+
+    let mut conn = pool
+        .acquire()
+        .await
+        .map_err(|e| format!("Koneksi ke MySQL lokal gagal: {}", e))?;
+
+    let _ = sqlx::query("SET FOREIGN_KEY_CHECKS=0").execute(&mut *conn).await;
+
+    let mut dropped = Vec::new();
+    for table_name in tables {
+        let safe_table = match sanitize_identifier(&table_name) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let query = format!("DROP TABLE IF EXISTS {}", safe_table);
+        if let Err(e) = sqlx::query(&query).execute(&mut *conn).await {
+            eprintln!("Gagal drop tabel lokal {}: {}", table_name, e);
+        } else {
+            dropped.push(table_name);
+        }
+    }
+
+    let _ = sqlx::query("SET FOREIGN_KEY_CHECKS=1").execute(&mut *conn).await;
+    drop(conn);
+    pool.close().await;
+
+    Ok(dropped)
+}
