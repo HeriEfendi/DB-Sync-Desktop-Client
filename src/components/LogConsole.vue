@@ -74,15 +74,41 @@ const logContainer = ref(null);
 const currentFilter = ref('all');
 const searchQuery = ref('');
 
+const MAX_DISPLAY_LOGS = 500;
+
 const filteredLogs = computed(() => {
   if (!props.logs || props.logs.length === 0) return [];
   const query = searchQuery.value ? searchQuery.value.toLowerCase().trim() : '';
   const filter = currentFilter.value;
-  const result = [];
 
-  const startIdx = Math.max(0, props.logs.length - 100);
-  for (let i = startIdx; i < props.logs.length; i++) {
-    const log = props.logs[i];
+  // Build a trimmed list that always keeps warning/error logs
+  let trimmed;
+  if (props.logs.length <= MAX_DISPLAY_LOGS) {
+    trimmed = props.logs.map((log, i) => ({ log, idx: i }));
+  } else {
+    // 1. Collect ALL warning/error logs (always preserved)
+    const critical = [];
+    const normal = [];
+    for (let i = 0; i < props.logs.length; i++) {
+      const t = props.logs[i].type;
+      if (t === 'warning' || t === 'warn' || t === 'error') {
+        critical.push({ log: props.logs[i], idx: i });
+      } else {
+        normal.push({ log: props.logs[i], idx: i });
+      }
+    }
+
+    // 2. Fill remaining slots with the most recent normal logs
+    const remainingSlots = Math.max(0, MAX_DISPLAY_LOGS - critical.length);
+    const recentNormal = normal.slice(-remainingSlots);
+
+    // 3. Merge and sort by original index to maintain chronological order
+    trimmed = [...critical, ...recentNormal].sort((a, b) => a.idx - b.idx);
+  }
+
+  // Apply filter & search on top of the trimmed set
+  const result = [];
+  for (const { log } of trimmed) {
     const normalizedType = log.type === 'warn' ? 'warning' : log.type;
     if (filter !== 'all' && normalizedType !== filter) continue;
     if (query && !log.message.toLowerCase().includes(query)) continue;
