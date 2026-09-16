@@ -1817,21 +1817,7 @@ async fn download_export_payload(
             };
 
             let response = if post_timed_out || send_result.is_none() {
-                last_network_err = format!("TIMEOUT: Server remote tidak merespons dalam 60 detik (url: {})", export_url);
-                if attempt < max_retries_per_candidate {
-                    emit_log(
-                        app,
-                        "warn",
-                        format!(
-                            "[Tabel '{}'] TIMEOUT menunggu response dari {} ({}/{}). Mencoba kembali...",
-                            table_name, export_url, attempt, max_retries_per_candidate
-                        ),
-                    );
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    continue;
-                } else {
-                    return Err(format!("TIMEOUT: Server remote PMA tidak merespons request export dalam 60 detik (url: {})", export_url));
-                }
+                return Err(format!("TIMEOUT: Server remote PMA tidak merespons request export dalam 60 detik (url: {})", export_url));
             } else {
                 match send_result.unwrap() {
                     Ok(r) => r,
@@ -1846,7 +1832,7 @@ async fn download_export_payload(
                                     table_name, export_url, attempt, max_retries_per_candidate, e
                                 ),
                             );
-                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                             continue;
                         } else {
                             continue 'candidate_loop;
@@ -2263,11 +2249,15 @@ async fn fetch_table_export_stream(
             format!("chunk {}", chunk_idx + 1)
         };
 
-        // Percobaan per-chunk (Percobaan 1: 100k, Percobaan 2: 50k, Percobaan 3: 25k jika timeout)
-        let mut chunk_attempt = 0;
+        // Percobaan per-chunk:
+        // Percobaan 1: 100k -> jika timeout langsung ke 50k
+        // Percobaan 2: 50k  -> jika timeout langsung ke 25k (chunk terkecil)
+        // Percobaan 3..5: 25k (mencoba ulang hingga 3 kali pada ukuran minimal)
+        let mut chunk_attempt = 0usize;
         let mut chunk_res = None;
+        let max_chunk_attempts = 5usize;
 
-        while chunk_attempt < 3 {
+        while chunk_attempt < max_chunk_attempts {
             chunk_attempt += 1;
             if is_user_cancelled() {
                 return Err("__USER_CANCELLED__".to_string());
@@ -2315,20 +2305,32 @@ async fn fetch_table_export_stream(
                     chunk_res = res;
                     break;
                 }
-                Err(e) if e.contains("TIMEOUT") && chunk_attempt < 3 => {
+                Err(e) if e.contains("TIMEOUT") && chunk_attempt < max_chunk_attempts => {
+                    let prev_size = chunk_size;
                     chunk_size = match chunk_attempt {
                         1 => 50_000,
-                        2 => 25_000,
                         _ => 25_000,
                     };
-                    emit_log(
-                        app,
-                        "warn",
-                        format!(
-                            "⏱️ [Tabel '{}'] {} TIMEOUT (> 1 menit) pada percobaan {}/3. Mencoba ulang dengan ukuran chunk lebih kecil ({} row)...",
-                            table_name, chunk_label, chunk_attempt, format_number(chunk_size)
-                        ),
-                    );
+                    if prev_size != chunk_size {
+                        emit_log(
+                            app,
+                            "warn",
+                            format!(
+                                "⏱️ [Tabel '{}'] {} TIMEOUT (> 1 menit). Langsung mengecilkan ukuran chunk ke {} row...",
+                                table_name, chunk_label, format_number(chunk_size)
+                            ),
+                        );
+                    } else {
+                        let retry_idx = chunk_attempt.saturating_sub(2);
+                        emit_log(
+                            app,
+                            "warn",
+                            format!(
+                                "⏱️ [Tabel '{}'] {} TIMEOUT pada ukuran minimal {} row (percobaan {}/3). Mencoba kembali...",
+                                table_name, chunk_label, format_number(chunk_size), retry_idx
+                            ),
+                        );
+                    }
                     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                 }
                 Err(e) => {
@@ -2391,7 +2393,15 @@ async fn fetch_table_export_stream(
             // Jeda throttling singkat antar chunk agar memory & I/O remote server PMA tidak overload
             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
         } else {
-            break;
+            emit_log(
+                app,
+                "warn",
+                format!(
+                    "⚠️ [Tabel '{}'] Server remote PMA selalu timeout bahkan pada ukuran minimal 25.000 row setelah 3x percobaan. Melewati tabel ini...",
+                    table_name
+                ),
+            );
+            return Ok(None);
         }
     }
 
