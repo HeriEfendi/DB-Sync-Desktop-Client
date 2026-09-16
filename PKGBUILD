@@ -1,6 +1,6 @@
 # Maintainer: Heri Efendi <heriefendi@gmail.com>
 pkgname=db-sync-desktop-client
-pkgver=0.22.8
+pkgver=0.23.1
 pkgrel=1
 pkgdesc="DB-Sync Client (PMA to Local MySQL)"
 arch=('x86_64')
