@@ -1722,7 +1722,7 @@ async fn download_export_payload(
 
             let send_start = std::time::Instant::now();
             let mut last_wait_log = std::time::Instant::now();
-
+            let mut post_timed_out = false;
             let send_result = loop {
                 if is_user_cancelled() {
                     return Err("__USER_CANCELLED__".to_string());
@@ -1733,10 +1733,14 @@ async fn download_export_payload(
 
                 tokio::select! {
                     res = &mut post_future => {
-                        break res;
+                        break Some(res);
                     }
                     _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
                         let elapsed_wait = send_start.elapsed().as_secs();
+                        if elapsed_wait >= 60 {
+                            post_timed_out = true;
+                            break None;
+                        }
                         if elapsed_wait >= 5 && last_wait_log.elapsed().as_secs() >= 5 {
                             let label_str = chunk_label.map(|lbl| format!(" ({})", lbl)).unwrap_or_default();
                             emit_log(
@@ -1753,23 +1757,41 @@ async fn download_export_payload(
                 }
             };
 
-            let response = match send_result {
-                Ok(r) => r,
-                Err(e) => {
-                    last_network_err = e.to_string();
-                    if attempt < max_retries_per_candidate {
-                        emit_log(
-                            app,
-                            "warn",
-                            format!(
-                                "[Tabel '{}'] Koneksi ke {} terputus ({}/{}): {}. Mencoba kembali...",
-                                table_name, export_url, attempt, max_retries_per_candidate, e
-                            ),
-                        );
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                        continue;
-                    } else {
-                        continue 'candidate_loop;
+            let response = if post_timed_out || send_result.is_none() {
+                last_network_err = format!("TIMEOUT: Server remote tidak merespons dalam 60 detik (url: {})", export_url);
+                if attempt < max_retries_per_candidate {
+                    emit_log(
+                        app,
+                        "warn",
+                        format!(
+                            "[Tabel '{}'] TIMEOUT menunggu response dari {} ({}/{}). Mencoba kembali...",
+                            table_name, export_url, attempt, max_retries_per_candidate
+                        ),
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    continue;
+                } else {
+                    return Err(format!("TIMEOUT: Server remote PMA tidak merespons request export dalam 60 detik (url: {})", export_url));
+                }
+            } else {
+                match send_result.unwrap() {
+                    Ok(r) => r,
+                    Err(e) => {
+                        last_network_err = e.to_string();
+                        if attempt < max_retries_per_candidate {
+                            emit_log(
+                                app,
+                                "warn",
+                                format!(
+                                    "[Tabel '{}'] Koneksi ke {} terputus ({}/{}): {}. Mencoba kembali...",
+                                    table_name, export_url, attempt, max_retries_per_candidate, e
+                                ),
+                            );
+                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                            continue;
+                        } else {
+                            continue 'candidate_loop;
+                        }
                     }
                 }
             };
@@ -1801,14 +1823,23 @@ async fn download_export_payload(
             let mut last_progress_log = std::time::Instant::now();
             let mut last_logged_bytes = 0usize;
             let mut read_failed = false;
+            let mut stream_timed_out = false;
 
-            while let Some(chunk_res) = stream.next().await {
+            while let Some(chunk_res) = {
                 if is_user_cancelled() {
                     return Err("__USER_CANCELLED__".to_string());
                 }
                 if is_aborted() {
                     return Err("__WORKER_ABORTED__".to_string());
                 }
+                match tokio::time::timeout(std::time::Duration::from_secs(60), stream.next()).await {
+                    Ok(item) => item,
+                    Err(_elapsed) => {
+                        stream_timed_out = true;
+                        None
+                    }
+                }
+            } {
                 match chunk_res {
                     Ok(chunk) => {
                         response_bytes.extend_from_slice(&chunk);
@@ -1845,6 +1876,24 @@ async fn download_export_payload(
                         read_failed = true;
                         break;
                     }
+                }
+            }
+
+            if stream_timed_out {
+                last_network_err = format!("TIMEOUT: Aliran stream data terhenti lebih dari 60 detik (url: {})", export_url);
+                if attempt < max_retries_per_candidate {
+                    emit_log(
+                        app,
+                        "warn",
+                        format!(
+                            "[Tabel '{}'] TIMEOUT membaca stream dari {} ({}/{}). Mencoba kembali...",
+                            table_name, export_url, attempt, max_retries_per_candidate
+                        ),
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    continue;
+                } else {
+                    return Err(format!("TIMEOUT: Aliran stream data terhenti lebih dari 60 detik (url: {})", export_url));
                 }
             }
 
@@ -1960,64 +2009,211 @@ async fn fetch_table_export_stream(
     let effective_row_limit = pma_config.row_limit.filter(|limit| *limit > 0);
 
     let is_forced_chunk = forced_chunk_size.is_some();
-    // Kriteria chunking (cicilan):
-    // 1. Bukan structure_only
-    // 2. Bukan incremental dengan watermark sempit
-    // 3. Aktif jika dipaksa chunking (karena retry timeout), ATAU est_rows >= 100_000, ATAU limit yang dipilih user >= 100_000
-    let should_chunk = !is_structure_only
+    let should_chunk_initially = !is_structure_only
         && !has_incremental_watermark
         && (is_forced_chunk
             || est_rows >= 100_000
             || effective_row_limit.map(|l| l >= 100_000).unwrap_or(false));
 
-    if should_chunk {
-        let chunk_size = forced_chunk_size.unwrap_or(100_000usize);
-        let effective_est = effective_row_limit
-            .map(|l| if est_rows > 0 { l.min(est_rows) } else { l })
-            .unwrap_or(est_rows);
-        let total_chunks = if effective_est > 0 {
-            (effective_est + chunk_size - 1) / chunk_size
+    // Jika tidak perlu chunking di awal, coba unduh langsung (direct export)
+    if !should_chunk_initially {
+        let struct_or_data = if is_structure_only {
+            "structure"
+        } else if is_incremental {
+            "data"
         } else {
-            0
+            "structure_and_data"
         };
-        let safe_table = table_name.replace('`', "``");
+        let sql_structure = if is_incremental { "0" } else { "1" };
+        let sql_create = if is_incremental { "false" } else { "true" };
 
-        let order_clause = if let Some(pk_col) = pk_col_opt {
-            format!("ORDER BY `{}` ASC", pk_col.replace('`', "``"))
+        let custom_query_opt = if is_structure_only {
+            None
+        } else if effective_row_limit.is_some() || has_incremental_watermark {
+            let limit = effective_row_limit.unwrap_or(usize::MAX);
+            let safe_table = table_name.replace('`', "``");
+
+            let limited_query = if let Some(watermark) = pma_config
+                .incremental_watermarks
+                .as_ref()
+                .and_then(|watermarks| watermarks.get(table_name))
+                .filter(|_| pma_config.sync_mode.as_deref() == Some("incremental"))
+            {
+                let last_id_str = match &watermark.last_synced_id {
+                    serde_json::Value::Number(value) => Some(value.to_string()),
+                    serde_json::Value::String(value) => Some(format!("'{}'", value.replace('\'', "''"))),
+                    _ => None,
+                };
+                let last_sync = watermark.last_sync_time.replace('\'', "''");
+
+                let mut conditions = Vec::new();
+
+                if let (Some(pk_col), Some(last_id)) = (pk_col_opt, last_id_str) {
+                    let safe_pk = pk_col.replace('`', "``");
+                    conditions.push(format!("`{}` > {}", safe_pk, last_id));
+                }
+
+                if has_updated_at && !last_sync.is_empty() {
+                    conditions.push(format!("`updated_at` > '{}'", last_sync));
+                }
+
+                let where_clause = if !conditions.is_empty() {
+                    format!("WHERE {}", conditions.join(" OR "))
+                } else {
+                    String::new()
+                };
+
+                let order_clause = if let Some(pk_col) = pk_col_opt {
+                    format!("ORDER BY `{}` ASC", pk_col.replace('`', "``"))
+                } else if has_updated_at {
+                    "ORDER BY `updated_at` ASC".to_string()
+                } else {
+                    String::new()
+                };
+
+                let limit_clause = if limit != usize::MAX {
+                    format!("LIMIT {}", limit)
+                } else {
+                    String::new()
+                };
+
+                format!(
+                    "SELECT * FROM `{}` {} {} {}",
+                    safe_table, where_clause, order_clause, limit_clause
+                ).split_whitespace().collect::<Vec<_>>().join(" ")
+            } else {
+                let order_clause = if let Some(pk_col) = pk_col_opt {
+                    format!("ORDER BY `{}` DESC", pk_col.replace('`', "``"))
+                } else {
+                    String::new()
+                };
+                let limit_clause = if limit != usize::MAX {
+                    format!("LIMIT {}", limit)
+                } else {
+                    String::new()
+                };
+                format!(
+                    "SELECT * FROM `{}` {} {}",
+                    safe_table, order_clause, limit_clause
+                ).split_whitespace().collect::<Vec<_>>().join(" ")
+            };
+            Some(limited_query)
         } else {
-            String::new()
+            None
         };
 
-        if total_chunks > 0 {
-            emit_log(
-                app,
-                "info",
-                format!(
-                    "[Tabel '{}'] Mengunduh dalam cicilan {} chunk ({} row per chunk, target ~{} row)...",
-                    table_name,
-                    total_chunks,
-                    format_number(chunk_size),
-                    format_number(effective_est)
-                ),
-            );
-        } else {
-            emit_log(
-                app,
-                "info",
-                format!(
-                    "[Tabel '{}'] Mengunduh dalam cicilan chunk ({} row per chunk) hingga seluruh data selesai...",
-                    table_name,
-                    format_number(chunk_size)
-                ),
-            );
+        let direct_res = download_export_payload(
+            client,
+            base_url,
+            csrf_token,
+            pma_config,
+            table_name,
+            struct_or_data,
+            sql_structure,
+            sql_create,
+            sql_type_val,
+            custom_query_opt,
+            cached_endpoint,
+            app,
+            None,
+        ).await;
+
+        match direct_res {
+            Ok(data) => return Ok(data),
+            Err(e) if e.contains("TIMEOUT") && !is_structure_only && !has_incremental_watermark => {
+                emit_log(
+                    app,
+                    "warn",
+                    format!(
+                        "⏱️ [Tabel '{}'] Unduhan langsung TIMEOUT (> 1 menit): Server remote overload atau tabel sangat besar. Beralih otomatis ke MODE CICILAN (50.000 row per chunk) agar SELURUH data tetap terambil lengkap...",
+                        table_name
+                    ),
+                );
+                // Lanjut eksekusi mode chunking di bawah
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    // === MODE CICILAN (CHUNKING) PER-CHUNK TIMEOUT (1 MENIT / 60s) ===
+    // Setiap chunk memiliki timeout 60 detik mandiri. Total tabel dapat berjalan berapa pun chunk-nya.
+    let mut chunk_size = forced_chunk_size.unwrap_or(50_000usize);
+    let effective_est = effective_row_limit
+        .map(|l| if est_rows > 0 { l.min(est_rows) } else { l })
+        .unwrap_or(est_rows);
+    let total_chunks = if effective_est > 0 {
+        (effective_est + chunk_size - 1) / chunk_size
+    } else {
+        0
+    };
+    let safe_table = table_name.replace('`', "``");
+
+    let order_clause = if let Some(pk_col) = pk_col_opt {
+        format!("ORDER BY `{}` ASC", pk_col.replace('`', "``"))
+    } else {
+        String::new()
+    };
+
+    if total_chunks > 0 {
+        emit_log(
+            app,
+            "info",
+            format!(
+                "[Tabel '{}'] Mengunduh dalam cicilan {} chunk ({} row per chunk, target ~{} row)...",
+                table_name,
+                total_chunks,
+                format_number(chunk_size),
+                format_number(effective_est)
+            ),
+        );
+    } else {
+        emit_log(
+            app,
+            "info",
+            format!(
+                "[Tabel '{}'] Mengunduh dalam cicilan chunk ({} row per chunk) hingga seluruh data selesai...",
+                table_name,
+                format_number(chunk_size)
+            ),
+        );
+    }
+
+    let mut combined_sql = Vec::new();
+    let mut chunk_idx = 0usize;
+    let max_chunks_by_limit = effective_row_limit.map(|l| (l + chunk_size - 1) / chunk_size).unwrap_or(5000);
+    let max_safe_chunks = max_chunks_by_limit.min(5000); // Mendukung hingga 250 juta baris
+
+    while chunk_idx < max_safe_chunks {
+        if is_user_cancelled() {
+            return Err("__USER_CANCELLED__".to_string());
+        }
+        if is_aborted() {
+            return Err("__WORKER_ABORTED__".to_string());
         }
 
-        let mut combined_sql = Vec::new();
-        let mut chunk_idx = 0usize;
-        let max_chunks_by_limit = effective_row_limit.map(|l| (l + chunk_size - 1) / chunk_size).unwrap_or(2000);
-        let max_safe_chunks = max_chunks_by_limit.min(2000); // Mendukung hingga 200 juta baris
+        let offset = chunk_idx * chunk_size;
+        let chunk_struct = if chunk_idx == 0 && !is_incremental { "structure_and_data" } else { "data" };
+        let chunk_sql_struct = if chunk_idx == 0 && !is_incremental { "1" } else { "0" };
+        let chunk_sql_create = if chunk_idx == 0 && !is_incremental { "true" } else { "false" };
 
-        while chunk_idx < max_safe_chunks {
+        let chunk_query = format!(
+            "SELECT * FROM `{}` {} LIMIT {} OFFSET {}",
+            safe_table, order_clause, chunk_size, offset
+        ).split_whitespace().collect::<Vec<_>>().join(" ");
+
+        let chunk_label = if total_chunks > 0 {
+            let display_total = total_chunks.max(chunk_idx + 1);
+            format!("chunk {}/{}", chunk_idx + 1, display_total)
+        } else {
+            format!("chunk {}", chunk_idx + 1)
+        };
+
+        // Percobaan per-chunk (hingga 3 kali dengan penyesuaian ukuran chunk jika timeout)
+        let mut chunk_attempt = 0;
+        let mut chunk_res = None;
+
+        while chunk_attempt < 3 {
+            chunk_attempt += 1;
             if is_user_cancelled() {
                 return Err("__USER_CANCELLED__".to_string());
             }
@@ -2025,24 +2221,7 @@ async fn fetch_table_export_stream(
                 return Err("__WORKER_ABORTED__".to_string());
             }
 
-            let offset = chunk_idx * chunk_size;
-            let chunk_struct = if chunk_idx == 0 && !is_incremental { "structure_and_data" } else { "data" };
-            let chunk_sql_struct = if chunk_idx == 0 && !is_incremental { "1" } else { "0" };
-            let chunk_sql_create = if chunk_idx == 0 && !is_incremental { "true" } else { "false" };
-
-            let chunk_query = format!(
-                "SELECT * FROM `{}` {} LIMIT {} OFFSET {}",
-                safe_table, order_clause, chunk_size, offset
-            ).split_whitespace().collect::<Vec<_>>().join(" ");
-
-            let chunk_label = if total_chunks > 0 {
-                let display_total = total_chunks.max(chunk_idx + 1);
-                format!("chunk {}/{}", chunk_idx + 1, display_total)
-            } else {
-                format!("chunk {}", chunk_idx + 1)
-            };
-
-            let chunk_res = download_export_payload(
+            match download_export_payload(
                 client,
                 base_url,
                 csrf_token,
@@ -2052,170 +2231,89 @@ async fn fetch_table_export_stream(
                 chunk_sql_struct,
                 chunk_sql_create,
                 sql_type_val,
-                Some(chunk_query),
+                Some(chunk_query.clone()),
                 cached_endpoint,
                 app,
                 Some(&chunk_label),
-            ).await?;
-
-            if let Some(chunk_data) = chunk_res {
-                let raw_chunk_sql = if chunk_data.is_gzip {
-                    decompress_gzip_bytes(&chunk_data.response_bytes)
-                        .unwrap_or(chunk_data.response_bytes)
-                } else {
-                    chunk_data.response_bytes
-                };
-
-                let chunk_len = raw_chunk_sql.len();
-                let row_count_in_chunk = count_imported_sql_rows(&raw_chunk_sql);
-                let has_insert = raw_chunk_sql.windows(11).any(|w| w == b"INSERT INTO")
-                    || raw_chunk_sql.windows(12).any(|w| w == b"REPLACE INTO");
-
-                if !combined_sql.is_empty() {
-                    combined_sql.push(b'\n');
-                }
-                combined_sql.extend_from_slice(&raw_chunk_sql);
-
-                let display_progress = if total_chunks > 0 {
-                    format!("Chunk {}/{}", chunk_idx + 1, total_chunks.max(chunk_idx + 1))
-                } else {
-                    format!("Chunk {}", chunk_idx + 1)
-                };
-
-                emit_log(
-                    app,
-                    "info",
-                    format!(
-                        "[Tabel '{}'] {} selesai diunduh: ~{} row ({})",
-                        table_name,
-                        display_progress,
-                        format_number(row_count_in_chunk),
-                        format_byte_size(chunk_len)
-                    ),
-                );
-
-                chunk_idx += 1;
-
-                // Jika chunk tidak memiliki data INSERT atau baris kurang dari chunk_size, berarti seluruh isi tabel telah selesai
-                if !has_insert || row_count_in_chunk < chunk_size {
+            ).await {
+                Ok(res) => {
+                    chunk_res = res;
                     break;
                 }
-
-                // Jeda throttling singkat antar chunk agar memory & I/O remote server PMA tidak overload
-                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-            } else {
-                break;
+                Err(e) if e.contains("TIMEOUT") && chunk_attempt < 3 => {
+                    chunk_size = (chunk_size / 2).max(10_000);
+                    emit_log(
+                        app,
+                        "warn",
+                        format!(
+                            "⏱️ [Tabel '{}'] {} TIMEOUT (> 1 menit). Mencoba ulang dengan ukuran chunk lebih kecil ({} row)...",
+                            table_name, chunk_label, format_number(chunk_size)
+                        ),
+                    );
+                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                }
+                Err(e) => {
+                    return Err(e);
+                }
             }
         }
 
-        return Ok(Some(DownloadedTableData {
-            table_name: table_name.to_string(),
-            response_bytes: combined_sql,
-            is_gzip: false,
-            table_start,
-        }));
+        if let Some(chunk_data) = chunk_res {
+            let raw_chunk_sql = if chunk_data.is_gzip {
+                decompress_gzip_bytes(&chunk_data.response_bytes)
+                    .unwrap_or(chunk_data.response_bytes)
+            } else {
+                chunk_data.response_bytes
+            };
+
+            let chunk_len = raw_chunk_sql.len();
+            let row_count_in_chunk = count_imported_sql_rows(&raw_chunk_sql);
+            let has_insert = raw_chunk_sql.windows(11).any(|w| w == b"INSERT INTO")
+                || raw_chunk_sql.windows(12).any(|w| w == b"REPLACE INTO");
+
+            if !combined_sql.is_empty() {
+                combined_sql.push(b'\n');
+            }
+            combined_sql.extend_from_slice(&raw_chunk_sql);
+
+            let display_progress = if total_chunks > 0 {
+                format!("Chunk {}/{}", chunk_idx + 1, total_chunks.max(chunk_idx + 1))
+            } else {
+                format!("Chunk {}", chunk_idx + 1)
+            };
+
+            emit_log(
+                app,
+                "info",
+                format!(
+                    "[Tabel '{}'] {} selesai diunduh: ~{} row ({})",
+                    table_name,
+                    display_progress,
+                    format_number(row_count_in_chunk),
+                    format_byte_size(chunk_len)
+                ),
+            );
+
+            chunk_idx += 1;
+
+            // Jika chunk tidak memiliki data INSERT atau baris kurang dari chunk_size, berarti seluruh isi tabel telah selesai
+            if !has_insert || row_count_in_chunk < chunk_size {
+                break;
+            }
+
+            // Jeda throttling singkat antar chunk agar memory & I/O remote server PMA tidak overload
+            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        } else {
+            break;
+        }
     }
 
-    let struct_or_data = if is_structure_only {
-        "structure"
-    } else if is_incremental {
-        "data"
-    } else {
-        "structure_and_data"
-    };
-    let sql_structure = if is_incremental { "0" } else { "1" };
-    let sql_create = if is_incremental { "false" } else { "true" };
-
-    let custom_query_opt = if is_structure_only {
-        None
-    } else if effective_row_limit.is_some() || has_incremental_watermark {
-        let limit = effective_row_limit.unwrap_or(usize::MAX);
-        let safe_table = table_name.replace('`', "``");
-
-        let limited_query = if let Some(watermark) = pma_config
-            .incremental_watermarks
-            .as_ref()
-            .and_then(|watermarks| watermarks.get(table_name))
-            .filter(|_| pma_config.sync_mode.as_deref() == Some("incremental"))
-        {
-            let last_id_str = match &watermark.last_synced_id {
-                serde_json::Value::Number(value) => Some(value.to_string()),
-                serde_json::Value::String(value) => Some(format!("'{}'", value.replace('\'', "''"))),
-                _ => None,
-            };
-            let last_sync = watermark.last_sync_time.replace('\'', "''");
-
-            let mut conditions = Vec::new();
-
-            if let (Some(pk_col), Some(last_id)) = (pk_col_opt, last_id_str) {
-                let safe_pk = pk_col.replace('`', "``");
-                conditions.push(format!("`{}` > {}", safe_pk, last_id));
-            }
-
-            if has_updated_at && !last_sync.is_empty() {
-                conditions.push(format!("`updated_at` > '{}'", last_sync));
-            }
-
-            let where_clause = if !conditions.is_empty() {
-                format!("WHERE {}", conditions.join(" OR "))
-            } else {
-                String::new()
-            };
-
-            let order_clause = if let Some(pk_col) = pk_col_opt {
-                format!("ORDER BY `{}` ASC", pk_col.replace('`', "``"))
-            } else if has_updated_at {
-                "ORDER BY `updated_at` ASC".to_string()
-            } else {
-                String::new()
-            };
-
-            let limit_clause = if limit != usize::MAX {
-                format!("LIMIT {}", limit)
-            } else {
-                String::new()
-            };
-
-            format!(
-                "SELECT * FROM `{}` {} {} {}",
-                safe_table, where_clause, order_clause, limit_clause
-            ).split_whitespace().collect::<Vec<_>>().join(" ")
-        } else {
-            let order_clause = if let Some(pk_col) = pk_col_opt {
-                format!("ORDER BY `{}` DESC", pk_col.replace('`', "``"))
-            } else {
-                String::new()
-            };
-            let limit_clause = if limit != usize::MAX {
-                format!("LIMIT {}", limit)
-            } else {
-                String::new()
-            };
-            format!(
-                "SELECT * FROM `{}` {} {}",
-                safe_table, order_clause, limit_clause
-            ).split_whitespace().collect::<Vec<_>>().join(" ")
-        };
-        Some(limited_query)
-    } else {
-        None
-    };
-
-    download_export_payload(
-        client,
-        base_url,
-        csrf_token,
-        pma_config,
-        table_name,
-        struct_or_data,
-        sql_structure,
-        sql_create,
-        sql_type_val,
-        custom_query_opt,
-        cached_endpoint,
-        app,
-        None,
-    ).await
+    Ok(Some(DownloadedTableData {
+        table_name: table_name.to_string(),
+        response_bytes: combined_sql,
+        is_gzip: false,
+        table_start,
+    }))
 }
 
 fn get_mysql_cli_binary() -> &'static str {
@@ -3155,101 +3253,42 @@ pub async fn export_pma_database(
                     None => break,
                 };
 
-                // === Retry Timeout Tanpa Memotong Total Data ===
-                // Jika unduhan direct single-shot mengalami timeout (> 120s),
-                // jangan pernah memotong batas data menjadi setengah!
-                // Alihkan ke MODE CICILAN (Chunking per 100.000 row) agar 100% data tetap terambil lengkap.
-                let per_table_timeout = std::time::Duration::from_secs(120);
-                let max_timeout_retries = 3u32;
-                let mut timeout_attempt = 0u32;
-                let mut maybe_data: Option<DownloadedTableData> = None;
-                let mut table_succeeded = false;
-                let mut forced_chunk_size: Option<usize> = None;
+                // Eksekusi unduh export stream (timeout 120s dikelola mandiri per-chunk di dalam fetch_table_export_stream)
+                let download_res = fetch_table_export_stream(
+                    &client_p,
+                    &base_url_p,
+                    &csrf_token_p,
+                    &pma_config_p,
+                    &table_name,
+                    &cached_endpoint_p,
+                    &table_row_counts_p,
+                    &app_p,
+                    None,
+                )
+                .await;
 
-                loop {
-                    if is_user_cancelled() {
-                        return Err("__USER_CANCELLED__".to_string());
-                    }
-                    if is_aborted() {
-                        return Err("__WORKER_ABORTED__".to_string());
-                    }
-
-                    let download_res = tokio::time::timeout(
-                        per_table_timeout,
-                        fetch_table_export_stream(
-                            &client_p,
-                            &base_url_p,
-                            &csrf_token_p,
-                            &pma_config_p,
-                            &table_name,
-                            &cached_endpoint_p,
-                            &table_row_counts_p,
+                let maybe_data = match download_res {
+                    Ok(data) => data,
+                    Err(e) => {
+                        if e == "__USER_CANCELLED__" {
+                            return Err("__USER_CANCELLED__".to_string());
+                        }
+                        if e == "__WORKER_ABORTED__" {
+                            return Err("__WORKER_ABORTED__".to_string());
+                        }
+                        emit_log(
                             &app_p,
-                            forced_chunk_size,
-                        ),
-                    )
-                    .await;
-
-                    match download_res {
-                        Ok(Ok(data)) => {
-                            // Berhasil — keluar dari retry loop
-                            maybe_data = data;
-                            table_succeeded = true;
-                            break;
-                        }
-                        Ok(Err(e)) => {
-                            // Download error (bukan timeout) — skip tabel ini
-                            emit_log(
-                                &app_p,
-                                "warn",
-                                format!(
-                                    "⚠️ [Tabel '{}'] Gagal mengunduh export: {}. Melanjutkan ke tabel berikutnya...",
-                                    table_name, e
-                                ),
-                            );
-                            break; // keluar retry loop, table_succeeded tetap false
-                        }
-                        Err(_elapsed) => {
-                            timeout_attempt += 1;
-                            if timeout_attempt >= max_timeout_retries {
-                                // 3x timeout berturut-turut → skip tabel
-                                emit_log(
-                                    &app_p,
-                                    "warn",
-                                    format!(
-                                        "⏱️ [Tabel '{}'] TIMEOUT {}x berturut-turut (masing-masing 2 menit). Tabel di-skip, melanjutkan ke tabel berikutnya...",
-                                        table_name, max_timeout_retries
-                                    ),
-                                );
-                                break; // keluar retry loop, table_succeeded tetap false
-                            }
-
-                            // JANGAN MEMOTONG TOTAL DATA!
-                            // Alihkan ke MODE CICILAN (Chunking) dengan ukuran chunk yang ringan untuk server:
-                            // Percobaan 1: 100.000 row per cicilan
-                            // Percobaan 2: 50.000 row per cicilan
-                            // Percobaan 3: 25.000 row per cicilan
-                            let next_chunk_size = match timeout_attempt {
-                                1 => 100_000usize,
-                                2 => 50_000usize,
-                                _ => 25_000usize,
-                            };
-                            forced_chunk_size = Some(next_chunk_size);
-
-                            emit_log(
-                                &app_p,
-                                "warn",
-                                format!(
-                                    "⏱️ [Tabel '{}'] TIMEOUT unduhan langsung (percobaan {}/{}): Server remote overload atau tabel sangat besar. Beralih ke MODE CICILAN ({} row per chunk) agar SELURUH data tetap terambil lengkap...",
-                                    table_name, timeout_attempt, max_timeout_retries,
-                                    format_number(next_chunk_size)
-                                ),
-                            );
-                            // Jeda singkat sebelum retry
-                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                        }
+                            "warn",
+                            format!(
+                                "⚠️ [Tabel '{}'] Gagal mengunduh export: {}. Melanjutkan ke tabel berikutnya...",
+                                table_name, e
+                            ),
+                        );
+                        None
                     }
-                }
+                };
+
+                let table_succeeded = maybe_data.is_some();
 
                 if !table_succeeded {
                     // Kirim None ke consumer agar counter completed tetap bertambah
