@@ -1,7 +1,6 @@
 use crate::commands::LocalDbConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tauri::Emitter;
@@ -1664,6 +1663,8 @@ struct DownloadedTableData {
     response_bytes: Vec<u8>,
     is_gzip: bool,
     table_start: std::time::Instant,
+    already_imported: bool,
+    imported_rows: usize,
 }
 
 /// Helper download low-level payload dari phpMyAdmin server
@@ -1971,6 +1972,8 @@ async fn download_export_payload(
                 response_bytes: response_bytes.to_vec(),
                 is_gzip: is_gz,
                 table_start,
+                already_imported: false,
+                imported_rows: 0,
             }));
         }
     }
@@ -1991,6 +1994,7 @@ async fn fetch_table_export_stream(
     base_url: &str,
     csrf_token: &str,
     pma_config: &PmaExportConfig,
+    local_config: &LocalDbConfig,
     table_name: &str,
     cached_endpoint: &std::sync::Arc<tokio::sync::Mutex<Option<(String, String)>>>,
     table_row_counts: &std::sync::Arc<HashMap<String, usize>>,
@@ -2180,8 +2184,7 @@ async fn fetch_table_export_stream(
         }
     }
 
-    // === MODE CICILAN (CHUNKING) PER-CHUNK TIMEOUT (1 MENIT / 60s) ===
-    // Percobaan pertama: 100.000 row, percobaan kedua: 50.000 row, percobaan ketiga: 25.000 row
+    // === MODE CICILAN (CHUNKING) DENGAN LIVE STREAMING LANGSUNG KE MYSQL LOKAL ===
     let mut chunk_size = forced_chunk_size.unwrap_or(100_000usize);
     let effective_est = effective_row_limit
         .map(|l| if est_rows > 0 { l.min(est_rows) } else { l })
@@ -2204,7 +2207,7 @@ async fn fetch_table_export_stream(
             app,
             "info",
             format!(
-                "[Tabel '{}'] Mengunduh dalam cicilan {} chunk ({} row per chunk, target ~{} row)...",
+                "[Tabel '{}'] Mengunduh & mengalirkan dalam cicilan {} chunk ({} row per chunk, target ~{} row)...",
                 table_name,
                 total_chunks,
                 format_number(chunk_size),
@@ -2216,25 +2219,57 @@ async fn fetch_table_export_stream(
             app,
             "info",
             format!(
-                "[Tabel '{}'] Mengunduh dalam cicilan chunk ({} row per chunk) hingga seluruh data selesai...",
+                "[Tabel '{}'] Mengunduh & mengalirkan dalam cicilan chunk ({} row per chunk) hingga seluruh data selesai...",
                 table_name,
                 format_number(chunk_size)
             ),
         );
     }
 
-    let mut combined_sql = Vec::with_capacity(if total_chunks > 0 { (total_chunks.min(50)) * 2 * 1024 * 1024 } else { 4 * 1024 * 1024 });
+    // Buka koneksi stream child process MySQL sekali untuk seluruh chunk tabel ini
+    let (mut child, mut child_stdin, mut child_stderr) = spawn_mysql_child(local_config)?;
+    let is_fresh = pma_config.sync_mode.as_deref() == Some("fresh");
+
+    use tokio::io::AsyncWriteExt;
+    let drop_clause = if is_fresh {
+        format!("DROP TABLE IF EXISTS `{}`;\n", safe_table)
+    } else {
+        String::new()
+    };
+    let prelude_str = format!(
+        "SET SESSION sql_log_bin=0;\n\
+         SET SESSION foreign_key_checks=0;\n\
+         SET SESSION unique_checks=0;\n\
+         SET SESSION autocommit=0;\n\
+         SET SESSION sql_mode='';\n\
+         SET SESSION net_read_timeout=600;\n\
+         SET SESSION net_write_timeout=600;\n\
+         SET SESSION wait_timeout=600;\n\
+         SET SESSION lock_wait_timeout=600;\n\
+         SET SESSION innodb_lock_wait_timeout=600;\n\
+         {}",
+        drop_clause
+    );
+
+    if let Err(e) = child_stdin.write_all(prelude_str.as_bytes()).await {
+        let _ = child.start_kill();
+        return Err(format!("Gagal menulis inisialisasi prelude ke MySQL lokal: {}", e));
+    }
+
     let mut chunk_idx = 0usize;
     let mut current_offset = 0usize;
     let mut last_seen_pk: Option<String> = None;
+    let mut total_imported_rows = 0usize;
     let max_chunks_by_limit = effective_row_limit.map(|l| (l + chunk_size - 1) / chunk_size).unwrap_or(5000);
     let max_safe_chunks = max_chunks_by_limit.min(5000); // Mendukung hingga 250 juta baris
 
     while chunk_idx < max_safe_chunks {
         if is_user_cancelled() {
+            let _ = child.start_kill();
             return Err("__USER_CANCELLED__".to_string());
         }
         if is_aborted() {
+            let _ = child.start_kill();
             return Err("__WORKER_ABORTED__".to_string());
         }
 
@@ -2260,9 +2295,11 @@ async fn fetch_table_export_stream(
         while chunk_attempt < max_chunk_attempts {
             chunk_attempt += 1;
             if is_user_cancelled() {
+                let _ = child.start_kill();
                 return Err("__USER_CANCELLED__".to_string());
             }
             if is_aborted() {
+                let _ = child.start_kill();
                 return Err("__WORKER_ABORTED__".to_string());
             }
 
@@ -2334,6 +2371,7 @@ async fn fetch_table_export_stream(
                     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                 }
                 Err(e) => {
+                    let _ = child.start_kill();
                     return Err(e);
                 }
             }
@@ -2359,10 +2397,20 @@ async fn fetch_table_export_stream(
                 }
             }
 
-            if !combined_sql.is_empty() {
-                combined_sql.push(b'\n');
+            // Alirkan langsung raw_chunk_sql ke STDIN child process MySQL secara real-time
+            if !raw_chunk_sql.is_empty() {
+                if let Err(e) = child_stdin.write_all(&raw_chunk_sql).await {
+                    let _ = child.start_kill();
+                    return Err(format!("[Tabel '{}'] Gagal menulis data chunk ke MySQL: {}", table_name, e));
+                }
+                if let Err(e) = child_stdin.write_all(b"\nCOMMIT;\n").await {
+                    let _ = child.start_kill();
+                    return Err(format!("[Tabel '{}'] Gagal mengeksekusi COMMIT chunk ke MySQL: {}", table_name, e));
+                }
+                let _ = child_stdin.flush().await;
             }
-            combined_sql.extend_from_slice(&raw_chunk_sql);
+
+            total_imported_rows += row_count_in_chunk;
 
             let display_progress = if total_chunks > 0 {
                 format!("Chunk {}/{}", chunk_idx + 1, total_chunks.max(chunk_idx + 1))
@@ -2374,7 +2422,7 @@ async fn fetch_table_export_stream(
                 app,
                 "info",
                 format!(
-                    "[Tabel '{}'] {} selesai diunduh: ~{} row ({})",
+                    "[Tabel '{}'] {} selesai: ~{} row ({}) langsung masuk MySQL lokal",
                     table_name,
                     display_progress,
                     format_number(row_count_in_chunk),
@@ -2393,6 +2441,7 @@ async fn fetch_table_export_stream(
             // Jeda throttling singkat antar chunk agar memory & I/O remote server PMA tidak overload
             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
         } else {
+            let _ = child.start_kill();
             emit_log(
                 app,
                 "warn",
@@ -2405,11 +2454,29 @@ async fn fetch_table_export_stream(
         }
     }
 
+    // Finalisasi MySQL child process untuk mode cicilan
+    let postlude = b"\nCOMMIT;\nSET SESSION foreign_key_checks=1;\nSET SESSION unique_checks=1;\nSET SESSION autocommit=1;\n";
+    let _ = child_stdin.write_all(postlude).await;
+    let _ = child_stdin.flush().await;
+    drop(child_stdin);
+
+    use tokio::io::AsyncReadExt;
+    let mut err_buf = Vec::new();
+    let _ = child_stderr.read_to_end(&mut err_buf).await;
+    let status = child.wait().await.map_err(|e| format!("Gagal menunggu child process MySQL: {}", e))?;
+
+    if !status.success() {
+        let stderr_full = String::from_utf8_lossy(&err_buf);
+        return Err(format!("MySQL import error pada mode cicilan: {}", stderr_full.trim()));
+    }
+
     Ok(Some(DownloadedTableData {
         table_name: table_name.to_string(),
-        response_bytes: combined_sql,
+        response_bytes: Vec::new(),
         is_gzip: false,
         table_start,
+        already_imported: true,
+        imported_rows: total_imported_rows,
     }))
 }
 
@@ -2507,6 +2574,106 @@ pub fn get_docker_mysql_cli(container: &str) -> String {
     }
 
     detected
+}
+
+/// Helper untuk menjalankan child process MySQL CLI / Docker exec dengan parameter optimal
+fn spawn_mysql_child(
+    local_config: &LocalDbConfig,
+) -> Result<(tokio::process::Child, tokio::process::ChildStdin, tokio::process::ChildStderr), String> {
+    let host = if local_config.host.is_empty() {
+        "127.0.0.1"
+    } else {
+        &local_config.host
+    };
+    let port_str = local_config.port.to_string();
+    let db_name = &local_config.database;
+    let cli_bin = get_mysql_cli_binary();
+    let use_docker = local_config.use_docker && !local_config.docker_container.trim().is_empty();
+    let container_name = local_config.docker_container.trim();
+
+    let docker_cli = if use_docker {
+        get_docker_mysql_cli(container_name)
+    } else {
+        String::new()
+    };
+
+    let mut cmd = if use_docker {
+        let mut c = tokio::process::Command::new("docker");
+        c.arg("exec")
+            .arg("-i")
+            .arg(container_name)
+            .arg(&docker_cli)
+            .arg("--skip-ssl")
+            .arg("--binary-mode")
+            .arg("--quick")
+            .arg("--max-allowed-packet=1024M")
+            .arg("--net-buffer-length=1M")
+            .arg("--connect-timeout=60")
+            .arg("--default-character-set=utf8mb4")
+            .arg("-u")
+            .arg(&local_config.username);
+
+        if !local_config.password.is_empty() {
+            c.arg(format!("-p{}", local_config.password));
+        }
+
+        c.arg(db_name);
+        c
+    } else {
+        let mut c = tokio::process::Command::new(cli_bin);
+        c.arg("--skip-ssl")
+            .arg("--binary-mode")
+            .arg("--quick")
+            .arg("--max-allowed-packet=1024M")
+            .arg("--net-buffer-length=1M")
+            .arg("--connect-timeout=60")
+            .arg("--default-character-set=utf8mb4")
+            .arg("-h")
+            .arg(host)
+            .arg("-P")
+            .arg(&port_str)
+            .arg("-u")
+            .arg(&local_config.username);
+
+        if !local_config.password.is_empty() {
+            c.arg(format!("-p{}", local_config.password));
+        }
+
+        c.arg(db_name);
+        c
+    };
+
+    cmd.stdin(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    cmd.stdout(std::process::Stdio::null());
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            if use_docker {
+                return Err(format!(
+                    "Gagal menjalankan perintah 'docker exec -i {} {}'. Pastikan Docker service berjalan dan nama kontainer benar. Error: {}",
+                    container_name, docker_cli, e
+                ));
+            } else {
+                return Err(format!(
+                    "Gagal menjalankan perintah CLI '{}'. Pastikan client MySQL/MariaDB terinstall dan ada di PATH system. Error: {}",
+                    cli_bin, e
+                ));
+            }
+        }
+    };
+
+    let child_stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "Gagal membuka STDIN child process mysql".to_string())?;
+    let child_stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "Gagal membuka STDERR child process mysql".to_string())?;
+
+    Ok((child, child_stdin, child_stderr))
 }
 
 
@@ -2657,17 +2824,26 @@ async fn import_table_to_local_internal(
 
     let table_name = &data.table_name;
     let table_start = data.table_start;
+
+    // Jika data sudah dialirkan dan diimpor langsung ke MySQL secara real-time per chunk (Mode Cicilan)
+    if data.already_imported {
+        let duration = table_start.elapsed();
+        emit_log(
+            app,
+            "success",
+            format!(
+                "[Tabel '{}'] Sinkronisasi selesai: ~{} row berhasil diimpor ke MySQL lokal ({:.2}s)",
+                table_name,
+                format_number(data.imported_rows),
+                duration.as_secs_f64()
+            ),
+        );
+        return Ok(data.imported_rows);
+    }
+
     let response_bytes = data.response_bytes;
     let _is_gzip = data.is_gzip;
     let total_bytes = response_bytes.len();
-
-    let host = if local_config.host.is_empty() {
-        "127.0.0.1"
-    } else {
-        &local_config.host
-    };
-    let port_str = local_config.port.to_string();
-    let db_name = &local_config.database;
     let is_fresh = force_fresh || pma_config.sync_mode.as_deref() == Some("fresh");
 
     let is_structure_only = pma_config.sync_mode.as_deref() == Some("structure_only")
@@ -2723,9 +2899,6 @@ async fn import_table_to_local_internal(
     let max_retries = 3;
     let mut attempt = 0;
     let mut last_error = String::new();
-    let cli_bin = get_mysql_cli_binary();
-    let use_docker = local_config.use_docker && !local_config.docker_container.trim().is_empty();
-    let container_name = local_config.docker_container.trim();
 
     while attempt < max_retries {
         attempt += 1;
@@ -2737,87 +2910,7 @@ async fn import_table_to_local_internal(
             return Err("__WORKER_ABORTED__".to_string());
         }
 
-        let docker_cli = if use_docker {
-            get_docker_mysql_cli(container_name)
-        } else {
-            String::new()
-        };
-
-        let mut cmd = if use_docker {
-            let mut c = Command::new("docker");
-            c.arg("exec")
-                .arg("-i")
-                .arg(container_name)
-                .arg(&docker_cli)
-                .arg("--skip-ssl")
-                .arg("--binary-mode")
-                .arg("--quick")
-                .arg("--max-allowed-packet=1024M")
-                .arg("--net-buffer-length=1M")
-                .arg("--connect-timeout=60")
-                .arg("--default-character-set=utf8mb4")
-                .arg("-u")
-                .arg(&local_config.username);
-
-            if !local_config.password.is_empty() {
-                c.arg(format!("-p{}", local_config.password));
-            }
-
-            c.arg(db_name);
-            c
-        } else {
-            let mut c = Command::new(cli_bin);
-            c.arg("--skip-ssl")
-                .arg("--binary-mode")
-                .arg("--quick")
-                .arg("--max-allowed-packet=1024M")
-                .arg("--net-buffer-length=1M")
-                .arg("--connect-timeout=60")
-                .arg("--default-character-set=utf8mb4")
-                .arg("-h")
-                .arg(host)
-                .arg("-P")
-                .arg(&port_str)
-                .arg("-u")
-                .arg(&local_config.username);
-
-            if !local_config.password.is_empty() {
-                c.arg(format!("-p{}", local_config.password));
-            }
-
-            c.arg(db_name);
-            c
-        };
-
-        cmd.stdin(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-        cmd.stdout(Stdio::null());
-
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                if use_docker {
-                    return Err(format!(
-                        "Gagal menjalankan perintah 'docker exec -i {} {}'. Pastikan Docker service berjalan dan nama kontainer benar. Error: {}",
-                        container_name, docker_cli, e
-                    ));
-                } else {
-                    return Err(format!(
-                        "Gagal menjalankan perintah CLI '{}'. Pastikan client MySQL/MariaDB terinstall dan ada di PATH system. Error: {}",
-                        cli_bin, e
-                    ));
-                }
-            }
-        };
-
-        let mut child_stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| "Gagal membuka STDIN child process mysql".to_string())?;
-        let mut child_stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| "Gagal membuka STDERR child process mysql".to_string())?;
+        let (mut child, mut child_stdin, mut child_stderr) = spawn_mysql_child(local_config)?;
 
         let sql_bytes_task = sql_bytes_arc.clone();
         let app_handle = app.clone();
@@ -3083,6 +3176,7 @@ async fn import_table_to_local_with_fallback(
                     base_url,
                     csrf_token,
                     &fresh_pma_config,
+                    local_config,
                     &table_name,
                     cached_endpoint,
                     table_row_counts,
@@ -3412,6 +3506,7 @@ pub async fn export_pma_database(
         let base_url_p = base_url.clone();
         let csrf_token_p = csrf_token.clone();
         let pma_config_p = pma_config.clone();
+        let local_config_p = local_config.clone();
         let cached_endpoint_p = cached_endpoint.clone();
         let table_row_counts_p = table_row_counts.clone();
         let app_p = app.clone();
@@ -3442,6 +3537,7 @@ pub async fn export_pma_database(
                     &base_url_p,
                     &csrf_token_p,
                     &pma_config_p,
+                    &local_config_p,
                     &table_name,
                     &cached_endpoint_p,
                     &table_row_counts_p,
