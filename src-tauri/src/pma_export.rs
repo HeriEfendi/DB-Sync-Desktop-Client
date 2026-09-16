@@ -2765,8 +2765,6 @@ async fn import_table_to_local_internal(
                  SET SESSION unique_checks=0;\n\
                  SET SESSION autocommit=0;\n\
                  SET SESSION sql_mode='';\n\
-                 SET SESSION net_buffer_length=1048576;\n\
-                 SET SESSION max_allowed_packet=1073741824;\n\
                  SET SESSION net_read_timeout=600;\n\
                  SET SESSION net_write_timeout=600;\n\
                  SET SESSION wait_timeout=600;\n\
