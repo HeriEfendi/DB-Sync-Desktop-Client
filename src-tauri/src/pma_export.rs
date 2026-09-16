@@ -2125,7 +2125,7 @@ async fn fetch_table_export_stream(
                     app,
                     "warn",
                     format!(
-                        "⏱️ [Tabel '{}'] Unduhan langsung TIMEOUT (> 1 menit): Server remote overload atau tabel sangat besar. Beralih otomatis ke MODE CICILAN (50.000 row per chunk) agar SELURUH data tetap terambil lengkap...",
+                        "⏱️ [Tabel '{}'] Unduhan langsung TIMEOUT (> 1 menit): Server remote overload atau tabel sangat besar. Beralih otomatis ke MODE CICILAN (100.000 row per chunk) agar SELURUH data tetap terambil lengkap...",
                         table_name
                     ),
                 );
@@ -2136,8 +2136,8 @@ async fn fetch_table_export_stream(
     }
 
     // === MODE CICILAN (CHUNKING) PER-CHUNK TIMEOUT (1 MENIT / 60s) ===
-    // Setiap chunk memiliki timeout 60 detik mandiri. Total tabel dapat berjalan berapa pun chunk-nya.
-    let mut chunk_size = forced_chunk_size.unwrap_or(50_000usize);
+    // Percobaan pertama: 100.000 row, percobaan kedua: 50.000 row, percobaan ketiga: 25.000 row
+    let mut chunk_size = forced_chunk_size.unwrap_or(100_000usize);
     let effective_est = effective_row_limit
         .map(|l| if est_rows > 0 { l.min(est_rows) } else { l })
         .unwrap_or(est_rows);
@@ -2180,6 +2180,7 @@ async fn fetch_table_export_stream(
 
     let mut combined_sql = Vec::new();
     let mut chunk_idx = 0usize;
+    let mut current_offset = 0usize;
     let max_chunks_by_limit = effective_row_limit.map(|l| (l + chunk_size - 1) / chunk_size).unwrap_or(5000);
     let max_safe_chunks = max_chunks_by_limit.min(5000); // Mendukung hingga 250 juta baris
 
@@ -2191,15 +2192,9 @@ async fn fetch_table_export_stream(
             return Err("__WORKER_ABORTED__".to_string());
         }
 
-        let offset = chunk_idx * chunk_size;
         let chunk_struct = if chunk_idx == 0 && !is_incremental { "structure_and_data" } else { "data" };
         let chunk_sql_struct = if chunk_idx == 0 && !is_incremental { "1" } else { "0" };
         let chunk_sql_create = if chunk_idx == 0 && !is_incremental { "true" } else { "false" };
-
-        let chunk_query = format!(
-            "SELECT * FROM `{}` {} LIMIT {} OFFSET {}",
-            safe_table, order_clause, chunk_size, offset
-        ).split_whitespace().collect::<Vec<_>>().join(" ");
 
         let chunk_label = if total_chunks > 0 {
             let display_total = total_chunks.max(chunk_idx + 1);
@@ -2208,7 +2203,7 @@ async fn fetch_table_export_stream(
             format!("chunk {}", chunk_idx + 1)
         };
 
-        // Percobaan per-chunk (hingga 3 kali dengan penyesuaian ukuran chunk jika timeout)
+        // Percobaan per-chunk (Percobaan 1: 100k, Percobaan 2: 50k, Percobaan 3: 25k jika timeout)
         let mut chunk_attempt = 0;
         let mut chunk_res = None;
 
@@ -2221,6 +2216,11 @@ async fn fetch_table_export_stream(
                 return Err("__WORKER_ABORTED__".to_string());
             }
 
+            let chunk_query = format!(
+                "SELECT * FROM `{}` {} LIMIT {} OFFSET {}",
+                safe_table, order_clause, chunk_size, current_offset
+            ).split_whitespace().collect::<Vec<_>>().join(" ");
+
             match download_export_payload(
                 client,
                 base_url,
@@ -2231,7 +2231,7 @@ async fn fetch_table_export_stream(
                 chunk_sql_struct,
                 chunk_sql_create,
                 sql_type_val,
-                Some(chunk_query.clone()),
+                Some(chunk_query),
                 cached_endpoint,
                 app,
                 Some(&chunk_label),
@@ -2241,13 +2241,17 @@ async fn fetch_table_export_stream(
                     break;
                 }
                 Err(e) if e.contains("TIMEOUT") && chunk_attempt < 3 => {
-                    chunk_size = (chunk_size / 2).max(10_000);
+                    chunk_size = match chunk_attempt {
+                        1 => 50_000,
+                        2 => 25_000,
+                        _ => 25_000,
+                    };
                     emit_log(
                         app,
                         "warn",
                         format!(
-                            "⏱️ [Tabel '{}'] {} TIMEOUT (> 1 menit). Mencoba ulang dengan ukuran chunk lebih kecil ({} row)...",
-                            table_name, chunk_label, format_number(chunk_size)
+                            "⏱️ [Tabel '{}'] {} TIMEOUT (> 1 menit) pada percobaan {}/3. Mencoba ulang dengan ukuran chunk lebih kecil ({} row)...",
+                            table_name, chunk_label, chunk_attempt, format_number(chunk_size)
                         ),
                     );
                     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -2294,6 +2298,7 @@ async fn fetch_table_export_stream(
                 ),
             );
 
+            current_offset += chunk_size;
             chunk_idx += 1;
 
             // Jika chunk tidak memiliki data INSERT atau baris kurang dari chunk_size, berarti seluruh isi tabel telah selesai
