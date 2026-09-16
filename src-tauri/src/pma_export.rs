@@ -1659,12 +1659,14 @@ async fn download_export_payload(
     'candidate_loop: for (export_url, compression_mode) in candidates {
         let is_gz = compression_mode == "gzip";
 
+        let is_structure_only = struct_or_data == "structure";
+        let sql_data_val = if is_structure_only { "0" } else { "1" };
+
         let mut form: Vec<(String, String)> = vec![
             ("db".to_string(), pma_config.database.clone()),
             ("table".to_string(), table_name.to_string()),
             ("table_select[]".to_string(), table_name.to_string()),
             ("table_structure[]".to_string(), table_name.to_string()),
-            ("table_data[]".to_string(), table_name.to_string()),
             ("single_table".to_string(), "true".to_string()),
             ("what".to_string(), "sql".to_string()),
             ("export_type".to_string(), "table".to_string()),
@@ -1678,7 +1680,7 @@ async fn download_export_payload(
                 struct_or_data.to_string(),
             ),
             ("sql_structure".to_string(), sql_structure.to_string()),
-            ("sql_data".to_string(), "1".to_string()),
+            ("sql_data".to_string(), sql_data_val.to_string()),
             ("sql_create_table".to_string(), sql_create.to_string()),
             ("sql_drop_table".to_string(), "false".to_string()),
             ("sql_if_not_exists".to_string(), "true".to_string()),
@@ -1690,6 +1692,10 @@ async fn download_export_payload(
             ("sql_disable_fk".to_string(), "true".to_string()),
             ("sql_use_transaction".to_string(), "true".to_string()),
         ];
+
+        if !is_structure_only {
+            form.push(("table_data[]".to_string(), table_name.to_string()));
+        }
 
         if let Some(ref limited_query) = custom_query_opt {
             form.push(("sql_query".to_string(), limited_query.clone()));
@@ -1895,7 +1901,7 @@ async fn fetch_table_export_stream(
     cached_endpoint: &std::sync::Arc<tokio::sync::Mutex<Option<(String, String)>>>,
     table_row_counts: &std::sync::Arc<HashMap<String, usize>>,
     app: &tauri::AppHandle,
-    row_limit_override: Option<usize>,
+    forced_chunk_size: Option<usize>,
 ) -> Result<Option<DownloadedTableData>, String> {
     if is_user_cancelled() {
         return Err("__USER_CANCELLED__".to_string());
@@ -1940,7 +1946,10 @@ async fn fetch_table_export_stream(
         return Ok(None);
     }
 
-    let sql_type_val = if pma_config.sync_mode.as_deref() == Some("fresh") {
+    let is_structure_only = pma_config.sync_mode.as_deref() == Some("structure_only")
+        || pma_config.sync_mode.as_deref() == Some("structure");
+
+    let sql_type_val = if pma_config.sync_mode.as_deref() == Some("fresh") || is_structure_only {
         "INSERT"
     } else {
         "REPLACE"
@@ -1948,31 +1957,29 @@ async fn fetch_table_export_stream(
 
     let is_incremental = pma_config.sync_mode.as_deref() == Some("incremental");
     let est_rows = table_row_counts.get(table_name).copied().unwrap_or(0);
-    // row_limit_override menimpa pma_config.row_limit saat retry timeout dengan limit dikurangi
-    let effective_row_limit = row_limit_override.or(pma_config.row_limit).filter(|limit| *limit > 0);
+    let effective_row_limit = pma_config.row_limit.filter(|limit| *limit > 0);
 
-    if row_limit_override.is_some() {
-        emit_log(
-            app,
-            "info",
-            format!(
-                "[Tabel '{}'] Retry dengan limit dikurangi: {} row",
-                table_name,
-                format_number(row_limit_override.unwrap())
-            ),
-        );
-    }
-
-    // Kriteria chunking:
-    // Tabel besar (est_rows >= 150_000), tanpa incremental watermark sempit, dan row_limit tidak di-set kecil (< 150_000)
-    let should_chunk = est_rows >= 150_000
+    let is_forced_chunk = forced_chunk_size.is_some();
+    // Kriteria chunking (cicilan):
+    // 1. Bukan structure_only
+    // 2. Bukan incremental dengan watermark sempit
+    // 3. Aktif jika dipaksa chunking (karena retry timeout), ATAU est_rows >= 100_000, ATAU limit yang dipilih user >= 100_000
+    let should_chunk = !is_structure_only
         && !has_incremental_watermark
-        && effective_row_limit.map(|l| l >= 150_000).unwrap_or(true);
+        && (is_forced_chunk
+            || est_rows >= 100_000
+            || effective_row_limit.map(|l| l >= 100_000).unwrap_or(false));
 
     if should_chunk {
-        let chunk_size = 100_000usize;
-        let effective_est = effective_row_limit.map(|l| l.min(est_rows)).unwrap_or(est_rows);
-        let total_chunks = (effective_est + chunk_size - 1) / chunk_size;
+        let chunk_size = forced_chunk_size.unwrap_or(100_000usize);
+        let effective_est = effective_row_limit
+            .map(|l| if est_rows > 0 { l.min(est_rows) } else { l })
+            .unwrap_or(est_rows);
+        let total_chunks = if effective_est > 0 {
+            (effective_est + chunk_size - 1) / chunk_size
+        } else {
+            0
+        };
         let safe_table = table_name.replace('`', "``");
 
         let order_clause = if let Some(pk_col) = pk_col_opt {
@@ -1981,22 +1988,34 @@ async fn fetch_table_export_stream(
             String::new()
         };
 
-        emit_log(
-            app,
-            "info",
-            format!(
-                "[Tabel '{}'] Tabel berukuran besar (~{} row). Mengunduh dalam cicilan {} chunk ({} row per chunk)...",
-                table_name,
-                format_number(est_rows),
-                total_chunks,
-                format_number(chunk_size)
-            ),
-        );
+        if total_chunks > 0 {
+            emit_log(
+                app,
+                "info",
+                format!(
+                    "[Tabel '{}'] Mengunduh dalam cicilan {} chunk ({} row per chunk, target ~{} row)...",
+                    table_name,
+                    total_chunks,
+                    format_number(chunk_size),
+                    format_number(effective_est)
+                ),
+            );
+        } else {
+            emit_log(
+                app,
+                "info",
+                format!(
+                    "[Tabel '{}'] Mengunduh dalam cicilan chunk ({} row per chunk) hingga seluruh data selesai...",
+                    table_name,
+                    format_number(chunk_size)
+                ),
+            );
+        }
 
         let mut combined_sql = Vec::new();
         let mut chunk_idx = 0usize;
-        let max_chunks_by_limit = effective_row_limit.map(|l| (l + chunk_size - 1) / chunk_size).unwrap_or(500);
-        let max_safe_chunks = max_chunks_by_limit.min(500);
+        let max_chunks_by_limit = effective_row_limit.map(|l| (l + chunk_size - 1) / chunk_size).unwrap_or(2000);
+        let max_safe_chunks = max_chunks_by_limit.min(2000); // Mendukung hingga 200 juta baris
 
         while chunk_idx < max_safe_chunks {
             if is_user_cancelled() {
@@ -2016,8 +2035,12 @@ async fn fetch_table_export_stream(
                 safe_table, order_clause, chunk_size, offset
             ).split_whitespace().collect::<Vec<_>>().join(" ");
 
-            let display_total = total_chunks.max(chunk_idx + 1);
-            let chunk_label = format!("chunk {}/{}", chunk_idx + 1, display_total);
+            let chunk_label = if total_chunks > 0 {
+                let display_total = total_chunks.max(chunk_idx + 1);
+                format!("chunk {}/{}", chunk_idx + 1, display_total)
+            } else {
+                format!("chunk {}", chunk_idx + 1)
+            };
 
             let chunk_res = download_export_payload(
                 client,
@@ -2053,14 +2076,19 @@ async fn fetch_table_export_stream(
                 }
                 combined_sql.extend_from_slice(&raw_chunk_sql);
 
+                let display_progress = if total_chunks > 0 {
+                    format!("Chunk {}/{}", chunk_idx + 1, total_chunks.max(chunk_idx + 1))
+                } else {
+                    format!("Chunk {}", chunk_idx + 1)
+                };
+
                 emit_log(
                     app,
                     "info",
                     format!(
-                        "[Tabel '{}'] Chunk {}/{} selesai diunduh: ~{} row ({})",
+                        "[Tabel '{}'] {} selesai diunduh: ~{} row ({})",
                         table_name,
-                        chunk_idx + 1,
-                        display_total,
+                        display_progress,
                         format_number(row_count_in_chunk),
                         format_byte_size(chunk_len)
                     ),
@@ -2088,11 +2116,19 @@ async fn fetch_table_export_stream(
         }));
     }
 
-    let struct_or_data = if is_incremental { "data" } else { "structure_and_data" };
+    let struct_or_data = if is_structure_only {
+        "structure"
+    } else if is_incremental {
+        "data"
+    } else {
+        "structure_and_data"
+    };
     let sql_structure = if is_incremental { "0" } else { "1" };
     let sql_create = if is_incremental { "false" } else { "true" };
 
-    let custom_query_opt = if effective_row_limit.is_some() || has_incremental_watermark {
+    let custom_query_opt = if is_structure_only {
+        None
+    } else if effective_row_limit.is_some() || has_incremental_watermark {
         let limit = effective_row_limit.unwrap_or(usize::MAX);
         let safe_table = table_name.replace('`', "``");
 
@@ -2372,10 +2408,12 @@ async fn import_table_to_local_internal(
 
     let imported_rows = count_imported_sql_rows(&sql_bytes);
     let has_create_table = sql_bytes.windows(12).any(|w| w == b"CREATE TABLE");
+    let is_structure_only = pma_config.sync_mode.as_deref() == Some("structure_only")
+        || pma_config.sync_mode.as_deref() == Some("structure");
     let is_fresh = force_fresh || pma_config.sync_mode.as_deref() == Some("fresh");
 
     // Zero-Row Fast Skip: jika 0 baris data dan tidak butuh membuat struktur tabel baru, lewati seketika
-    if imported_rows == 0 && (!is_fresh || !has_create_table) {
+    if imported_rows == 0 && (!is_fresh || !has_create_table) && !is_structure_only {
         emit_log(
             app,
             "info",
@@ -2387,16 +2425,28 @@ async fn import_table_to_local_internal(
         return Ok(0);
     }
 
-    emit_log(
-        app,
-        "info",
-        format!(
-            "[Tabel '{}'] Data diterima {} (format: {}). Memulai impor ke MySQL lokal...",
-            table_name,
-            format_byte_size(total_bytes),
-            if is_actual_gzip { "GZIP" } else { "SQL/raw" }
-        ),
-    );
+    if is_structure_only {
+        emit_log(
+            app,
+            "info",
+            format!(
+                "[Tabel '{}'] DDL Struktur diterima ({}). Mengeksekusi pembuatan tabel di MySQL lokal...",
+                table_name,
+                format_byte_size(total_bytes)
+            ),
+        );
+    } else {
+        emit_log(
+            app,
+            "info",
+            format!(
+                "[Tabel '{}'] Data diterima {} (format: {}). Memulai impor ke MySQL lokal...",
+                table_name,
+                format_byte_size(total_bytes),
+                if is_actual_gzip { "GZIP" } else { "SQL/raw" }
+            ),
+        );
+    }
 
     let sql_bytes_arc = std::sync::Arc::new(sql_bytes);
     let total_sql_len = sql_bytes_arc.len();
@@ -2672,14 +2722,25 @@ async fn import_table_to_local_internal(
 
     let rows_fmt = format_number(imported_rows);
 
-    emit_log(
-        app,
-        "success",
-        format!(
-            "[Tabel '{}'] Selesai! ~{} row disinkronkan dalam {}.",
-            table_name, rows_fmt, elapsed_str
-        ),
-    );
+    if is_structure_only {
+        emit_log(
+            app,
+            "success",
+            format!(
+                "[Tabel '{}'] Struktur tabel berhasil dibuat di MySQL lokal dalam {}.",
+                table_name, elapsed_str
+            ),
+        );
+    } else {
+        emit_log(
+            app,
+            "success",
+            format!(
+                "[Tabel '{}'] Selesai! ~{} row disinkronkan dalam {}.",
+                table_name, rows_fmt, elapsed_str
+            ),
+        );
+    }
 
     Ok(imported_rows)
 }
@@ -3094,18 +3155,16 @@ pub async fn export_pma_database(
                     None => break,
                 };
 
-                // === Retry dengan limit dikurangi setengah setiap timeout ===
-                // Percobaan 1: limit asli (misal 500.000)
-                // Percobaan 2: limit / 2 (250.000)
-                // Percobaan 3: limit / 4 (125.000)
-                // Jika 3x timeout berturut-turut → tabel di-skip
+                // === Retry Timeout Tanpa Memotong Total Data ===
+                // Jika unduhan direct single-shot mengalami timeout (> 120s),
+                // jangan pernah memotong batas data menjadi setengah!
+                // Alihkan ke MODE CICILAN (Chunking per 100.000 row) agar 100% data tetap terambil lengkap.
                 let per_table_timeout = std::time::Duration::from_secs(120);
-                let base_limit = pma_config_p.row_limit.filter(|l| *l > 0)
-                    .or_else(|| table_row_counts_p.get(&table_name).copied().filter(|r| *r > 0));
                 let max_timeout_retries = 3u32;
                 let mut timeout_attempt = 0u32;
                 let mut maybe_data: Option<DownloadedTableData> = None;
                 let mut table_succeeded = false;
+                let mut forced_chunk_size: Option<usize> = None;
 
                 loop {
                     if is_user_cancelled() {
@@ -3114,18 +3173,6 @@ pub async fn export_pma_database(
                     if is_aborted() {
                         return Err("__WORKER_ABORTED__".to_string());
                     }
-
-                    // Hitung limit override: bagi 2 setiap kali timeout
-                    let current_limit_override = if timeout_attempt == 0 {
-                        None // Percobaan pertama pakai limit asli dari config
-                    } else {
-                        // Setengah dari limit sebelumnya: base / 2^attempt
-                        let divisor = 1usize << timeout_attempt; // 2, 4, 8, ...
-                        let reduced = base_limit
-                            .map(|bl| (bl / divisor).max(1000)) // minimal 1000 row
-                            .or(Some(50_000 / divisor as usize)); // fallback jika tidak ada estimasi
-                        reduced
-                    };
 
                     let download_res = tokio::time::timeout(
                         per_table_timeout,
@@ -3138,7 +3185,7 @@ pub async fn export_pma_database(
                             &cached_endpoint_p,
                             &table_row_counts_p,
                             &app_p,
-                            current_limit_override,
+                            forced_chunk_size,
                         ),
                     )
                     .await;
@@ -3156,7 +3203,7 @@ pub async fn export_pma_database(
                                 &app_p,
                                 "warn",
                                 format!(
-                                    "⚠️ [Tabel '{}'] Gagal mengunduh export: {}. Tabel di-skip, melanjutkan ke tabel berikutnya...",
+                                    "⚠️ [Tabel '{}'] Gagal mengunduh export: {}. Melanjutkan ke tabel berikutnya...",
                                     table_name, e
                                 ),
                             );
@@ -3177,19 +3224,25 @@ pub async fn export_pma_database(
                                 break; // keluar retry loop, table_succeeded tetap false
                             }
 
-                            let next_limit = {
-                                let divisor = 1usize << timeout_attempt;
-                                base_limit
-                                    .map(|bl| (bl / divisor).max(1000))
-                                    .unwrap_or(50_000 / divisor)
+                            // JANGAN MEMOTONG TOTAL DATA!
+                            // Alihkan ke MODE CICILAN (Chunking) dengan ukuran chunk yang ringan untuk server:
+                            // Percobaan 1: 100.000 row per cicilan
+                            // Percobaan 2: 50.000 row per cicilan
+                            // Percobaan 3: 25.000 row per cicilan
+                            let next_chunk_size = match timeout_attempt {
+                                1 => 100_000usize,
+                                2 => 50_000usize,
+                                _ => 25_000usize,
                             };
+                            forced_chunk_size = Some(next_chunk_size);
+
                             emit_log(
                                 &app_p,
                                 "warn",
                                 format!(
-                                    "⏱️ [Tabel '{}'] TIMEOUT (percobaan {}/{}): Server membutuhkan lebih dari 2 menit. Mencoba ulang dengan limit dikurangi setengah → {} row...",
+                                    "⏱️ [Tabel '{}'] TIMEOUT unduhan langsung (percobaan {}/{}): Server remote overload atau tabel sangat besar. Beralih ke MODE CICILAN ({} row per chunk) agar SELURUH data tetap terambil lengkap...",
                                     table_name, timeout_attempt, max_timeout_retries,
-                                    format_number(next_limit)
+                                    format_number(next_chunk_size)
                                 ),
                             );
                             // Jeda singkat sebelum retry
