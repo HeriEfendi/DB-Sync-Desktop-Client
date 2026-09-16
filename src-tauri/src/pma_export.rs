@@ -2178,9 +2178,10 @@ async fn fetch_table_export_stream(
         );
     }
 
-    let mut combined_sql = Vec::new();
+    let mut combined_sql = Vec::with_capacity(if total_chunks > 0 { (total_chunks.min(50)) * 2 * 1024 * 1024 } else { 4 * 1024 * 1024 });
     let mut chunk_idx = 0usize;
     let mut current_offset = 0usize;
+    let mut last_seen_pk: Option<String> = None;
     let max_chunks_by_limit = effective_row_limit.map(|l| (l + chunk_size - 1) / chunk_size).unwrap_or(5000);
     let max_safe_chunks = max_chunks_by_limit.min(5000); // Mendukung hingga 250 juta baris
 
@@ -2216,10 +2217,25 @@ async fn fetch_table_export_stream(
                 return Err("__WORKER_ABORTED__".to_string());
             }
 
-            let chunk_query = format!(
-                "SELECT * FROM `{}` {} LIMIT {} OFFSET {}",
-                safe_table, order_clause, chunk_size, current_offset
-            ).split_whitespace().collect::<Vec<_>>().join(" ");
+            // Langkah 1: Keyset Pagination (Seek Method) jika PK terdeteksi & chunk > 0 untuk kecepatan O(1) instan
+            let chunk_query = if let (Some(pk_col), Some(ref last_pk)) = (pk_col_opt, &last_seen_pk) {
+                format!(
+                    "SELECT * FROM `{}` WHERE `{}` > {} ORDER BY `{}` ASC LIMIT {}",
+                    safe_table,
+                    pk_col.replace('`', "``"),
+                    last_pk,
+                    pk_col.replace('`', "``"),
+                    chunk_size
+                )
+            } else {
+                format!(
+                    "SELECT * FROM `{}` {} LIMIT {} OFFSET {}",
+                    safe_table, order_clause, chunk_size, current_offset
+                )
+            }
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
 
             match download_export_payload(
                 client,
@@ -2274,6 +2290,13 @@ async fn fetch_table_export_stream(
             let row_count_in_chunk = count_imported_sql_rows(&raw_chunk_sql);
             let has_insert = raw_chunk_sql.windows(11).any(|w| w == b"INSERT INTO")
                 || raw_chunk_sql.windows(12).any(|w| w == b"REPLACE INTO");
+
+            // Update last_seen_pk dari chunk yang baru selesai untuk Keyset Pagination chunk berikutnya
+            if let Some(pk_col) = pk_col_opt {
+                if let Some(new_pk) = extract_last_pk_value(&raw_chunk_sql, pk_col) {
+                    last_seen_pk = Some(new_pk);
+                }
+            }
 
             if !combined_sql.is_empty() {
                 combined_sql.push(b'\n');
@@ -2418,25 +2441,117 @@ pub fn get_docker_mysql_cli(container: &str) -> String {
 }
 
 
-/// Helper deteksi error ketidakcocokan skema / kolom / struktur tabel MySQL
+/// Mengekstrak nilai Primary Key terbesar/terakhir dari chunk SQL dump phpMyAdmin
+/// untuk mendukung Keyset Pagination (Seek Method) O(1) yang super cepat
+fn extract_last_pk_value(sql_bytes: &[u8], pk_column_name: &str) -> Option<String> {
+    if sql_bytes.is_empty() || pk_column_name.is_empty() {
+        return None;
+    }
+
+    let sql_str = match std::str::from_utf8(sql_bytes) {
+        Ok(s) => s,
+        Err(_) => return None,
+    };
+
+    let target_pk = pk_column_name.trim().trim_matches('`').to_lowercase();
+    if target_pk.is_empty() {
+        return None;
+    }
+
+    // Cari posisi statement INSERT INTO atau REPLACE INTO terakhir
+    let insert_pos = sql_str
+        .rfind("INSERT INTO ")
+        .or_else(|| sql_str.rfind("insert into "))
+        .or_else(|| sql_str.rfind("REPLACE INTO "))
+        .or_else(|| sql_str.rfind("replace into "))?;
+
+    let statement = &sql_str[insert_pos..];
+
+    // Ekstrak daftar kolom di dalam tanda kurung sebelum VALUES
+    let values_keyword_pos = statement.find("VALUES").or_else(|| statement.find("values"))?;
+    let header_part = &statement[..values_keyword_pos];
+
+    // Cari daftar kolom di header, contoh: `table` (`id`, `name`, `status`)
+    let pk_index = if let (Some(open_p), Some(close_p)) = (header_part.find('('), header_part.rfind(')')) {
+        if open_p < close_p {
+            let cols_str = &header_part[open_p + 1..close_p];
+            let cols: Vec<String> = cols_str
+                .split(',')
+                .map(|c| c.trim().trim_matches('`').trim_matches('\'').trim_matches('"').to_lowercase())
+                .collect();
+            cols.iter().position(|c| c == &target_pk).unwrap_or(0)
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+
+    // Cari tuple baris terakhir di bagian VALUES (...)
+    let values_part = &statement[values_keyword_pos..];
+    let last_close_paren = values_part.rfind(')')?;
+    let last_open_paren = values_part[..last_close_paren].rfind('(')?;
+
+    let row_str = &values_part[last_open_paren + 1..last_close_paren];
+
+    // Parse nilai-nilai dalam tuple baris dengan memperhatikan petik string (') dan escaping (\)
+    let mut values = Vec::new();
+    let mut current_val = String::new();
+    let mut in_quote = false;
+    let mut is_escaped = false;
+
+    for ch in row_str.chars() {
+        if is_escaped {
+            current_val.push(ch);
+            is_escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            current_val.push(ch);
+            is_escaped = true;
+            continue;
+        }
+        if ch == '\'' {
+            in_quote = !in_quote;
+            current_val.push(ch);
+            continue;
+        }
+        if ch == ',' && !in_quote {
+            values.push(current_val.trim().to_string());
+            current_val.clear();
+            continue;
+        }
+        current_val.push(ch);
+    }
+    if !current_val.is_empty() {
+        values.push(current_val.trim().to_string());
+    }
+
+    if let Some(val) = values.get(pk_index) {
+        let clean = val.trim();
+        if !clean.is_empty() && clean.to_uppercase() != "NULL" {
+            return Some(clean.to_string());
+        }
+    }
+
+    None
+}
+
+/// Menentukan apakah error MySQL disebabkan oleh struktur skema yang tidak cocok
 fn is_schema_mismatch_error(err: &str) -> bool {
     let lower = err.to_lowercase();
     lower.contains("unknown column")
-        || lower.contains("error 1054")
-        || lower.contains("doesn't exist")
-        || lower.contains("error 1146")
         || lower.contains("column count doesn't match")
-        || lower.contains("error 1136")
+        || lower.contains("table") && lower.contains("doesn't exist")
         || lower.contains("doesn't have a default value")
-        || lower.contains("error 1364")
-        || lower.contains("cannot be null")
-        || lower.contains("error 1048")
-        || lower.contains("data too long")
-        || lower.contains("error 1406")
         || lower.contains("data truncated")
+        || lower.contains("cannot be null")
+        || lower.contains("error 1054")
+        || lower.contains("error 1136")
+        || lower.contains("error 1146")
+        || lower.contains("error 1364")
         || lower.contains("error 1265")
-        || lower.contains("duplicate column")
-        || lower.contains("error 1060")
+        || lower.contains("error 1048")
         || lower.contains("incorrect integer value")
         || lower.contains("incorrect decimal value")
         || lower.contains("incorrect date")
@@ -2480,43 +2595,14 @@ async fn import_table_to_local_internal(
     } else {
         &local_config.host
     };
-    let port_str = if local_config.port == 0 {
-        "3306".to_string()
-    } else {
-        local_config.port.to_string()
-    };
-    let db_name = if local_config.database.is_empty() {
-        "db_sync"
-    } else {
-        &local_config.database
-    };
-
-    let is_actual_gzip =
-        response_bytes.len() >= 2 && response_bytes[0] == 0x1f && response_bytes[1] == 0x8b;
-
-    let sql_bytes = if is_actual_gzip {
-        decompress_gzip_bytes(&response_bytes)
-            .map_err(|e| format!("GZIP export tidak valid: {}", e))?
-    } else {
-        response_bytes
-    };
-
-    let processed_bytes = sql_bytes.len();
-    if processed_bytes == 0 {
-        return Err(format!(
-            "Export tabel '{}' menghasilkan SQL kosong.",
-            table_name
-        ));
-    }
-
-    let imported_rows = count_imported_sql_rows(&sql_bytes);
-    let has_create_table = sql_bytes.windows(12).any(|w| w == b"CREATE TABLE");
-    let is_structure_only = pma_config.sync_mode.as_deref() == Some("structure_only")
-        || pma_config.sync_mode.as_deref() == Some("structure");
+    let port_str = local_config.port.to_string();
+    let db_name = &local_config.database;
     let is_fresh = force_fresh || pma_config.sync_mode.as_deref() == Some("fresh");
 
-    // Zero-Row Fast Skip: jika 0 baris data dan tidak butuh membuat struktur tabel baru, lewati seketika
-    if imported_rows == 0 && (!is_fresh || !has_create_table) && !is_structure_only {
+    let is_structure_only = pma_config.sync_mode.as_deref() == Some("structure_only")
+        || pma_config.sync_mode.as_deref() == Some("structure");
+
+    if total_bytes == 0 {
         emit_log(
             app,
             "info",
@@ -2527,6 +2613,15 @@ async fn import_table_to_local_internal(
         );
         return Ok(0);
     }
+
+    let is_actual_gzip = response_bytes.len() >= 2 && response_bytes[0] == 0x1f && response_bytes[1] == 0x8b;
+    let sql_bytes = if is_actual_gzip {
+        decompress_gzip_bytes(&response_bytes).unwrap_or(response_bytes)
+    } else {
+        response_bytes
+    };
+
+    let imported_rows = count_imported_sql_rows(&sql_bytes);
 
     if is_structure_only {
         emit_log(
@@ -2586,7 +2681,8 @@ async fn import_table_to_local_internal(
                 .arg("--skip-ssl")
                 .arg("--binary-mode")
                 .arg("--quick")
-                .arg("--max-allowed-packet=512M")
+                .arg("--max-allowed-packet=1024M")
+                .arg("--net-buffer-length=1M")
                 .arg("--connect-timeout=60")
                 .arg("--default-character-set=utf8mb4")
                 .arg("-u")
@@ -2603,7 +2699,8 @@ async fn import_table_to_local_internal(
             c.arg("--skip-ssl")
                 .arg("--binary-mode")
                 .arg("--quick")
-                .arg("--max-allowed-packet=512M")
+                .arg("--max-allowed-packet=1024M")
+                .arg("--net-buffer-length=1M")
                 .arg("--connect-timeout=60")
                 .arg("--default-character-set=utf8mb4")
                 .arg("-h")
@@ -2663,7 +2760,19 @@ async fn import_table_to_local_internal(
                 String::new()
             };
             let prelude_str = format!(
-                "SET SESSION sql_log_bin=0;\nSET SESSION foreign_key_checks=0;\nSET SESSION unique_checks=0;\nSET SESSION autocommit=0;\nSET SESSION sql_mode='';\nSET SESSION net_read_timeout=600;\nSET SESSION net_write_timeout=600;\nSET SESSION wait_timeout=600;\nSET SESSION lock_wait_timeout=600;\nSET SESSION innodb_lock_wait_timeout=600;\n{}",
+                "SET SESSION sql_log_bin=0;\n\
+                 SET SESSION foreign_key_checks=0;\n\
+                 SET SESSION unique_checks=0;\n\
+                 SET SESSION autocommit=0;\n\
+                 SET SESSION sql_mode='';\n\
+                 SET SESSION net_buffer_length=1048576;\n\
+                 SET SESSION max_allowed_packet=1073741824;\n\
+                 SET SESSION net_read_timeout=600;\n\
+                 SET SESSION net_write_timeout=600;\n\
+                 SET SESSION wait_timeout=600;\n\
+                 SET SESSION lock_wait_timeout=600;\n\
+                 SET SESSION innodb_lock_wait_timeout=600;\n\
+                 {}",
                 drop_clause
             );
 
@@ -2671,7 +2780,7 @@ async fn import_table_to_local_internal(
                 return Err(e);
             }
 
-            let chunk_size = 512 * 1024; // 512 KB per chunk
+            let chunk_size = 1024 * 1024; // 1 MB per write chunk untuk throughput maksimal
             let mut written = 0usize;
             let mut last_log_time = std::time::Instant::now();
             let mut last_logged_written = 0usize;
