@@ -131,7 +131,7 @@ let logSaveTimer = null;
 const addLog = (entry) => {
   const msg = entry.message || '';
   const tableMatch = msg.match(/\[Tabel\s+'([^']+)'\]/);
-  const tableName = tableMatch ? tableMatch[1] : null;
+  const tableName = tableMatch ? tableMatch[1] : (entry.tableName || null);
 
   const isTransientProgress =
     msg.includes('Mengunduh stream') ||
@@ -141,7 +141,10 @@ const addLog = (entry) => {
     msg.includes('selesai diunduh: ~');
 
   const isTableFinished =
-    msg.includes('Selesai! ~') ||
+    entry.type === 'success' ||
+    msg.includes('Selesai!') ||
+    msg.includes('Struktur tabel berhasil dibuat') ||
+    msg.includes('Auto-fallback Fresh Sync') ||
     msg.includes('Melewati proses import lokal') ||
     msg.includes('Di-skip pada sinkronisasi') ||
     msg.includes('Export GAGAL') ||
@@ -172,14 +175,23 @@ const addLog = (entry) => {
   }
 
   if (tableName && isTableFinished) {
-    // Clean up temporary in-flight progress logs for this table upon finish
+    // Hapus log sementara (transient) dan semua log INFO perantara untuk tabel ini
+    // agar histori log konsol tetap bersih dan ringkas (hanya menyisakan status akhir)
     logs.value = logs.value.filter(
-      (l) => !(l.isTransient && l.tableName === tableName)
+      (l) =>
+        !(
+          (l.tableName === tableName ||
+            (l.message && l.message.includes(`[Tabel '${tableName}']`))) &&
+          (l.isTransient || l.type === 'info')
+        )
     );
   }
 
   // Push permanent clean log
-  logs.value.push(entry);
+  logs.value.push({
+    ...entry,
+    tableName: tableName || undefined,
+  });
   if (logs.value.length > 500) {
     logs.value.shift();
   }
