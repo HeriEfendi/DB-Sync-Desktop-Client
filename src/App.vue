@@ -537,10 +537,11 @@ const fetchTablesFromPma = async () => {
             }
 
             // 2. Tambahkan tabel baru dari PMA yang belum ada di local
+            // 2. Tambahkan tabel baru dari PMA yang belum ada di local (Hanya struktur tabel / DDL, penarikan data dilakukan pada proses sync)
             if (newTables.length > 0) {
               addLog({
                 type: 'info',
-                message: `📥 Ditemukan ${newTables.length} tabel baru di PMA yang belum ada di lokal: ${newTables.join(', ')}. Mengimpor struktur & data ke MySQL lokal...`,
+                message: `📥 Ditemukan ${newTables.length} tabel baru di PMA yang belum ada di lokal: ${newTables.join(', ')}. Membuat struktur tabel di MySQL lokal...`,
                 timestamp: new Date().toLocaleTimeString(),
               });
 
@@ -552,13 +553,13 @@ const fetchTablesFromPma = async () => {
 
               await syncEngine.runMultiTableSync({
                 tables: newTables,
-                syncMode: 'fresh',
+                syncMode: 'structure_only',
                 rowLimit: 0,
               });
 
               addLog({
                 type: 'success',
-                message: `✅ Selesai menambahkan ${newTables.length} tabel baru ke MySQL lokal.`,
+                message: `✅ Selesai membuat struktur ${newTables.length} tabel baru di MySQL lokal (data akan disinkronkan saat proses Sync).`,
                 timestamp: new Date().toLocaleTimeString(),
               });
             }
@@ -719,10 +720,12 @@ const handleStartSync = async () => {
     ? selectedTables.value
     : [pmaConfig.value.table || 'users'];
 
+  const expectedTotal = tablesToSync.length;
+
   isSyncing.value = true;
   syncProgress.value = {
     currentTableIndex: 0,
-    totalTables: tablesToSync.length,
+    totalTables: expectedTotal,
     currentTableName: tablesToSync[0] || '',
     rowsSyncedCurrentTable: 0,
     totalSyncedAllTables: 0,
@@ -734,13 +737,24 @@ const handleStartSync = async () => {
     onTableSynced: refreshTableStates,
     onProgress: (p) => {
       const rowsCount = p.rowsSyncedCurrentTable ?? p.rowsSyncedForCurrentTable ?? 0;
+      const rawTableIndex = p.currentTableIndex || 0;
+      // Pastikan index tabel tidak pernah melebihi total dan tidak melompat mundur karena out-of-order event multi-worker
+      const safeTableIndex = Math.min(
+        Math.max(rawTableIndex, syncProgress.value.currentTableIndex || 0),
+        expectedTotal
+      );
+      const safeTotalRows = Math.max(
+        p.totalSyncedAllTables || 0,
+        syncProgress.value.totalSyncedAllTables || 0
+      );
+
       syncProgress.value = {
-        currentTableIndex: p.currentTableIndex || 0,
-        totalTables: p.totalTables || 0,
-        currentTableName: p.currentTableName || '',
+        currentTableIndex: safeTableIndex,
+        totalTables: expectedTotal, // Terkunci presisi ke jumlah tabel yang dipilih
+        currentTableName: p.currentTableName || syncProgress.value.currentTableName || '',
         rowsSyncedCurrentTable: rowsCount,
         rowsSyncedForCurrentTable: rowsCount,
-        totalSyncedAllTables: p.totalSyncedAllTables || 0,
+        totalSyncedAllTables: safeTotalRows,
         status: p.status || 'idle',
       };
     },

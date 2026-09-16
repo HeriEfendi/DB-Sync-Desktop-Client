@@ -18,6 +18,20 @@ export class SyncEngine {
     this.onTableSynced = options.onTableSynced || (() => {});
     this.isSyncing = false;
     this.shouldStop = false;
+    this.unlisteners = [];
+  }
+
+  cleanupListeners() {
+    if (Array.isArray(this.unlisteners)) {
+      this.unlisteners.forEach((fn) => {
+        if (typeof fn === 'function') {
+          try {
+            fn();
+          } catch (_) {}
+        }
+      });
+      this.unlisteners = [];
+    }
   }
 
   log(type, message) {
@@ -79,11 +93,15 @@ export class SyncEngine {
     const tables = rawTables.map((t) => typeof t === 'string' ? { name: t, primaryKey: this.pmaConfig.primaryKey || null } : t);
     const syncMode = syncOptions.syncMode || 'incremental';
     const totalRowLimit = parseInt(syncOptions.rowLimit || 0, 10);
+    const totalTablesCount = tables.length;
+
+    // Bersihkan listener event lama agar tidak terjadi memory leak / duplikasi event
+    this.cleanupListeners();
 
     // Notify initial progress
     this.onProgress({
       currentTableIndex: 0,
-      totalTables: tables.length,
+      totalTables: totalTablesCount,
       currentTableName: '',
       rowsSyncedForCurrentTable: 0,
       totalSyncedAllTables: 0,
@@ -114,7 +132,7 @@ export class SyncEngine {
         }
         this.onProgress({
           currentTableIndex: event.payload.current_table_index,
-          totalTables: event.payload.total_tables,
+          totalTables: totalTablesCount, // Selalu kunci ke jumlah tabel yang aktif disinkronkan
           currentTableName: event.payload.current_table_name,
           rowsSyncedCurrentTable: rowsCount,
           rowsSyncedForCurrentTable: rowsCount,
@@ -123,6 +141,8 @@ export class SyncEngine {
         });
       }
     });
+
+    this.unlisteners.push(unlistenLog, unlistenProgress);
 
     try {
       const tableNames = tables.map((t) => (typeof t === 'string' ? t : t.name));
@@ -191,66 +211,70 @@ export class SyncEngine {
         localConfig,
       });
 
-      const lastSyncTime = formatMySQLDateTime();
+      if (syncMode !== 'structure_only') {
+        const lastSyncTime = formatMySQLDateTime();
 
-      let batchResults = null;
-      try {
-        batchResults = await safeInvoke('get_all_tables_last_local_ids', {
-          config: localConfig,
-          tables: tableNames,
-        });
-      } catch (batchErr) {
-        console.warn('[Sync state] Batch last ID query gagal, fallback ke sequential:', batchErr);
-      }
-
-      for (const tableName of tableNames) {
-        const tableInfo = batchResults ? batchResults[tableName] : null;
-        const detectedPk = tableInfo?.primary_key || tablePrimaryKeys[tableName] || this.pmaConfig.primaryKey?.trim() || 'id';
-        const existingState = getTableState(this.serverHost, this.database, tableName);
-        let lastSyncedId = tableInfo?.last_id ?? null;
-
-        if (!tableInfo) {
-          try {
-            lastSyncedId = await safeInvoke('get_last_local_id', {
-              config: localConfig,
-              tableName,
-              primaryKey: detectedPk,
-            });
-          } catch (error) {
-            console.warn(`[Sync state] Gagal membaca MAX(${detectedPk}) untuk '${tableName}':`, error);
-          }
+        let batchResults = null;
+        try {
+          batchResults = await safeInvoke('get_all_tables_last_local_ids', {
+            config: localConfig,
+            tables: tableNames,
+          });
+        } catch (batchErr) {
+          console.warn('[Sync state] Batch last ID query gagal, fallback ke sequential:', batchErr);
         }
 
-        const isValidNewId = lastSyncedId !== null && lastSyncedId !== undefined && lastSyncedId !== 0 && lastSyncedId !== '0';
-        const finalLastSyncedId = isValidNewId ? lastSyncedId : (existingState?.lastSyncedId ?? null);
+        for (const tableName of tableNames) {
+          const tableInfo = batchResults ? batchResults[tableName] : null;
+          const detectedPk = tableInfo?.primary_key || tablePrimaryKeys[tableName] || this.pmaConfig.primaryKey?.trim() || 'id';
+          const existingState = getTableState(this.serverHost, this.database, tableName);
+          let lastSyncedId = tableInfo?.last_id ?? null;
 
-        saveTableState(this.serverHost, this.database, tableName, {
-          lastSyncedId: finalLastSyncedId,
-          lastSyncTime,
-          rowsSynced: 0,
-          primaryKey: detectedPk,
-        });
-        this.onTableSynced(tableName);
+          if (!tableInfo) {
+            try {
+              lastSyncedId = await safeInvoke('get_last_local_id', {
+                config: localConfig,
+                tableName,
+                primaryKey: detectedPk,
+              });
+            } catch (error) {
+              console.warn(`[Sync state] Gagal membaca MAX(${detectedPk}) untuk '${tableName}':`, error);
+            }
+          }
+
+          const isValidNewId = lastSyncedId !== null && lastSyncedId !== undefined && lastSyncedId !== 0 && lastSyncedId !== '0';
+          const finalLastSyncedId = isValidNewId ? lastSyncedId : (existingState?.lastSyncedId ?? null);
+
+          saveTableState(this.serverHost, this.database, tableName, {
+            lastSyncedId: finalLastSyncedId,
+            lastSyncTime,
+            rowsSynced: 0,
+            primaryKey: detectedPk,
+          });
+          this.onTableSynced(tableName);
+        }
       }
 
       const elapsed = Math.round(performance.now() - startTime);
-      this.log('success', `🎉 Sinkronisasi Selesai! (Waktu: ${elapsed}ms)`);
+      if (syncMode === 'structure_only') {
+        this.log('success', `🎉 Struktur ${tableNames.length} tabel selesai dibuat di MySQL lokal! (Waktu: ${elapsed}ms)`);
+      } else {
+        this.log('success', `🎉 Sinkronisasi Selesai! (Waktu: ${elapsed}ms)`);
+      }
 
       this.isSyncing = false;
-      if (typeof unlistenLog === 'function') unlistenLog();
-      if (typeof unlistenProgress === 'function') unlistenProgress();
+      this.cleanupListeners();
 
       return {
         success: true,
         count: latestTotalSyncedRows,
         totalRowsSynced: latestTotalSyncedRows,
-        totalTables: tables.length,
+        totalTables: totalTablesCount,
         durationMs: elapsed,
       };
     } catch (err) {
       this.isSyncing = false;
-      if (typeof unlistenLog === 'function') unlistenLog();
-      if (typeof unlistenProgress === 'function') unlistenProgress();
+      this.cleanupListeners();
       const errMsg = err?.message || String(err);
       if (this.shouldStop) {
         this.log('warning', '🛑 Sinkronisasi telah dihentikan oleh pengguna.');
