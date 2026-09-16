@@ -1539,23 +1539,82 @@ fn extract_tables_from_html(html: &str) -> Vec<String> {
 }
 
 fn count_imported_sql_rows(bytes: &[u8]) -> usize {
+    if bytes.is_empty() {
+        return 0;
+    }
     let mut count = 0usize;
     let len = bytes.len();
     let mut i = 0;
+    let mut in_string = false;
+    let mut in_escape = false;
+
     while i < len {
-        if i + 6 <= len && &bytes[i..i + 6] == b"VALUES" {
-            let mut p = i + 6;
-            while p < len && bytes[p] != b';' {
-                if bytes[p] == b'(' && (p == 0 || bytes[p - 1] == b' ' || bytes[p - 1] == b',' || bytes[p - 1] == b'\n' || bytes[p - 1] == b'\r') {
-                    count += 1;
+        if in_escape {
+            in_escape = false;
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'\\' {
+            in_escape = true;
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'\'' {
+            in_string = !in_string;
+            i += 1;
+            continue;
+        }
+
+        if !in_string {
+            // Check for VALUES keyword
+            if i + 6 <= len && bytes[i..i + 6].eq_ignore_ascii_case(b"VALUES") {
+                let mut p = i + 6;
+                let mut in_str2 = false;
+                let mut in_esc2 = false;
+                let mut depth = 0usize;
+
+                while p < len {
+                    if in_esc2 {
+                        in_esc2 = false;
+                        p += 1;
+                        continue;
+                    }
+                    if bytes[p] == b'\\' {
+                        in_esc2 = true;
+                        p += 1;
+                        continue;
+                    }
+                    if bytes[p] == b'\'' {
+                        in_str2 = !in_str2;
+                        p += 1;
+                        continue;
+                    }
+
+                    if !in_str2 {
+                        if bytes[p] == b'(' {
+                            if depth == 0 {
+                                count += 1;
+                            }
+                            depth += 1;
+                        } else if bytes[p] == b')' {
+                            if depth > 0 {
+                                depth -= 1;
+                            }
+                        } else if bytes[p] == b';' && depth == 0 {
+                            p += 1;
+                            break;
+                        }
+                    }
+                    p += 1;
                 }
-                p += 1;
+                i = p;
+                continue;
             }
-            i = p;
         }
         i += 1;
     }
-    if count == 0 && (bytes.windows(11).any(|w| w == b"INSERT INTO") || bytes.windows(12).any(|w| w == b"REPLACE INTO")) {
+
+    if count == 0 && (bytes.windows(11).any(|w| w.eq_ignore_ascii_case(b"INSERT INTO")) || bytes.windows(12).any(|w| w.eq_ignore_ascii_case(b"REPLACE INTO"))) {
         count = 1;
     }
     count
@@ -2324,8 +2383,8 @@ async fn fetch_table_export_stream(
             current_offset += chunk_size;
             chunk_idx += 1;
 
-            // Jika chunk tidak memiliki data INSERT atau baris kurang dari chunk_size, berarti seluruh isi tabel telah selesai
-            if !has_insert || row_count_in_chunk < chunk_size {
+            // Jika chunk tidak memiliki data INSERT atau row count kosong, berarti seluruh isi tabel telah selesai
+            if !has_insert || row_count_in_chunk == 0 {
                 break;
             }
 
@@ -2465,7 +2524,9 @@ fn extract_last_pk_value(sql_bytes: &[u8], pk_column_name: &str) -> Option<Strin
         .or_else(|| sql_str.rfind("REPLACE INTO "))
         .or_else(|| sql_str.rfind("replace into "))?;
 
-    let statement = &sql_str[insert_pos..];
+    let raw_statement = &sql_str[insert_pos..];
+    let semicolon_pos = raw_statement.find(';').unwrap_or(raw_statement.len());
+    let statement = &raw_statement[..semicolon_pos];
 
     // Ekstrak daftar kolom di dalam tanda kurung sebelum VALUES
     let values_keyword_pos = statement.find("VALUES").or_else(|| statement.find("values"))?;
