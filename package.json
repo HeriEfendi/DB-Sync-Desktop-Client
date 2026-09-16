@@ -1,7 +1,7 @@
 {
   "name": "db-sync-desktop-client",
   "private": true,
-  "version": "0.23.1",
+  "version": "0.23.2",
   "license": "SEE LICENSE IN LICENSE",
   "author": "Heri Efendi <hheri58@gmail.com>",
   "type": "module",
