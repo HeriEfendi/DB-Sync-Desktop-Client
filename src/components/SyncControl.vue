@@ -91,7 +91,7 @@
             class="form-select limit-select"
             @change="$emit('update:row-limit', Number($event.target.value) || 0)"
           >
-            <option :value="0">Semua Row (Default)</option><option :value="1000">1.000 Row</option><option :value="10000">10.000 Row</option><option :value="100000">100.000 Row</option><option :value="500000">500.000 Row</option><option :value="2000000">2.000.000 Row</option>
+            <option :value="0">Semua Row (Default)</option><option :value="1000">1.000 Row</option><option :value="10000">10.000 Row</option><option :value="100000">100.000 Row</option><option :value="500000">500.000 Row</option><option :value="1000000">1.000.000 Row</option><option :value="2000000">2.000.000 Row</option><option :value="5000000">5.000.000 Row</option>
           </select>
         </div>
       </div>
