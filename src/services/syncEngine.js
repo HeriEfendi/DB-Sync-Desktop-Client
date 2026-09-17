@@ -157,6 +157,8 @@ export class SyncEngine {
       const incrementalWatermarks = {};
 
       if (syncMode === 'incremental') {
+        // Build watermarks map for batch cleanup
+        const cleanupWatermarks = {};
         for (const tableName of tableNames) {
           if (this.shouldStop) {
             this.isSyncing = false;
@@ -169,19 +171,28 @@ export class SyncEngine {
           const primaryKey = tablePrimaryKeys[tableName] || this.pmaConfig.primaryKey?.trim() || 'id';
           if (!state || state.lastSyncedId === null || state.lastSyncedId === undefined || state.lastSyncedId === 0 || state.lastSyncedId === '0' || !state.lastSyncTime) continue;
 
-          const removedRows = await safeInvoke('delete_local_rows_after_id', {
-            config: localConfig,
-            tableName,
-            primaryKey,
-            lastSyncedId: state.lastSyncedId,
-          });
-
+          cleanupWatermarks[tableName] = {
+            primary_key: primaryKey,
+            last_synced_id: state.lastSyncedId,
+          };
           incrementalWatermarks[tableName] = {
             last_synced_id: state.lastSyncedId,
             last_sync_time: state.lastSyncTime,
           };
-          if (removedRows > 0) {
-            this.log('warning', `[Tabel '${tableName}'] ${removedRows} data lokal di atas Last ID ${state.lastSyncedId} dihapus untuk sinkron dengan server.`);
+        }
+
+        // Single batch call — parallel + batched DELETE + progress events
+        if (Object.keys(cleanupWatermarks).length > 0) {
+          this.log('info', `🧹 Membersihkan data lokal yang melampaui server (${Object.keys(cleanupWatermarks).length} tabel)...`);
+          try {
+            await safeInvoke('batch_cleanup_incremental', {
+              config: localConfig,
+              watermarks: cleanupWatermarks,
+              batchSize: 50000,
+              concurrency: 3,
+            });
+          } catch (cleanupErr) {
+            this.log('warning', `Batch cleanup error (non-fatal): ${cleanupErr?.message || cleanupErr}`);
           }
         }
       }

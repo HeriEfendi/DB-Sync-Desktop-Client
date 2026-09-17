@@ -30,6 +30,9 @@ export async function safeInvoke(cmd, args = {}) {
     if (cmd === 'get_all_tables_last_local_ids') {
       return {};
     }
+    if (cmd === 'batch_cleanup_incremental') {
+      return {};
+    }
     throw new Error('Fitur ini memerlukan runtime desktop Tauri.');
   }
 

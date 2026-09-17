@@ -13,6 +13,7 @@ pub fn run() {
             commands::get_last_local_id,
             commands::get_all_tables_last_local_ids,
             commands::delete_local_rows_after_id,
+            commands::batch_cleanup_incremental,
             commands::get_local_tables,
             commands::drop_local_tables,
             pma_export::export_pma_database,

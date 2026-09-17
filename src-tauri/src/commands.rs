@@ -4,6 +4,8 @@ use sqlx::{
     Row,
 };
 use std::collections::HashMap;
+use tauri::Emitter;
+
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct LocalDbConfig {
@@ -451,6 +453,307 @@ pub async fn delete_local_rows_after_id(
     drop(conn);
     pool.close().await;
     Ok(result.rows_affected())
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CleanupWatermark {
+    pub primary_key: String,
+    pub last_synced_id: serde_json::Value,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct CleanupLogPayload {
+    r#type: String,
+    message: String,
+    timestamp: String,
+}
+
+fn cleanup_timestamp() -> String {
+    chrono::Local::now().format("%H:%M:%S").to_string()
+}
+
+fn cleanup_emit_log(app: &tauri::AppHandle, log_type: &str, message: impl Into<String>) {
+    let msg = message.into();
+    println!("[CLEANUP] [{}]: {}", log_type, msg);
+    let _ = app.emit(
+        "pma-log",
+        CleanupLogPayload {
+            r#type: log_type.to_string(),
+            message: msg,
+            timestamp: cleanup_timestamp(),
+        },
+    );
+}
+
+/// Batch cleanup: delete local rows beyond server-confirmed ID for multiple tables.
+/// Uses a single pool, batched DELETE with LIMIT, parallel processing, and progress events.
+#[tauri::command]
+pub async fn batch_cleanup_incremental(
+    app: tauri::AppHandle,
+    config: LocalDbConfig,
+    watermarks: HashMap<String, CleanupWatermark>,
+    batch_size: Option<u64>,
+    concurrency: Option<usize>,
+) -> Result<HashMap<String, u64>, String> {
+    use std::sync::Arc;
+    use tokio::sync::Semaphore;
+
+    let effective_batch = batch_size.unwrap_or(50_000).max(1_000);
+    let effective_concurrency = concurrency.unwrap_or(3).max(1).min(8);
+
+    if watermarks.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let conn_str = build_connection_string(&config);
+    let pool = Arc::new(
+        MySqlPoolOptions::new()
+            .max_connections((effective_concurrency as u32 + 2).min(10))
+            .connect(&conn_str)
+            .await
+            .map_err(|e| format!("Koneksi ke MySQL lokal gagal: {}", e))?,
+    );
+
+    cleanup_emit_log(
+        &app,
+        "info",
+        format!(
+            "🧹 Memulai batch cleanup {} tabel (batch={}, paralel={})",
+            watermarks.len(),
+            effective_batch,
+            effective_concurrency
+        ),
+    );
+
+    let semaphore = Arc::new(Semaphore::new(effective_concurrency));
+    let app_arc = Arc::new(app);
+    let mut handles = Vec::new();
+
+    for (table_name, wm) in watermarks.into_iter() {
+        // Validate last_synced_id
+        let is_valid = match &wm.last_synced_id {
+            serde_json::Value::Number(num) => {
+                num.as_i64().map(|n| n > 0).unwrap_or(false)
+                    || num.as_f64().map(|f| f > 0.0).unwrap_or(false)
+            }
+            serde_json::Value::String(s) => {
+                let trimmed = s.trim();
+                !trimmed.is_empty() && trimmed != "0"
+            }
+            _ => false,
+        };
+        if !is_valid {
+            continue;
+        }
+
+        let pool = Arc::clone(&pool);
+        let sem = Arc::clone(&semaphore);
+        let app_handle = Arc::clone(&app_arc);
+        let pk = wm.primary_key.clone();
+        let last_id = wm.last_synced_id.clone();
+        let batch_sz = effective_batch;
+
+        let handle = tokio::spawn(async move {
+            let _permit = sem
+                .acquire()
+                .await
+                .map_err(|e| format!("Semaphore error: {}", e))?;
+
+            // Check table & column existence
+            if !table_exists(&pool, &table_name).await.unwrap_or(false) {
+                return Ok::<(String, u64), String>((table_name, 0));
+            }
+            let cols = get_local_table_columns(&pool, &table_name)
+                .await
+                .unwrap_or_default();
+            if !cols.iter().any(|c| c.eq_ignore_ascii_case(&pk)) {
+                return Ok((table_name, 0));
+            }
+
+            let safe_table = sanitize_identifier(&table_name)?;
+            let safe_pk = sanitize_identifier(&pk)?;
+
+            let mut conn = pool
+                .acquire()
+                .await
+                .map_err(|e| format!("Pool acquire gagal untuk '{}': {}", table_name, e))?;
+
+            // Disable FK checks
+            let _ = sqlx::query("SET FOREIGN_KEY_CHECKS=0")
+                .execute(&mut *conn)
+                .await;
+
+            // Count rows to delete
+            let count_query =
+                format!("SELECT COUNT(*) FROM {} WHERE {} > ?", safe_table, safe_pk);
+            let total_to_delete: u64 = match &last_id {
+                serde_json::Value::Number(num) => {
+                    let n = num.as_i64().unwrap_or(0);
+                    sqlx::query(&count_query)
+                        .bind(n)
+                        .fetch_one(&mut *conn)
+                        .await
+                        .and_then(|r| r.try_get::<i64, _>(0).map(|v| v as u64))
+                        .unwrap_or(0)
+                }
+                serde_json::Value::String(s) => sqlx::query(&count_query)
+                    .bind(s.clone())
+                    .fetch_one(&mut *conn)
+                    .await
+                    .and_then(|r| r.try_get::<i64, _>(0).map(|v| v as u64))
+                    .unwrap_or(0),
+                _ => 0,
+            };
+
+            if total_to_delete == 0 {
+                let _ = sqlx::query("SET FOREIGN_KEY_CHECKS=1")
+                    .execute(&mut *conn)
+                    .await;
+                return Ok((table_name, 0));
+            }
+
+            let total_batches =
+                ((total_to_delete as f64) / (batch_sz as f64)).ceil() as u64;
+
+            cleanup_emit_log(
+                &app_handle,
+                "info",
+                format!(
+                    "🗑️ [Cleanup '{}'] {} row akan dihapus dalam ~{} batch",
+                    table_name,
+                    format_number_u64(total_to_delete),
+                    total_batches
+                ),
+            );
+
+            // Batched delete loop
+            let delete_query = format!(
+                "DELETE FROM {} WHERE {} > ? ORDER BY {} ASC LIMIT {}",
+                safe_table, safe_pk, safe_pk, batch_sz
+            );
+            let mut total_deleted: u64 = 0;
+            let mut batch_idx: u64 = 0;
+
+            loop {
+                let affected = match &last_id {
+                    serde_json::Value::Number(num) => {
+                        let n = num.as_i64().unwrap_or(0);
+                        sqlx::query(&delete_query)
+                            .bind(n)
+                            .execute(&mut *conn)
+                            .await
+                            .map(|r| r.rows_affected())
+                            .unwrap_or(0)
+                    }
+                    serde_json::Value::String(s) => sqlx::query(&delete_query)
+                        .bind(s.clone())
+                        .execute(&mut *conn)
+                        .await
+                        .map(|r| r.rows_affected())
+                        .unwrap_or(0),
+                    _ => 0,
+                };
+
+                if affected == 0 {
+                    break;
+                }
+
+                total_deleted += affected;
+                batch_idx += 1;
+
+                let pct = if total_to_delete > 0 {
+                    ((total_deleted as f64 / total_to_delete as f64) * 100.0).min(100.0)
+                } else {
+                    100.0
+                };
+
+                cleanup_emit_log(
+                    &app_handle,
+                    "info",
+                    format!(
+                        "🗑️ [Cleanup '{}'] Batch {}/{}: {} / {} row dihapus ({:.0}%)",
+                        table_name,
+                        batch_idx,
+                        total_batches,
+                        format_number_u64(total_deleted),
+                        format_number_u64(total_to_delete),
+                        pct
+                    ),
+                );
+
+                // Small yield between batches to prevent CPU hogging
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+
+            // Re-enable FK checks
+            let _ = sqlx::query("SET FOREIGN_KEY_CHECKS=1")
+                .execute(&mut *conn)
+                .await;
+
+            if total_deleted > 0 {
+                cleanup_emit_log(
+                    &app_handle,
+                    "warning",
+                    format!(
+                        "✅ [Cleanup '{}'] Selesai: {} row dihapus untuk sinkron dengan server",
+                        table_name,
+                        format_number_u64(total_deleted)
+                    ),
+                );
+            }
+
+            Ok((table_name, total_deleted))
+        });
+
+        handles.push(handle);
+    }
+
+    // Collect results
+    let mut result_map = HashMap::new();
+    for handle in handles {
+        match handle.await {
+            Ok(Ok((table, count))) => {
+                result_map.insert(table, count);
+            }
+            Ok(Err(e)) => {
+                cleanup_emit_log(&app_arc, "error", format!("Cleanup error: {}", e));
+            }
+            Err(e) => {
+                cleanup_emit_log(
+                    &app_arc,
+                    "error",
+                    format!("Cleanup task panic: {}", e),
+                );
+            }
+        }
+    }
+
+    let total_all: u64 = result_map.values().sum();
+    cleanup_emit_log(
+        &app_arc,
+        "success",
+        format!(
+            "🧹 Batch cleanup selesai: {} row dihapus dari {} tabel",
+            format_number_u64(total_all),
+            result_map.len()
+        ),
+    );
+
+    pool.close().await;
+    Ok(result_map)
+}
+
+fn format_number_u64(n: u64) -> String {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let mut result = String::with_capacity(s.len() + s.len() / 3);
+    for (i, &b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i) % 3 == 0 {
+            result.push('.');
+        }
+        result.push(b as char);
+    }
+    result
 }
 
 /// Get list of table names currently in local MySQL database
