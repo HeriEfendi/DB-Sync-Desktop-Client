@@ -1,6 +1,6 @@
 [package]
 name = "db-sync-desktop-client"
-version = "0.23.4"
+version = "0.23.5"
 description = "DB-Sync Desktop Client - PMA to Local MySQL/MariaDB"
 authors = ["Heri Efendi <hheri58@gmail.com>"]
 license = "LicenseRef-Proprietary"
