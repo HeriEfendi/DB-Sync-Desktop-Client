@@ -7,6 +7,20 @@ function formatMySQLDateTime(date = new Date()) {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
+function formatDurationText(ms) {
+  if (!ms || isNaN(ms)) return '0 detik';
+  const totalSec = Math.round(ms / 1000);
+  const hours = Math.floor(totalSec / 3600);
+  const minutes = Math.floor((totalSec % 3600) / 60);
+  const seconds = totalSec % 60;
+
+  const parts = [];
+  if (hours > 0) parts.push(`${hours} jam`);
+  if (minutes > 0) parts.push(`${minutes} menit`);
+  if (seconds > 0 || parts.length === 0) parts.push(`${seconds} detik`);
+  return parts.join(' ');
+}
+
 export class SyncEngine {
   constructor(pmaConfig, localDbConfig, options = {}) {
     this.pmaConfig = pmaConfig;
@@ -38,7 +52,7 @@ export class SyncEngine {
     this.onLog({
       type, // 'info' | 'success' | 'warning' | 'error'
       message,
-      timestamp: new Date().toLocaleTimeString(),
+      timestamp: new Date().toLocaleTimeString('id-ID').replace(/\./g, ':'),
     });
   }
 
@@ -267,10 +281,11 @@ export class SyncEngine {
       }
 
       const elapsed = Math.round(performance.now() - startTime);
+      const elapsedText = formatDurationText(elapsed);
       if (syncMode === 'structure_only') {
-        this.log('success', `🎉 Struktur ${tableNames.length} tabel selesai dibuat di MySQL lokal! (Waktu: ${elapsed}ms)`);
+        this.log('success', `🎉 Struktur ${tableNames.length} tabel selesai dibuat di MySQL lokal! (Waktu: ${elapsedText})`);
       } else {
-        this.log('success', `🎉 Sinkronisasi Selesai! (Waktu: ${elapsed}ms)`);
+        this.log('success', `🎉 Sinkronisasi Selesai! (Waktu: ${elapsedText})`);
       }
 
       this.isSyncing = false;
