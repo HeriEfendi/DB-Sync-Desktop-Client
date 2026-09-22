@@ -116,7 +116,10 @@ const formatDate = (isoString) => {
   if (!isoString) return '-';
   try {
     const d = new Date(isoString);
-    return d.toLocaleString('id-ID', { dateStyle: 'short', timeStyle: 'short' });
+    if (isNaN(d.getTime())) return isoString;
+    const datePart = d.toLocaleDateString('id-ID', { day: '2-digit', month: '2-digit', year: 'numeric' });
+    const timePart = d.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' }).replace(/\./g, ':');
+    return `${datePart}, ${timePart}`;
   } catch {
     return isoString;
   }

@@ -129,9 +129,12 @@ const stats = ref({
 let logSaveTimer = null;
 
 const addLog = (entry) => {
-  const msg = entry.message || '';
+  const rawTs = entry.timestamp || new Date().toLocaleTimeString('id-ID');
+  const timestamp = typeof rawTs === 'string' ? rawTs.replace(/\./g, ':') : rawTs;
+  const normalizedEntry = { ...entry, timestamp };
+  const msg = normalizedEntry.message || '';
   const tableMatch = msg.match(/\[Tabel\s+'([^']+)'\]/);
-  const tableName = tableMatch ? tableMatch[1] : (entry.tableName || null);
+  const tableName = tableMatch ? tableMatch[1] : (normalizedEntry.tableName || null);
 
   const isTransientProgress =
     msg.includes('Mengunduh stream') ||
@@ -158,14 +161,14 @@ const addLog = (entry) => {
     );
     if (existingIdx !== -1) {
       logs.value[existingIdx] = {
-        ...entry,
+        ...normalizedEntry,
         isTransient: true,
         tableName,
       };
       return;
     } else {
       logs.value.push({
-        ...entry,
+        ...normalizedEntry,
         isTransient: true,
         tableName,
       });
@@ -189,7 +192,7 @@ const addLog = (entry) => {
 
   // Push permanent clean log
   logs.value.push({
-    ...entry,
+    ...normalizedEntry,
     tableName: tableName || undefined,
   });
   if (logs.value.length > 500) {
@@ -784,7 +787,7 @@ const handleStartSync = async () => {
     const countSynced = (res && res.totalRowsSynced !== undefined ? res.totalRowsSynced : res?.count) || syncProgress.value.totalSyncedAllTables || 0;
     stats.value.totalSynced = countSynced;
     if (res && res.durationMs) stats.value.lastDuration = res.durationMs;
-    stats.value.lastSyncTime = new Date().toLocaleTimeString();
+    stats.value.lastSyncTime = new Date().toLocaleTimeString('id-ID').replace(/\./g, ':');
 
     if (res && res.success) {
       pmaStatus.value.connected = true;

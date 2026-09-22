@@ -68,7 +68,7 @@
         </div>
 
         <div v-if="!isSyncing" class="stat-card">
-          <span class="stat-value text-amber">{{ (stats.lastSyncTime || '-') }}</span>
+          <span class="stat-value text-amber">{{ formatTime(stats.lastSyncTime) }}</span>
           <span class="stat-label">Waktu Sinkron Terakhir</span>
         </div>
         <div v-else class="stat-card stat-live">
@@ -294,11 +294,30 @@ const elapsedDisplay = computed(() => {
 });
 // --- End timer ---
 
+const formatTime = (val) => {
+  if (!val) return '-';
+  if (typeof val === 'string') {
+    if (/^\d{1,2}[.:]\d{1,2}(?:[.:]\d{1,2})?$/.test(val.trim())) {
+      return val.trim().replace(/\./g, ':');
+    }
+  }
+  try {
+    const d = new Date(val);
+    if (!isNaN(d.getTime())) {
+      return d.toLocaleTimeString('id-ID').replace(/\./g, ':');
+    }
+  } catch {}
+  return String(val).replace(/\./g, ':');
+};
+
 const formatDate = (isoString) => {
   if (!isoString) return '-';
   try {
     const d = new Date(isoString);
-    return d.toLocaleString('id-ID', { dateStyle: 'short', timeStyle: 'medium' });
+    if (isNaN(d.getTime())) return isoString;
+    const datePart = d.toLocaleDateString('id-ID', { day: '2-digit', month: '2-digit', year: 'numeric' });
+    const timePart = d.toLocaleTimeString('id-ID').replace(/\./g, ':');
+    return `${datePart}, ${timePart}`;
   } catch {
     return isoString;
   }
