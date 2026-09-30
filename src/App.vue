@@ -725,6 +725,13 @@ const handleStopSync = () => {
   if (activeEngineInstance) {
     activeEngineInstance.stopSync();
   }
+  // Safety fallback: pastikan state UI kembali responsif dalam 2 detik
+  setTimeout(() => {
+    if (isSyncing.value && (!activeEngineInstance || !activeEngineInstance.isSyncing)) {
+      isSyncing.value = false;
+      syncProgress.value.status = 'idle';
+    }
+  }, 2000);
 };
 
 // Execute full sync cycle across selected tables

@@ -36,6 +36,10 @@ export class SyncEngine {
   }
 
   cleanupListeners() {
+    if (this._forceStopTimeout) {
+      clearTimeout(this._forceStopTimeout);
+      this._forceStopTimeout = null;
+    }
     if (Array.isArray(this.unlisteners)) {
       this.unlisteners.forEach((fn) => {
         if (typeof fn === 'function') {
@@ -78,6 +82,22 @@ export class SyncEngine {
         } catch (err) {
           console.warn('Gagal memanggil cancel_pma_export:', err);
         }
+      }
+
+      // Safety fallback: jika dalam 1.5 detik backend belum mengembalikan kontrol,
+      // paksa reset status sinkronisasi agar UI tidak macet dan tombol kembali bisa diklik tanpa perlu restart aplikasi
+      if (!this._forceStopTimeout) {
+        this._forceStopTimeout = setTimeout(() => {
+          if (this.isSyncing) {
+            this.log('warning', '⚠️ Memaksa reset status sinkronisasi frontend.');
+            this.isSyncing = false;
+            this.cleanupListeners();
+            this.onProgress({
+              status: 'idle',
+            });
+          }
+          this._forceStopTimeout = null;
+        }, 1500);
       }
     }
   }

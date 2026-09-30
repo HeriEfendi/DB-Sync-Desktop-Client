@@ -8,11 +8,67 @@ use tokio::process::Command;
 
 pub static USER_CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
 pub static WORKER_ABORT_REQUESTED: AtomicBool = AtomicBool::new(false);
+pub static ACTIVE_CHILD_PIDS: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+static CANCEL_NOTIFIER: std::sync::OnceLock<(
+    tokio::sync::watch::Sender<bool>,
+    tokio::sync::watch::Receiver<bool>,
+)> = std::sync::OnceLock::new();
+
+pub fn get_cancel_watch() -> &'static (tokio::sync::watch::Sender<bool>, tokio::sync::watch::Receiver<bool>) {
+    CANCEL_NOTIFIER.get_or_init(|| tokio::sync::watch::channel(false))
+}
+
+pub fn register_child_pid(pid: u32) {
+    if let Ok(mut lock) = ACTIVE_CHILD_PIDS.lock() {
+        if !lock.contains(&pid) {
+            lock.push(pid);
+        }
+    }
+}
+
+pub fn unregister_child_pid(pid: u32) {
+    if let Ok(mut lock) = ACTIVE_CHILD_PIDS.lock() {
+        lock.retain(|&p| p != pid);
+    }
+}
+
+pub fn kill_all_child_processes() {
+    let pids = {
+        if let Ok(mut lock) = ACTIVE_CHILD_PIDS.lock() {
+            let pids = lock.clone();
+            lock.clear();
+            pids
+        } else {
+            Vec::new()
+        }
+    };
+    for pid in pids {
+        #[cfg(unix)]
+        {
+            let _ = std::process::Command::new("kill").args(["-9", &pid.to_string()]).output();
+        }
+        #[cfg(windows)]
+        {
+            let _ = std::process::Command::new("taskkill").args(["/F", "/T", "/PID", &pid.to_string()]).output();
+        }
+    }
+}
+
+pub fn reset_cancel_state() {
+    USER_CANCEL_REQUESTED.store(false, Ordering::SeqCst);
+    WORKER_ABORT_REQUESTED.store(false, Ordering::SeqCst);
+    let (tx, _) = get_cancel_watch();
+    let _ = tx.send(false);
+}
 
 #[tauri::command]
 pub fn cancel_pma_export() {
     USER_CANCEL_REQUESTED.store(true, Ordering::SeqCst);
     WORKER_ABORT_REQUESTED.store(true, Ordering::SeqCst);
+    let (tx, _) = get_cancel_watch();
+    let _ = tx.send(true);
+    kill_all_child_processes();
 }
 
 pub fn is_user_cancelled() -> bool {
@@ -1780,20 +1836,23 @@ async fn download_export_payload(
             let post_future = client.post(&export_url).form(&form).send();
             tokio::pin!(post_future);
 
+            let mut cancel_rx = get_cancel_watch().1.clone();
             let send_start = std::time::Instant::now();
             let mut last_wait_log = std::time::Instant::now();
             let mut post_timed_out = false;
             let send_result = loop {
-                if is_user_cancelled() {
+                if is_user_cancelled() || is_aborted() {
                     return Err("__USER_CANCELLED__".to_string());
-                }
-                if is_aborted() {
-                    return Err("__WORKER_ABORTED__".to_string());
                 }
 
                 tokio::select! {
                     res = &mut post_future => {
                         break Some(res);
+                    }
+                    _ = cancel_rx.changed() => {
+                        if *cancel_rx.borrow() {
+                            return Err("__USER_CANCELLED__".to_string());
+                        }
                     }
                     _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
                         let elapsed_wait = send_start.elapsed().as_secs();
@@ -1872,16 +1931,23 @@ async fn download_export_payload(
             let mut stream_timed_out = false;
 
             while let Some(chunk_res) = {
-                if is_user_cancelled() {
+                if is_user_cancelled() || is_aborted() {
                     return Err("__USER_CANCELLED__".to_string());
                 }
-                if is_aborted() {
-                    return Err("__WORKER_ABORTED__".to_string());
-                }
-                match tokio::time::timeout(std::time::Duration::from_secs(60), stream.next()).await {
-                    Ok(item) => item,
-                    Err(_elapsed) => {
-                        stream_timed_out = true;
+                tokio::select! {
+                    res = tokio::time::timeout(std::time::Duration::from_secs(60), stream.next()) => {
+                        match res {
+                            Ok(item) => item,
+                            Err(_elapsed) => {
+                                stream_timed_out = true;
+                                None
+                            }
+                        }
+                    }
+                    _ = cancel_rx.changed() => {
+                        if *cancel_rx.borrow() {
+                            return Err("__USER_CANCELLED__".to_string());
+                        }
                         None
                     }
                 }
@@ -2228,6 +2294,28 @@ async fn fetch_table_export_stream(
 
     // Buka koneksi stream child process MySQL sekali untuk seluruh chunk tabel ini
     let (mut child, mut child_stdin, mut child_stderr) = spawn_mysql_child(local_config)?;
+
+    // PENTING: Jalankan pembaca STDERR child process di background task secara non-blocking real-time.
+    // Jika STDERR tidak dibaca secara berkelanjutan, buffer pipe Linux/OS (64 KB) akan penuh saat
+    // MariaDB/MySQL menghasilkan warning atau query error, menyebabkan deadlock anon_pipe_write
+    // dan STDIN membeku selamanya!
+    let stderr_task = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let mut buf = [0u8; 8192];
+        let mut captured = Vec::new();
+        const MAX_CAPTURED: usize = 256 * 1024; // Simpan hingga 256 KB error log terbaru
+        while let Ok(n) = child_stderr.read(&mut buf).await {
+            if n == 0 {
+                break;
+            }
+            if captured.len() < MAX_CAPTURED {
+                let to_take = n.min(MAX_CAPTURED - captured.len());
+                captured.extend_from_slice(&buf[..to_take]);
+            }
+        }
+        captured
+    });
+
     let is_fresh = pma_config.sync_mode.as_deref() == Some("fresh");
 
     use tokio::io::AsyncWriteExt;
@@ -2253,6 +2341,7 @@ async fn fetch_table_export_stream(
 
     if let Err(e) = child_stdin.write_all(prelude_str.as_bytes()).await {
         let _ = child.start_kill();
+        stderr_task.abort();
         return Err(format!("Gagal menulis inisialisasi prelude ke MySQL lokal: {}", e));
     }
 
@@ -2266,10 +2355,12 @@ async fn fetch_table_export_stream(
     while chunk_idx < max_safe_chunks {
         if is_user_cancelled() {
             let _ = child.start_kill();
+            stderr_task.abort();
             return Err("__USER_CANCELLED__".to_string());
         }
         if is_aborted() {
             let _ = child.start_kill();
+            stderr_task.abort();
             return Err("__WORKER_ABORTED__".to_string());
         }
 
@@ -2284,6 +2375,14 @@ async fn fetch_table_export_stream(
             format!("chunk {}", chunk_idx + 1)
         };
 
+        // Dalam mode cicilan, gunakan REPLACE jika tabel memiliki Primary Key agar tidak terjadi
+        // duplicate entry error saat overlap boundary ataupun retry
+        let chunk_sql_type = if pk_col_opt.is_some() {
+            "REPLACE"
+        } else {
+            sql_type_val
+        };
+
         // Percobaan per-chunk:
         // Percobaan 1: 100k -> jika timeout langsung ke 50k
         // Percobaan 2: 50k  -> jika timeout langsung ke 25k (chunk terkecil)
@@ -2296,20 +2395,27 @@ async fn fetch_table_export_stream(
             chunk_attempt += 1;
             if is_user_cancelled() {
                 let _ = child.start_kill();
+                stderr_task.abort();
                 return Err("__USER_CANCELLED__".to_string());
             }
             if is_aborted() {
                 let _ = child.start_kill();
+                stderr_task.abort();
                 return Err("__WORKER_ABORTED__".to_string());
             }
 
             // Langkah 1: Keyset Pagination (Seek Method) jika PK terdeteksi & chunk > 0 untuk kecepatan O(1) instan
             let chunk_query = if let (Some(pk_col), Some(ref last_pk)) = (pk_col_opt, &last_seen_pk) {
+                let safe_pk_val = if last_pk.starts_with('\'') || last_pk.parse::<f64>().is_ok() {
+                    last_pk.clone()
+                } else {
+                    format!("'{}'", last_pk.replace('\'', "\\'"))
+                };
                 format!(
                     "SELECT * FROM `{}` WHERE `{}` > {} ORDER BY `{}` ASC LIMIT {}",
                     safe_table,
                     pk_col.replace('`', "``"),
-                    last_pk,
+                    safe_pk_val,
                     pk_col.replace('`', "``"),
                     chunk_size
                 )
@@ -2332,7 +2438,7 @@ async fn fetch_table_export_stream(
                 chunk_struct,
                 chunk_sql_struct,
                 chunk_sql_create,
-                sql_type_val,
+                chunk_sql_type,
                 Some(chunk_query),
                 cached_endpoint,
                 app,
@@ -2372,6 +2478,7 @@ async fn fetch_table_export_stream(
                 }
                 Err(e) => {
                     let _ = child.start_kill();
+                    stderr_task.abort();
                     return Err(e);
                 }
             }
@@ -2397,15 +2504,41 @@ async fn fetch_table_export_stream(
                 }
             }
 
+            // Cek apakah child process MySQL masih hidup sebelum menulis
+            if let Ok(Some(status)) = child.try_wait() {
+                let err_buf = stderr_task.await.unwrap_or_default();
+                let err_msg = String::from_utf8_lossy(&err_buf);
+                return Err(format!(
+                    "[Tabel '{}'] MySQL client terhenti lebih awal (exit code: {}): {}",
+                    table_name,
+                    status,
+                    err_msg.trim()
+                ));
+            }
+
             // Alirkan langsung raw_chunk_sql ke STDIN child process MySQL secara real-time
             if !raw_chunk_sql.is_empty() {
                 if let Err(e) = child_stdin.write_all(&raw_chunk_sql).await {
                     let _ = child.start_kill();
-                    return Err(format!("[Tabel '{}'] Gagal menulis data chunk ke MySQL: {}", table_name, e));
+                    let err_buf = stderr_task.await.unwrap_or_default();
+                    let err_msg = String::from_utf8_lossy(&err_buf);
+                    let detail = if err_msg.trim().is_empty() {
+                        e.to_string()
+                    } else {
+                        format!("{} | Detail MySQL: {}", e, err_msg.trim())
+                    };
+                    return Err(format!("[Tabel '{}'] Gagal menulis data chunk ke MySQL: {}", table_name, detail));
                 }
                 if let Err(e) = child_stdin.write_all(b"\nCOMMIT;\n").await {
                     let _ = child.start_kill();
-                    return Err(format!("[Tabel '{}'] Gagal mengeksekusi COMMIT chunk ke MySQL: {}", table_name, e));
+                    let err_buf = stderr_task.await.unwrap_or_default();
+                    let err_msg = String::from_utf8_lossy(&err_buf);
+                    let detail = if err_msg.trim().is_empty() {
+                        e.to_string()
+                    } else {
+                        format!("{} | Detail MySQL: {}", e, err_msg.trim())
+                    };
+                    return Err(format!("[Tabel '{}'] Gagal mengeksekusi COMMIT chunk ke MySQL: {}", table_name, detail));
                 }
                 let _ = child_stdin.flush().await;
             }
@@ -2442,6 +2575,7 @@ async fn fetch_table_export_stream(
             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
         } else {
             let _ = child.start_kill();
+            stderr_task.abort();
             emit_log(
                 app,
                 "warn",
@@ -2460,10 +2594,8 @@ async fn fetch_table_export_stream(
     let _ = child_stdin.flush().await;
     drop(child_stdin);
 
-    use tokio::io::AsyncReadExt;
-    let mut err_buf = Vec::new();
-    let _ = child_stderr.read_to_end(&mut err_buf).await;
     let status = child.wait().await.map_err(|e| format!("Gagal menunggu child process MySQL: {}", e))?;
+    let err_buf = stderr_task.await.unwrap_or_default();
 
     if !status.success() {
         let stderr_full = String::from_utf8_lossy(&err_buf);
@@ -2646,6 +2778,7 @@ fn spawn_mysql_child(
     cmd.stdin(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
     cmd.stdout(std::process::Stdio::null());
+    cmd.kill_on_drop(true);
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -2664,6 +2797,10 @@ fn spawn_mysql_child(
         }
     };
 
+    if let Some(pid) = child.id() {
+        register_child_pid(pid);
+    }
+
     let child_stdin = child
         .stdin
         .take()
@@ -2678,41 +2815,82 @@ fn spawn_mysql_child(
 
 
 /// Mengekstrak nilai Primary Key terbesar/terakhir dari chunk SQL dump phpMyAdmin
-/// untuk mendukung Keyset Pagination (Seek Method) O(1) yang super cepat
+/// untuk mendukung Keyset Pagination (Seek Method) O(1) yang super cepat.
+/// Menggunakan state-machine parser yang tahan terhadap string literal, JSON,
+/// tanda kurung bersarang, tanda petik escaped, dan titik koma (;) di dalam teks error/data.
 fn extract_last_pk_value(sql_bytes: &[u8], pk_column_name: &str) -> Option<String> {
     if sql_bytes.is_empty() || pk_column_name.is_empty() {
         return None;
     }
-
-    let sql_str = match std::str::from_utf8(sql_bytes) {
-        Ok(s) => s,
-        Err(_) => return None,
-    };
 
     let target_pk = pk_column_name.trim().trim_matches('`').to_lowercase();
     if target_pk.is_empty() {
         return None;
     }
 
-    // Cari posisi statement INSERT INTO atau REPLACE INTO terakhir
-    let insert_pos = sql_str
-        .rfind("INSERT INTO ")
-        .or_else(|| sql_str.rfind("insert into "))
-        .or_else(|| sql_str.rfind("REPLACE INTO "))
-        .or_else(|| sql_str.rfind("replace into "))?;
+    let len = sql_bytes.len();
+    let mut i = 0;
+    let mut in_string = false;
+    let mut in_escape = false;
+    let mut last_values_pos = None;
+    let mut last_insert_pos = 0;
 
-    let raw_statement = &sql_str[insert_pos..];
-    let semicolon_pos = raw_statement.find(';').unwrap_or(raw_statement.len());
-    let statement = &raw_statement[..semicolon_pos];
+    // 1. Scan SQL bytes untuk menemukan statement INSERT INTO / REPLACE INTO terakhir
+    // yang valid (mengabaikan komentar SQL dan string literal)
+    while i < len {
+        if in_escape {
+            in_escape = false;
+            i += 1;
+            continue;
+        }
+        if sql_bytes[i] == b'\\' {
+            in_escape = true;
+            i += 1;
+            continue;
+        }
+        if sql_bytes[i] == b'\'' {
+            in_string = !in_string;
+            i += 1;
+            continue;
+        }
 
-    // Ekstrak daftar kolom di dalam tanda kurung sebelum VALUES
-    let values_keyword_pos = statement.find("VALUES").or_else(|| statement.find("values"))?;
-    let header_part = &statement[..values_keyword_pos];
+        if !in_string {
+            // Lewati komentar satu baris (-- ...) atau (# ...)
+            if (i + 2 <= len && &sql_bytes[i..i + 2] == b"--") || sql_bytes[i] == b'#' {
+                while i < len && sql_bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            // Lewati komentar multi baris (/* ... */)
+            if i + 2 <= len && &sql_bytes[i..i + 2] == b"/*" {
+                i += 2;
+                while i + 1 < len && &sql_bytes[i..i + 2] != b"*/" {
+                    i += 1;
+                }
+                i += 2;
+                continue;
+            }
 
-    // Cari daftar kolom di header, contoh: `table` (`id`, `name`, `status`)
-    let pk_index = if let (Some(open_p), Some(close_p)) = (header_part.find('('), header_part.rfind(')')) {
+            if i + 11 <= len && sql_bytes[i..i + 11].eq_ignore_ascii_case(b"INSERT INTO") {
+                last_insert_pos = i;
+            } else if i + 12 <= len && sql_bytes[i..i + 12].eq_ignore_ascii_case(b"REPLACE INTO") {
+                last_insert_pos = i;
+            } else if i + 6 <= len && sql_bytes[i..i + 6].eq_ignore_ascii_case(b"VALUES") {
+                last_values_pos = Some((last_insert_pos, i));
+            }
+        }
+        i += 1;
+    }
+
+    let (insert_start, values_start) = last_values_pos?;
+
+    // 2. Ekstrak header kolom di antara INSERT/REPLACE dan VALUES jika ada
+    let header_bytes = &sql_bytes[insert_start..values_start];
+    let header_str = String::from_utf8_lossy(header_bytes);
+    let pk_index = if let (Some(open_p), Some(close_p)) = (header_str.find('('), header_str.rfind(')')) {
         if open_p < close_p {
-            let cols_str = &header_part[open_p + 1..close_p];
+            let cols_str = &header_str[open_p + 1..close_p];
             let cols: Vec<String> = cols_str
                 .split(',')
                 .map(|c| c.trim().trim_matches('`').trim_matches('\'').trim_matches('"').to_lowercase())
@@ -2725,44 +2903,93 @@ fn extract_last_pk_value(sql_bytes: &[u8], pk_column_name: &str) -> Option<Strin
         0
     };
 
-    // Cari tuple baris terakhir di bagian VALUES (...)
-    let values_part = &statement[values_keyword_pos..];
-    let last_close_paren = values_part.rfind(')')?;
-    let last_open_paren = values_part[..last_close_paren].rfind('(')?;
+    // 3. Scan bagian VALUES untuk mencari tuple baris terakhir secara akurat
+    let values_bytes = &sql_bytes[values_start + 6..];
+    let val_len = values_bytes.len();
+    let mut p = 0;
+    let mut in_str2 = false;
+    let mut in_esc2 = false;
+    let mut depth = 0usize;
+    let mut current_tuple_start = 0;
+    let mut last_tuple_range = None;
 
-    let row_str = &values_part[last_open_paren + 1..last_close_paren];
+    while p < val_len {
+        if in_esc2 {
+            in_esc2 = false;
+            p += 1;
+            continue;
+        }
+        if values_bytes[p] == b'\\' {
+            in_esc2 = true;
+            p += 1;
+            continue;
+        }
+        if values_bytes[p] == b'\'' {
+            in_str2 = !in_str2;
+            p += 1;
+            continue;
+        }
 
-    // Parse nilai-nilai dalam tuple baris dengan memperhatikan petik string (') dan escaping (\)
+        if !in_str2 {
+            if values_bytes[p] == b'(' {
+                if depth == 0 {
+                    current_tuple_start = p + 1;
+                }
+                depth += 1;
+            } else if values_bytes[p] == b')' {
+                if depth == 1 {
+                    last_tuple_range = Some((current_tuple_start, p));
+                }
+                if depth > 0 {
+                    depth -= 1;
+                }
+            } else if values_bytes[p] == b';' && depth == 0 {
+                break;
+            }
+        }
+        p += 1;
+    }
+
+    let (tuple_start, tuple_end) = last_tuple_range?;
+    if tuple_start >= tuple_end || tuple_end > values_bytes.len() {
+        return None;
+    }
+
+    let tuple_bytes = &values_bytes[tuple_start..tuple_end];
+
+    // 4. Parse nilai dalam tuple_bytes dipisahkan koma di luar string
     let mut values = Vec::new();
-    let mut current_val = String::new();
-    let mut in_quote = false;
-    let mut is_escaped = false;
+    let mut current_val = Vec::new();
+    let mut in_t_str = false;
+    let mut in_t_esc = false;
 
-    for ch in row_str.chars() {
-        if is_escaped {
-            current_val.push(ch);
-            is_escaped = false;
+    for &b in tuple_bytes {
+        if in_t_esc {
+            in_t_esc = false;
+            current_val.push(b);
             continue;
         }
-        if ch == '\\' {
-            current_val.push(ch);
-            is_escaped = true;
+        if b == b'\\' {
+            in_t_esc = true;
+            current_val.push(b);
             continue;
         }
-        if ch == '\'' {
-            in_quote = !in_quote;
-            current_val.push(ch);
+        if b == b'\'' {
+            in_t_str = !in_t_str;
+            current_val.push(b);
             continue;
         }
-        if ch == ',' && !in_quote {
-            values.push(current_val.trim().to_string());
+        if b == b',' && !in_t_str {
+            let s = String::from_utf8_lossy(&current_val).trim().to_string();
+            values.push(s);
             current_val.clear();
             continue;
         }
-        current_val.push(ch);
+        current_val.push(b);
     }
     if !current_val.is_empty() {
-        values.push(current_val.trim().to_string());
+        let s = String::from_utf8_lossy(&current_val).trim().to_string();
+        values.push(s);
     }
 
     if let Some(val) = values.get(pk_index) {
@@ -3404,8 +3631,7 @@ pub async fn export_pma_database(
     local_config: LocalDbConfig,
     app: tauri::AppHandle,
 ) -> Result<String, String> {
-    USER_CANCEL_REQUESTED.store(false, Ordering::SeqCst);
-    WORKER_ABORT_REQUESTED.store(false, Ordering::SeqCst);
+    reset_cancel_state();
 
     emit_log(
         &app,
@@ -3705,8 +3931,48 @@ pub async fn export_pma_database(
         consumer_handles.push(handle);
     }
 
-    let all_download_res = futures_util::future::join_all(download_handles).await;
-    let all_consumer_res = futures_util::future::join_all(consumer_handles).await;
+    let mut cancel_rx = get_cancel_watch().1.clone();
+    let mut download_join = Box::pin(futures_util::future::join_all(download_handles));
+    let mut consumer_join = Box::pin(futures_util::future::join_all(consumer_handles));
+
+    let mut download_done = false;
+    let mut consumer_done = false;
+    let mut all_download_res = Vec::new();
+    let mut all_consumer_res = Vec::new();
+
+    while !download_done || !consumer_done {
+        if is_user_cancelled() || is_aborted() {
+            kill_all_child_processes();
+            break;
+        }
+
+        tokio::select! {
+            res = &mut download_join, if !download_done => {
+                all_download_res = res;
+                download_done = true;
+            }
+            res = &mut consumer_join, if !consumer_done => {
+                all_consumer_res = res;
+                consumer_done = true;
+            }
+            _ = cancel_rx.changed() => {
+                if *cancel_rx.borrow() {
+                    kill_all_child_processes();
+                    break;
+                }
+            }
+            _ = tokio::time::sleep(tokio::time::Duration::from_millis(150)) => {
+                // Heartbeat check for cancellation
+            }
+        }
+    }
+
+    if is_user_cancelled() || is_aborted() {
+        kill_all_child_processes();
+        emit_progress(&app, completed_tables.load(Ordering::SeqCst), total_tables, "", 0, total_rows.load(Ordering::SeqCst), "cancelled");
+        emit_log(&app, "warn", "🛑 Sinkronisasi telah dihentikan oleh pengguna.");
+        return Err("Sinkronisasi dibatalkan oleh pengguna.".to_string());
+    }
 
     let mut real_error: Option<String> = None;
 
@@ -3783,4 +4049,39 @@ pub async fn export_pma_database(
         "Berhasil menyinkronkan {} tabel via Direct GZIP Stream ({} Workers).",
         total_tables, concurrency
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_last_pk_value_with_complex_strings() {
+        let sql = br#"
+-- phpMyAdmin SQL Dump
+-- version 5.2.1
+
+SET SQL_MODE = "NO_AUTO_VALUE_ON_ZERO";
+START TRANSACTION;
+
+INSERT INTO `omni_sales_order_errors` (`id`, `status`, `is_all_company`, `owned_by`, `created_by`, `deleted_at`, `created_at`, `updated_at`, `sales_order_id`, `error`) VALUES
+(188260, 1, 0, 4, 23, NULL, '2026-09-28 13:52:36', '2026-09-29 11:21:51', 1035479, 'Normal error; with semicolon in text'),
+(188261, 1, 0, 4, 23, NULL, '2026-09-28 13:52:36', '2026-09-29 11:21:51', 1035480, '{"stock-error":["BOSAUS680-white;bbss stock has not been met (Checked via Header BOM).","BOSAUS680-white stock has not been met (FIFO invalid)."],"cogs-error":"Below Benchmark COGS. <br> Manual approval required."}');
+
+COMMIT;
+"#;
+        let pk = extract_last_pk_value(sql, "id");
+        assert_eq!(pk, Some("188261".to_string()));
+    }
+
+    #[test]
+    fn test_extract_last_pk_value_without_column_header() {
+        let sql = br#"
+INSERT INTO `users` VALUES
+(1, 'Alice; admin (super)', '2026-01-01'),
+(42, 'Bob (tester); regular', '2026-01-02');
+"#;
+        let pk = extract_last_pk_value(sql, "id");
+        assert_eq!(pk, Some("42".to_string()));
+    }
 }

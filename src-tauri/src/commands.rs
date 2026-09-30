@@ -635,6 +635,9 @@ pub async fn batch_cleanup_incremental(
             let mut batch_idx: u64 = 0;
 
             loop {
+                if crate::pma_export::is_user_cancelled() {
+                    break;
+                }
                 let affected = match &last_id {
                     serde_json::Value::Number(num) => {
                         let n = num.as_i64().unwrap_or(0);
