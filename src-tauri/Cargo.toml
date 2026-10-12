@@ -12,7 +12,7 @@ tauri-build = { version = "2.0", features = [] }
 
 [dependencies]
 tauri = { version = "2.0", features = [] }
-tauri-plugin-http = { version = "2.0", features = ["unsafe-headers"] }
+tauri-plugin-http = { version = "2.0", features = ["unsafe-headers", "dangerous-settings"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1", features = ["full"] }

@@ -157,7 +157,8 @@ export class PmaClient {
         token: this.token,
       };
     } catch (err) {
-      throw new Error(`Gagal terhubung ke PMA (${this.baseUrl}): ${err.message}`);
+      const msg = err?.message || (typeof err === 'string' ? err : JSON.stringify(err));
+      throw new Error(`Gagal terhubung ke PMA (${this.baseUrl}): ${msg}`);
     }
   }
 

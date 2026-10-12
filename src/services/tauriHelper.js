@@ -42,10 +42,21 @@ export async function safeInvoke(cmd, args = {}) {
 export async function safeFetch(url, options = {}) {
   if (isTauriEnvironment()) {
     try {
-      return await tauriFetch(url, options);
+      const mergedOptions = {
+        ...options,
+        danger: {
+          acceptInvalidCerts: true,
+          acceptInvalidHostnames: true,
+          ...(options.danger || {}),
+        },
+      };
+      return await tauriFetch(url, mergedOptions);
     } catch (e) {
       console.warn('Tauri HTTP fetch error:', e);
-      throw e;
+      const errMsg = typeof e === 'string' ? e : (e?.message || JSON.stringify(e));
+      const error = new Error(errMsg);
+      error.original = e;
+      throw error;
     }
   }
   return await fetch(url, options);

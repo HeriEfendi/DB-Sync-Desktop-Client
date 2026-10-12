@@ -656,7 +656,7 @@ const testPmaConnection = async () => {
     pmaStatus.value.connected = false;
     addLog({
       type: 'error',
-      message: `Tes PMA Remote Gagal: ${err.message}`,
+      message: `Tes PMA Remote Gagal: ${err?.message || err}`,
       timestamp: new Date().toLocaleTimeString(),
     });
   } finally {

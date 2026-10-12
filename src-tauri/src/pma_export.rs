@@ -286,6 +286,7 @@ async fn authenticate_pma(
     let client = reqwest::Client::builder()
         .cookie_store(true)
         .gzip(false)
+        .danger_accept_invalid_certs(true)
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) DB-Sync-Client/1.0")
         .timeout(Duration::from_secs(300))
         .tcp_keepalive(Duration::from_secs(30))
