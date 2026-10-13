@@ -18,6 +18,7 @@ pub fn run() {
             commands::drop_local_tables,
             pma_export::export_pma_database,
             pma_export::get_pma_tables,
+            pma_export::test_pma_connection,
             pma_export::cancel_pma_export
         ])
         .run(tauri::generate_context!())

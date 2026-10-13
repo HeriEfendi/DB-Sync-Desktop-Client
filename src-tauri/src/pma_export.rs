@@ -140,9 +140,6 @@ fn emit_log(app: &tauri::AppHandle, log_type: &str, message: impl Into<String>) 
             "effective_base_url diperbarui",
             "Re-fetch dari",
             "CSRF token diekstrak",
-            "Melakukan otentikasi login PMA",
-            "POST login ke",
-            "Login response:",
             "Token baru dari login response",
             "POST request ke export",
             "Endpoint PMA valid ditemukan",
@@ -152,7 +149,7 @@ fn emit_log(app: &tauri::AppHandle, log_type: &str, message: impl Into<String>) 
         .any(|prefix| msg.starts_with(prefix) || msg.contains(prefix));
 
     let noisy_fallback =
-        norm_type == "warning" && (msg.contains("mengembalikan HTML response: 404 Not Found") || msg.contains("tidak menghasilkan PK"));
+        norm_type == "warning" && (msg.contains("tidak menghasilkan PK"));
 
     if noisy_http || noisy_fallback {
         println!("[PMA-LOG] [{}]: {}", norm_type, msg);
@@ -192,82 +189,231 @@ fn emit_progress(
     );
 }
 
-/// Extract CSRF token from PMA HTML content
-fn extract_csrf_token(html: &str) -> Option<String> {
-    if let Some(caps) = regex_find_token(html) {
-        return Some(caps);
-    }
-
-    let token_keys = [
-        "name=\"token\" value=\"",
-        "\"token\":\"",
-        "token=",
-        "set_session=",
+fn extract_attr_val(tag: &str, attr: &str) -> Option<String> {
+    let lower_tag = tag.to_lowercase();
+    let search_keys = [
+        format!("{}=\"", attr),
+        format!("{}='", attr),
+        format!("{} = \"", attr),
+        format!("{} = '", attr),
     ];
 
-    for key in token_keys {
-        for line in html.lines() {
-            if line.contains("token") || line.contains("set_session") {
-                if let Some(idx) = line.find(key) {
-                    let rest = &line[idx + key.len()..];
-                    let val: String = rest
-                        .chars()
-                        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
-                        .collect();
-                    if val.len() >= 16 {
-                        return Some(val);
-                    }
-                }
+    for key in &search_keys {
+        if let Some(pos) = lower_tag.find(key) {
+            let val_start = pos + key.len();
+            let quote = if key.contains('\'') { '\'' } else { '"' };
+            if let Some(val_len) = tag[val_start..].find(quote) {
+                return Some(tag[val_start..val_start + val_len].trim().to_string());
             }
+        }
+    }
+    None
+}
+
+/// Extract all hidden form inputs from HTML (e.g. set_session, token, server, target)
+fn extract_hidden_form_inputs(html: &str) -> HashMap<String, String> {
+    let mut inputs = HashMap::new();
+    let lower = html.to_lowercase();
+    let mut cursor = 0;
+
+    while let Some(rel_start) = lower[cursor..].find("<input") {
+        let tag_start = cursor + rel_start;
+        let tag_end = match lower[tag_start..].find('>') {
+            Some(rel_end) => tag_start + rel_end + 1,
+            None => break,
+        };
+
+        let tag = &html[tag_start..tag_end];
+        cursor = tag_end;
+
+        if let (Some(name), Some(val)) = (extract_attr_val(tag, "name"), extract_attr_val(tag, "value")) {
+            if !name.is_empty() {
+                inputs.insert(name, val);
+            }
+        }
+    }
+
+    inputs
+}
+
+/// Extract CSRF token from PMA HTML content (strictly token, never set_session)
+fn extract_csrf_token(html: &str) -> Option<String> {
+    // 1. Check hidden input name="token"
+    let inputs = extract_hidden_form_inputs(html);
+    if let Some(tok) = inputs.get("token") {
+        let trimmed = tok.trim();
+        if trimmed.len() >= 16 && trimmed.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    // 2. Check JSON / script patterns
+    let token_keys = [
+        "\"token\":\"",
+        "'token':'",
+        "\"token\" : \"",
+        "pma_token = \"",
+        "pma_token = '",
+        "data-token=\"",
+        "data-token='",
+        "name=\"token\" value=\"",
+        "name='token' value='",
+        "name=\"token\" value='",
+        "name='token' value=\"",
+        "CommonParams.set('token', '",
+        "PMA_commonParams.set('token', '",
+        "CommonParams.set(\"token\", \"",
+        "PMA_commonParams.set(\"token\", \"",
+    ];
+
+    for key in &token_keys {
+        if let Some(idx) = html.find(key) {
+            let rest = &html[idx + key.len()..];
+            let val: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+                .collect();
+            if val.len() >= 16 {
+                return Some(val);
+            }
+        }
+    }
+
+    // 3. Fallback: check query parameter token=
+    if let Some(idx) = html.find("token=") {
+        let rest = &html[idx + 6..];
+        let val: String = rest
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+            .collect();
+        if val.len() >= 16 {
+            return Some(val);
         }
     }
 
     None
 }
 
-fn regex_find_token(html: &str) -> Option<String> {
-    for line in html.lines() {
-        if line.contains("token") || line.contains("set_session") {
-            if line.contains("value=\"") {
-                for part in line.split("value=\"").skip(1) {
-                    if let Some(end) = part.find('"') {
-                        let val = part[..end].trim();
-                        if val.len() >= 16
-                            && val
-                                .chars()
-                                .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
-                        {
-                            return Some(val.to_string());
-                        }
-                    }
+fn strip_noscript(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut cursor = 0;
+    let lower = html.to_lowercase();
+    while let Some(rel) = lower[cursor..].find("<noscript") {
+        let tag_start = cursor + rel;
+        out.push_str(&html[cursor..tag_start]);
+        if let Some(end_rel) = lower[tag_start..].find("</noscript>") {
+            cursor = tag_start + end_rel + "</noscript>".len();
+        } else {
+            cursor = html.len();
+            break;
+        }
+    }
+    if cursor < html.len() {
+        out.push_str(&html[cursor..]);
+    }
+    out
+}
+
+fn extract_form_action(html: &str) -> Option<String> {
+    let lower = html.to_lowercase();
+    let mut cursor = 0;
+
+    while let Some(rel_start) = lower[cursor..].find("<form") {
+        let form_start = cursor + rel_start;
+        let tag_end = match lower[form_start..].find('>') {
+            Some(end) => form_start + end + 1,
+            None => break,
+        };
+
+        let form_end = match lower[tag_end..].find("</form>") {
+            Some(end) => tag_end + end,
+            None => html.len(),
+        };
+
+        let form_body = &lower[form_start..form_end];
+        let tag = &html[form_start..tag_end];
+        cursor = tag_end;
+
+        let is_login_form = form_body.contains("login_form")
+            || form_body.contains("pma_password")
+            || form_body.contains("pma_username");
+
+        if is_login_form {
+            if let Some(action) = extract_attr_val(tag, "action") {
+                let act = action.trim();
+                if !act.is_empty() && !act.contains("route=/login") {
+                    return Some(act.to_string());
                 }
             }
-            if line.contains("value='") {
-                for part in line.split("value='").skip(1) {
-                    if let Some(end) = part.find('\'') {
-                        let val = part[..end].trim();
-                        if val.len() >= 16
-                            && val
-                                .chars()
-                                .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
-                        {
-                            return Some(val.to_string());
-                        }
+            break;
+        }
+    }
+    None
+}
+
+/// Extract human-readable error banner from phpMyAdmin response HTML
+fn extract_pma_error_banner(html: &str) -> Option<String> {
+    let clean_html = strip_noscript(html);
+    let error_markers = [
+        "class=\"alert alert-danger\"",
+        "class='alert alert-danger'",
+        "class=\"error\"",
+        "class='error'",
+        "class=\"message error\"",
+        "class='message error'",
+        "id=\"pma_errors\"",
+    ];
+
+    for marker in &error_markers {
+        let mut search_idx = 0;
+        while let Some(rel_pos) = clean_html[search_idx..].find(marker) {
+            let pos = search_idx + rel_pos;
+            let start = pos + marker.len();
+            search_idx = start;
+
+            if let Some(gt_pos) = clean_html[start..].find('>') {
+                let content_start = start + gt_pos + 1;
+                if let Some(end_div) = clean_html[content_start..].find("</div>") {
+                    search_idx = content_start + end_div;
+                    let raw_err = &clean_html[content_start..content_start + end_div];
+                    let cleaned: String = raw_err
+                        .split('<')
+                        .map(|chunk| {
+                            if let Some(idx) = chunk.find('>') {
+                                &chunk[idx + 1..]
+                            } else {
+                                chunk
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ");
+
+                    if cleaned.contains("Javascript must be enabled")
+                        || cleaned.contains("mismatch between HTTPS")
+                    {
+                        continue;
                     }
-                }
-            }
-            if line.contains("\"token\":\"") {
-                for part in line.split("\"token\":\"").skip(1) {
-                    if let Some(end) = part.find('"') {
-                        let val = part[..end].trim();
-                        if val.len() >= 16 {
-                            return Some(val.to_string());
-                        }
+
+                    if !cleaned.is_empty() && cleaned.len() < 500 {
+                        return Some(cleaned);
                     }
                 }
             }
         }
     }
+
+    if clean_html.contains("Cannot log in to the database server")
+        || clean_html.contains("Cannot log in to the MySQL server")
+    {
+        return Some("Cannot log in to the database server (koneksi MySQL ditolak).".to_string());
+    }
+    if clean_html.contains("Access denied") {
+        return Some("Access denied (Username atau Password salah).".to_string());
+    }
+
     None
 }
 
@@ -276,7 +422,10 @@ async fn authenticate_pma(
     pma_config: &PmaExportConfig,
     app: &tauri::AppHandle,
 ) -> Result<(reqwest::Client, String, String), String> {
-    let base_url = pma_config.url.trim().trim_end_matches('/').to_string();
+    let mut base_url = pma_config.url.trim().trim_end_matches('/').to_string();
+    if base_url.ends_with("/index.php") {
+        base_url = base_url.trim_end_matches("/index.php").trim_end_matches('/').to_string();
+    }
     emit_log(
         app,
         "info",
@@ -388,6 +537,21 @@ async fn authenticate_pma(
         ),
     );
 
+    // Check if session is already authenticated (e.g. persistent cookie or unauthenticated PMA)
+    let is_already_authenticated = (html.contains("id=\"pma_navigation\"")
+        || html.contains("id='pma_navigation'")
+        || html.contains("id=\"floating_user\"")
+        || html.contains("id='floating_user'")
+        || html.contains("route=/server/databases")
+        || (html.contains("databases") && html.contains("logout")))
+        && !html.contains("name=\"pma_password\"")
+        && !html.contains("id=\"input_password\"");
+
+    if is_already_authenticated {
+        emit_log(app, "info", "Sesi PMA sudah terotentikasi (cookie/auth aktif).");
+        return Ok((client, effective_base_url, csrf_token));
+    }
+
     if !pma_config.username.is_empty() {
         emit_log(
             app,
@@ -397,41 +561,53 @@ async fn authenticate_pma(
                 pma_config.username
             ),
         );
-        let login_url = format!("{}/index.php?route=/login", effective_base_url);
-        let mut form = vec![
-            ("pma_username", pma_config.username.as_str()),
-            ("pma_password", pma_config.password.as_str()),
-            ("server", "1"),
-            ("target", "index.php"),
+        let form_action = extract_form_action(&html);
+        let login_url = if let Some(act) = form_action {
+            if act.starts_with("http://") || act.starts_with("https://") {
+                act
+            } else {
+                format!("{}/{}", effective_base_url, act.trim_start_matches('/'))
+            }
+        } else {
+            format!("{}/index.php", effective_base_url)
+        };
+        let hidden_inputs = extract_hidden_form_inputs(&html);
+
+        let mut form: Vec<(&str, String)> = vec![
+            ("pma_username", pma_config.username.clone()),
+            ("pma_password", pma_config.password.clone()),
         ];
-        if !pma_config.database.is_empty() {
-            form.push(("db", pma_config.database.as_str()));
+
+        let server_val = hidden_inputs.get("server").cloned().unwrap_or_else(|| "1".to_string());
+        form.push(("server", server_val));
+
+        let target_val = hidden_inputs.get("target").cloned().unwrap_or_else(|| "index.php".to_string());
+        form.push(("target", target_val));
+
+        if let Some(set_session) = hidden_inputs.get("set_session") {
+            emit_log(app, "info", format!("Menyertakan set_session: len={}", set_session.len()));
+            form.push(("set_session", set_session.clone()));
         }
-        if !csrf_token.is_empty() {
-            form.push(("token", csrf_token.as_str()));
+
+        if let Some(tok) = hidden_inputs.get("token") {
+            form.push(("token", tok.clone()));
+            csrf_token = tok.clone();
+        } else if !csrf_token.is_empty() {
+            form.push(("token", csrf_token.clone()));
+        }
+
+        if !pma_config.database.is_empty() {
+            form.push(("db", pma_config.database.clone()));
         }
 
         emit_log(app, "info", format!("POST login ke: {}", login_url));
 
-        let login_resp = client.post(&login_url).form(&form).send().await;
-
-        let login_resp = match login_resp {
-            Ok(r) => r,
-            Err(_) => {
-                let alt_login_url = format!("{}/index.php", effective_base_url);
-                emit_log(
-                    app,
-                    "warn",
-                    format!("Login route=/login gagal, mencoba: {}", alt_login_url),
-                );
-                client
-                    .post(&alt_login_url)
-                    .form(&form)
-                    .send()
-                    .await
-                    .map_err(|e| format!("Gagal login ke PMA: {}", e))?
-            }
-        };
+        let login_resp = client
+            .post(&login_url)
+            .form(&form)
+            .send()
+            .await
+            .map_err(|e| format!("Gagal mengirim request login ke PMA ({}): {}", login_url, e))?;
 
         let login_status = login_resp.status();
         let login_final_url = login_resp.url().to_string();
@@ -444,56 +620,45 @@ async fn authenticate_pma(
             app,
             "info",
             format!(
-                "Login response: status={}, final_url={}, len={}, preview={}",
+                "Login response: status={}, final_url={}, len={}",
                 login_status.as_u16(),
                 login_final_url,
-                login_html.len(),
-                &login_html[..login_html.len().min(300)]
+                login_html.len()
             ),
         );
 
         if let Some(new_token) = extract_csrf_token(&login_html) {
-            emit_log(
-                app,
-                "info",
-                format!(
-                    "Token baru dari login response: '{}' (len={})",
-                    &new_token[..new_token.len().min(16)],
-                    new_token.len()
-                ),
-            );
             csrf_token = new_token;
-        } else {
-            emit_log(
-                app,
-                "warn",
-                "Tidak ada token baru di login response, menggunakan token lama",
-            );
         }
 
-        if login_html.contains("Access denied")
-            || login_html.contains("Cannot log in to the MySQL server")
-        {
+        let has_password_field = login_html.contains("name=\"pma_password\"")
+            || login_html.contains("id=\"input_password\"");
+
+        let has_auth_marker = login_html.contains("id=\"pma_navigation\"")
+            || login_html.contains("id='pma_navigation'")
+            || login_html.contains("id=\"floating_user\"")
+            || login_html.contains("id='floating_user'")
+            || login_html.contains("serverinfo")
+            || login_html.contains("route=/server/databases")
+            || login_html.contains("route=/database")
+            || login_html.contains("db_structure.php")
+            || login_html.contains("navigation_tree")
+            || login_html.contains("id=\"pma_console\"")
+            || login_html.contains("title=\"Log out\"")
+            || login_html.contains("title='Log out'")
+            || login_html.contains("\"success\":true")
+            || login_html.contains("'success':true");
+
+        if has_password_field && !has_auth_marker {
+            if let Some(banner) = extract_pma_error_banner(&login_html) {
+                return Err(format!("Login PMA Gagal: {}", banner));
+            }
             return Err(
-                "Login PMA Gagal: Username atau Password salah atau akses ditolak.".to_string(),
+                "Login PMA Gagal: Kredensial (Username/Password) ditolak atau sesi tidak valid (form login masih tampil). Silakan periksa kembali konfigurasi login PMA.".to_string(),
             );
         }
 
-        // Check if login was actually successful by looking for authenticated page indicators
-        let login_ok = !login_html.contains("pma_username")
-            && !login_html.contains("\"name\":\"pma_username\"")
-            && (login_html.contains("main_pane_left")
-                || login_html.contains("navigation_tree")
-                || login_html.contains("pma-core")
-                || login_html.contains("\"success\":true")
-                || login_html.contains("db=")
-                || !csrf_token.is_empty());
-
-        if login_ok {
-            emit_log(app, "success", "Otentikasi login PMA berhasil.");
-        } else {
-            emit_log(app, "warn", "Login mungkin gagal — halaman login masih tampil. Melanjutkan dengan cookies yang ada...");
-        }
+        emit_log(app, "success", "Otentikasi login PMA berhasil.");
     }
 
     Ok((client, effective_base_url, csrf_token))
@@ -501,25 +666,42 @@ async fn authenticate_pma(
 
 fn find_html_redirect(html: &str) -> Option<String> {
     for line in html.lines() {
-        if line.to_lowercase().contains("refresh") || line.contains("window.location") {
-            if let Some(start) = line.find("url=") {
-                let rest = &line[start + 4..];
+        let lower = line.to_lowercase();
+        if lower.contains("refresh") || lower.contains("window.location") || lower.contains("location.replace") {
+            if let Some(pos) = lower.find("url=") {
+                let rest = line[pos + 4..].trim_start();
                 let end = rest
                     .find('"')
                     .or_else(|| rest.find('\''))
+                    .or_else(|| rest.find(';'))
+                    .or_else(|| rest.find(' '))
                     .unwrap_or(rest.len());
-                return Some(rest[..end].trim().to_string());
+                let clean = rest[..end].trim();
+                if !clean.is_empty() {
+                    return Some(clean.to_string());
+                }
             }
-            let start_opt = line
-                .find("window.location=")
-                .or_else(|| line.find("window.location ="));
-            if let Some(start) = start_opt {
-                if let Some(quote_start) =
-                    line[start..].find('"').or_else(|| line[start..].find('\''))
-                {
-                    let rest = &line[start + quote_start + 1..];
-                    if let Some(quote_end) = rest.find('"').or_else(|| rest.find('\'')) {
-                        return Some(rest[..quote_end].trim().to_string());
+            if let Some(pos) = lower.find("window.location") {
+                let rest = &line[pos + "window.location".len()..];
+                if let Some(q_start) = rest.find('"').or_else(|| rest.find('\'')) {
+                    let sub = &rest[q_start + 1..];
+                    if let Some(q_end) = sub.find('"').or_else(|| sub.find('\'')) {
+                        let clean = sub[..q_end].trim();
+                        if !clean.is_empty() {
+                            return Some(clean.to_string());
+                        }
+                    }
+                }
+            }
+            if let Some(pos) = lower.find("location.replace") {
+                let rest = &line[pos + "location.replace".len()..];
+                if let Some(q_start) = rest.find('"').or_else(|| rest.find('\'')) {
+                    let sub = &rest[q_start + 1..];
+                    if let Some(q_end) = sub.find('"').or_else(|| sub.find('\'')) {
+                        let clean = sub[..q_end].trim();
+                        if !clean.is_empty() {
+                            return Some(clean.to_string());
+                        }
                     }
                 }
             }
@@ -574,20 +756,27 @@ pub async fn fetch_pma_tables(
     }
 
     let (client, base_url, csrf_token) = authenticate_pma(pma_config, app).await?;
-    let db = &pma_config.database;
+    let db = pma_config.database.trim();
+    if db.is_empty() {
+        return Err("Nama database remote PMA belum diisi.".to_string());
+    }
 
     emit_log(
         app,
         "info",
-        format!("Mengambil daftar tabel dari database '{}'...", db),
+        format!("Mengambil daftar tabel dari database remote '{}'...", db),
     );
 
     let mut found_tables: Vec<String> = Vec::new();
+    let safe_db_sq = db.replace('\'', "''");
+    let safe_db_bt = db.replace('`', "``");
 
-    // === PRIMARY: AJAX SQL via /index.php?route=/sql ===
+    // === PRIMARY: AJAX SQL via /index.php?route=/sql and /sql.php ===
     let sql_queries = vec![
-        format!("SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = '{}' ORDER BY TABLE_NAME LIMIT 100000", db.replace('\'', "''")),
-        format!("SHOW TABLES FROM `{}`", db.replace('`', "``")),
+        format!("SELECT TABLE_NAME FROM information_schema.TABLES WHERE LOWER(TABLE_SCHEMA) = LOWER('{}') ORDER BY TABLE_NAME LIMIT 100000", safe_db_sq),
+        format!("SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = '{}' ORDER BY TABLE_NAME LIMIT 100000", safe_db_sq),
+        format!("SHOW FULL TABLES FROM `{}` WHERE Table_type = 'BASE TABLE'", safe_db_bt),
+        format!("SHOW TABLES FROM `{}`", safe_db_bt),
         "SHOW TABLES".to_string(),
     ];
 
@@ -599,13 +788,12 @@ pub async fn fetch_pma_tables(
     'outer: for sql_url in &sql_endpoints {
         for query in &sql_queries {
             let mut form_data: Vec<(&str, String)> = vec![
-                ("db", db.clone()),
+                ("db", db.to_string()),
                 ("table", String::new()),
                 ("server", "1".to_string()),
                 ("sql_query", query.clone()),
                 ("sql_delimiter", ";".to_string()),
                 ("ajax_request", "true".to_string()),
-                ("ajax_page_request", "true".to_string()),
                 ("submit_query", "Go".to_string()),
                 ("session_max_rows", "all".to_string()),
                 ("max_rows", "100000".to_string()),
@@ -651,10 +839,9 @@ pub async fn fetch_pma_tables(
                 app,
                 "info",
                 format!(
-                    "AJAX SQL response status={}, len={}, preview={}",
+                    "AJAX SQL response status={}, len={}",
                     status.as_u16(),
-                    raw_text.len(),
-                    &raw_text[..raw_text.len().min(300)]
+                    raw_text.len()
                 ),
             );
 
@@ -670,11 +857,21 @@ pub async fn fetch_pma_tables(
                         .or_else(|| json_val.get("message"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("unknown error");
-                    emit_log(app, "warn", format!("AJAX SQL error dari PMA: {}", err_msg));
+                    emit_log(app, "warn", format!("AJAX SQL info dari PMA: {}", err_msg));
                     continue;
                 }
 
                 let mut tables = extract_tables_from_json(&json_val, db);
+                // Also check if json_val has 'message' containing rendered HTML results
+                if tables.is_empty() {
+                    if let Some(msg_str) = json_val.get("message").and_then(|v| v.as_str()) {
+                        let html_extracted = extract_tables_from_html(msg_str);
+                        if !html_extracted.is_empty() {
+                            tables = html_extracted;
+                        }
+                    }
+                }
+
                 if !tables.is_empty() {
                     emit_log(
                         app,
@@ -689,12 +886,12 @@ pub async fn fetch_pma_tables(
                     let mut offset = tables.len();
                     while tables.len() % 250 == 0 {
                         let paged_query = format!(
-                            "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = '{}' ORDER BY TABLE_NAME LIMIT 1000 OFFSET {}",
-                            db.replace('\'', "''"),
+                            "SELECT TABLE_NAME FROM information_schema.TABLES WHERE LOWER(TABLE_SCHEMA) = LOWER('{}') ORDER BY TABLE_NAME LIMIT 1000 OFFSET {}",
+                            safe_db_sq,
                             offset
                         );
                         let mut paged_form = vec![
-                            ("db", db.clone()),
+                            ("db", db.to_string()),
                             ("table", String::new()),
                             ("server", "1".to_string()),
                             ("sql_query", paged_query),
@@ -727,7 +924,12 @@ pub async fn fetch_pma_tables(
                                 if let Ok(paged_json) =
                                     serde_json::from_str::<serde_json::Value>(&paged_text)
                                 {
-                                    let new_page_tables = extract_tables_from_json(&paged_json, db);
+                                    let mut new_page_tables = extract_tables_from_json(&paged_json, db);
+                                    if new_page_tables.is_empty() {
+                                        if let Some(msg_str) = paged_json.get("message").and_then(|v| v.as_str()) {
+                                            new_page_tables = extract_tables_from_html(msg_str);
+                                        }
+                                    }
                                     if new_page_tables.is_empty() {
                                         break;
                                     }
@@ -755,27 +957,30 @@ pub async fn fetch_pma_tables(
                 emit_log(
                     app,
                     "warn",
-                    "AJAX SQL success=true tapi tidak ada tabel di response JSON",
+                    "AJAX SQL success=true tapi tidak ada tabel di response JSON/message",
                 );
-            } else {
-                emit_log(
-                    app,
-                    "warn",
-                    format!(
-                        "AJAX SQL response bukan JSON valid (len={})",
-                        raw_text.len()
-                    ),
-                );
+            } else if !raw_text.is_empty() {
+                // If raw_text is HTML (e.g. PMA returned direct HTML view)
+                let html_extracted = extract_tables_from_html(&raw_text);
+                if !html_extracted.is_empty() {
+                    emit_log(
+                        app,
+                        "success",
+                        format!("Ekstraksi dari HTML SQL response berhasil: {} tabel ditemukan", html_extracted.len()),
+                    );
+                    found_tables = html_extracted;
+                    break 'outer;
+                }
             }
         }
     }
 
-    // === FALLBACK: HTML scraping dari database structure & export pages ===
+    // === FALLBACK: HTML scraping dari database structure, navigation & export pages ===
     if found_tables.is_empty() {
         emit_log(
             app,
             "warn",
-            "AJAX SQL tidak menghasilkan tabel, mencoba HTML scraping...",
+            "AJAX SQL tidak menghasilkan tabel, mencoba ekstraksi dari halaman PMA & Navigation Tree...",
         );
 
         let db_encoded = urlencoding::encode(db);
@@ -785,19 +990,17 @@ pub async fn fetch_pma_tables(
             String::new()
         };
 
-        // Prioritize export page because export pages list ALL tables without pagination
         let candidate_urls = vec![
-            format!(
-                "{}/index.php?route=/database/export&db={}{}",
-                base_url, db_encoded, token_param
-            ),
-            format!("{}/export.php?db={}{}", base_url, db_encoded, token_param),
-            format!(
-                "{}/index.php?route=/database/structure&db={}{}",
-                base_url, db_encoded, token_param
-            ),
+            format!("{}/index.php?route=/database/structure&db={}&server=1{}", base_url, db_encoded, token_param),
+            format!("{}/db_structure.php?db={}&server=1{}", base_url, db_encoded, token_param),
+            format!("{}/index.php?route=/navigation&db={}&server=1{}", base_url, db_encoded, token_param),
+            format!("{}/navigation.php?db={}&server=1{}", base_url, db_encoded, token_param),
+            format!("{}/index.php?route=/database/export&db={}&server=1&export_type=database{}", base_url, db_encoded, token_param),
+            format!("{}/export.php?db={}&server=1&export_type=database{}", base_url, db_encoded, token_param),
+            format!("{}/index.php?db={}&server=1{}", base_url, db_encoded, token_param),
+            format!("{}/index.php?route=/database/structure&db={}{}", base_url, db_encoded, token_param),
             format!("{}/db_structure.php?db={}{}", base_url, db_encoded, token_param),
-            format!("{}/index.php?db={}{}", base_url, db_encoded, token_param),
+            format!("{}/export.php?db={}{}", base_url, db_encoded, token_param),
         ];
 
         for url in &candidate_urls {
@@ -837,23 +1040,13 @@ pub async fn fetch_pma_tables(
                         app,
                         "info",
                         format!(
-                            "HTML scraping dari '{}' menemukan {} tabel",
+                            "Ekstraksi dari '{}' menemukan {} tabel",
                             url,
                             tables.len()
                         ),
                     );
                     found_tables = tables;
                     break;
-                } else {
-                    emit_log(
-                        app,
-                        "warn",
-                        format!(
-                            "HTML scraping dari '{}': tidak ada tabel (len={})",
-                            url,
-                            html.len()
-                        ),
-                    );
                 }
             }
         }
@@ -875,7 +1068,7 @@ pub async fn fetch_pma_tables(
     }
 
     Err(format!(
-        "Tidak ada tabel yang ditemukan di database '{}'. Pastikan nama database benar, credentials memiliki akses, dan coba lakukan 'Tes Koneksi PMA' terlebih dahulu.",
+        "Tidak ada tabel yang ditemukan di database '{}'. Pastikan nama database benar (case-sensitive di Linux), credentials memiliki hak akses SELECT, dan coba lakukan 'Tes Koneksi PMA' terlebih dahulu.",
         db
     ))
 }
@@ -1276,6 +1469,19 @@ async fn fetch_table_row_counts(
 fn extract_tables_from_json(json_val: &serde_json::Value, db: &str) -> Vec<String> {
     let mut tables = Vec::new();
 
+    // Check if JSON has "message" containing rendered HTML results (standard PMA AJAX format)
+    if let Some(msg_str) = json_val.get("message").and_then(|v| v.as_str()) {
+        let msg_tables = extract_tables_from_html(msg_str);
+        for t in msg_tables {
+            if !tables.contains(&t) {
+                tables.push(t);
+            }
+        }
+        if !tables.is_empty() {
+            return tables;
+        }
+    }
+
     // Try top-level fields: dataset, data, rows, results
     let try_keys = ["dataset", "data", "rows", "results", "query_data"];
     for key in &try_keys {
@@ -1405,6 +1611,15 @@ fn extract_table_name_from_row(row: &serde_json::Value, _db: &str) -> Option<Str
 }
 
 #[tauri::command]
+pub async fn test_pma_connection(
+    pma_config: PmaExportConfig,
+    app: tauri::AppHandle,
+) -> Result<String, String> {
+    let (_client, base_url, _csrf_token) = authenticate_pma(&pma_config, &app).await?;
+    Ok(format!("Koneksi dan otentikasi ke PMA remote ({}) berhasil!", base_url))
+}
+
+#[tauri::command]
 pub async fn get_pma_tables(
     pma_config: PmaExportConfig,
     app: tauri::AppHandle,
@@ -1462,7 +1677,11 @@ fn extract_tables_from_html(html: &str) -> Vec<String> {
                 | "server"
                 | "action"
                 | "table"
+                | "tables"
+                | "table_name"
+                | "tables_in"
                 | "view"
+                | "views"
                 | "all"
                 | "new"
                 | "ansi"
@@ -1509,17 +1728,24 @@ fn extract_tables_from_html(html: &str) -> Vec<String> {
                 | "quick_export"
                 | "sendit"
                 | "asfile"
+                | "browse"
+                | "search"
+                | "empty"
+                | "drop"
+                | "operations"
         )
     };
 
-    // Pattern 1: data-table="table_name"  ← most reliable, PMA adds this on structure page
-    for line in html.lines() {
-        if line.contains("data-table=\"") {
-            for part in line.split("data-table=\"").skip(1) {
-                if let Some(end) = part.find('"') {
-                    let name = part[..end].trim();
-                    if is_valid_table_name(name) && !tables.contains(&name.to_string()) {
-                        tables.push(name.to_string());
+    // Pattern 1: data-table="table_name" or data-filter-row="table_name" (structure page & PMA 5 rows)
+    for attr in &["data-table=\"", "data-name=\"", "data-filter-row=\""] {
+        for line in html.lines() {
+            if line.contains(attr) {
+                for part in line.split(attr).skip(1) {
+                    if let Some(end) = part.find('"') {
+                        let name = part[..end].trim();
+                        if is_valid_table_name(name) && !tables.contains(&name.to_string()) {
+                            tables.push(name.to_string());
+                        }
                     }
                 }
             }
@@ -1572,7 +1798,27 @@ fn extract_tables_from_html(html: &str) -> Vec<String> {
         }
     }
 
-    // Pattern 3: table=table_name or dbtable=table_name in URLs (query strings)
+    // Pattern 3: <td ... class="...data...">table_name</td> in SQL query results HTML
+    for line in html.lines() {
+        if line.contains("<td") && (line.contains("class=\"data") || line.contains("class='data") || line.contains("class=\"text")) {
+            if let Some(start) = line.find('>') {
+                let rest = &line[start + 1..];
+                if let Some(end) = rest.find("</td>") {
+                    let text = rest[..end].trim();
+                    // Strip inner HTML tags if any (e.g. <span>table_name</span>)
+                    let clean_text = text.replace(['<', '>'], " ");
+                    let words: Vec<&str> = clean_text.split_whitespace().collect();
+                    for w in words {
+                        if is_valid_table_name(w) && !tables.contains(&w.to_string()) {
+                            tables.push(w.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Pattern 4: table=table_name or dbtable=table_name in URLs (query strings)
     for line in html.lines() {
         for key in &["table=", "dbtable="] {
             if line.contains(key) {
@@ -1583,6 +1829,20 @@ fn extract_tables_from_html(html: &str) -> Vec<String> {
                         .collect();
                     if is_valid_table_name(&name) && !tables.contains(&name) {
                         tables.push(name);
+                    }
+                }
+            }
+        }
+    }
+
+    // Pattern 5: Navigation tree links e.g. <a class="hover_show_full" ... title="table_name">
+    for line in html.lines() {
+        if line.contains("hover_show_full") && line.contains("title=\"") {
+            for part in line.split("title=\"").skip(1) {
+                if let Some(end) = part.find('"') {
+                    let name = part[..end].trim();
+                    if is_valid_table_name(name) && !tables.contains(&name.to_string()) {
+                        tables.push(name.to_string());
                     }
                 }
             }
