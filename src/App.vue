@@ -424,10 +424,17 @@ onUnmounted(() => {
 
 // Fetch list of tables dynamically from remote PMA
 const fetchTablesFromPma = async () => {
+  const trimmedUrl = (pmaConfig.value.url || '').trim().replace(/\/index\.php.*$/, '').replace(/\/$/, '');
+  const trimmedDb = (pmaConfig.value.database || '').trim();
+  const trimmedUser = (pmaConfig.value.username || '').trim();
+  pmaConfig.value.url = trimmedUrl;
+  pmaConfig.value.database = trimmedDb;
+  pmaConfig.value.username = trimmedUser;
+
   fetchingTables.value = true;
   addLog({
     type: 'info',
-    message: `Menarik daftar tabel dari database PMA remote (${pmaConfig.value.database})...`,
+    message: `Menarik daftar tabel dari database PMA remote (${trimmedDb})...`,
     timestamp: new Date().toLocaleTimeString(),
   });
 
@@ -448,10 +455,10 @@ const fetchTablesFromPma = async () => {
       try {
         tables = await safeInvoke('get_pma_tables', {
           pmaConfig: {
-            url: pmaConfig.value.url,
-            username: pmaConfig.value.username,
+            url: trimmedUrl,
+            username: trimmedUser,
             password: pmaConfig.value.password,
-            database: pmaConfig.value.database,
+            database: trimmedDb,
             tables: [],
           },
         });
@@ -617,7 +624,7 @@ const fetchTablesFromPma = async () => {
     } else {
       addLog({
         type: 'error',
-        message: `Tidak ada tabel yang ditemukan di database '${pmaConfig.value.database}'. Pastikan nama database benar, credentials memiliki akses, dan coba lakukan "Tes Koneksi PMA" terlebih dahulu sebelum fetch tabel.`,
+        message: `Tidak ada tabel yang ditemukan di database '${pmaConfig.value.database}'. Tips: 1) Pastikan penulisan nama database benar (Linux MySQL bersifat case-sensitive). 2) Pastikan user PMA memiliki hak akses SELECT. 3) Jalankan tombol 'Tes Koneksi PMA' terlebih dahulu.`,
         timestamp: new Date().toLocaleTimeString(),
       });
     }
@@ -636,22 +643,60 @@ const fetchTablesFromPma = async () => {
 
 // Test PMA Remote connection
 const testPmaConnection = async () => {
+  const trimmedUrl = (pmaConfig.value.url || '').trim().replace(/\/index\.php.*$/, '').replace(/\/$/, '');
+  const trimmedDb = (pmaConfig.value.database || '').trim();
+  const trimmedUser = (pmaConfig.value.username || '').trim();
+  pmaConfig.value.url = trimmedUrl;
+  pmaConfig.value.database = trimmedDb;
+  pmaConfig.value.username = trimmedUser;
+
   testingPma.value = true;
   addLog({
     type: 'info',
-    message: `Menguji koneksi HTTP ke PMA remote: ${pmaConfig.value.url}...`,
+    message: `Menguji koneksi HTTP ke PMA remote: ${trimmedUrl}...`,
     timestamp: new Date().toLocaleTimeString(),
   });
 
   try {
-    const client = new PmaClient(pmaConfig.value);
-    const res = await client.authenticate();
-    pmaStatus.value.connected = true;
-    addLog({
-      type: 'success',
-      message: `PMA Remote OK: ${res.message}`,
-      timestamp: new Date().toLocaleTimeString(),
-    });
+    if (isTauri.value) {
+      let pmaLogUnlisten = null;
+      try {
+        pmaLogUnlisten = await safeListen('pma-log', (event) => {
+          const { type: t, message } = event.payload || {};
+          const logType = t === 'warn' ? 'warning' : (t || 'info');
+          addLog({ type: logType, message: `[PMA] ${message}`, timestamp: new Date().toLocaleTimeString() });
+        });
+      } catch (_) {}
+
+      try {
+        const msg = await safeInvoke('test_pma_connection', {
+          pmaConfig: {
+            url: trimmedUrl,
+            username: trimmedUser,
+            password: pmaConfig.value.password,
+            database: trimmedDb,
+            tables: [],
+          },
+        });
+        pmaStatus.value.connected = true;
+        addLog({
+          type: 'success',
+          message: `PMA Remote OK: ${msg}`,
+          timestamp: new Date().toLocaleTimeString(),
+        });
+      } finally {
+        if (pmaLogUnlisten) pmaLogUnlisten();
+      }
+    } else {
+      const client = new PmaClient(pmaConfig.value);
+      const res = await client.authenticate();
+      pmaStatus.value.connected = true;
+      addLog({
+        type: 'success',
+        message: `PMA Remote OK: ${res.message}`,
+        timestamp: new Date().toLocaleTimeString(),
+      });
+    }
   } catch (err) {
     pmaStatus.value.connected = false;
     addLog({
