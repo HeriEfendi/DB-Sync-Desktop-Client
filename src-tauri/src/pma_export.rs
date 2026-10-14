@@ -2051,6 +2051,7 @@ async fn download_export_payload(
     cached_endpoint: &std::sync::Arc<tokio::sync::Mutex<Option<(String, String)>>>,
     app: &tauri::AppHandle,
     chunk_label: Option<&str>,
+    format_what: Option<&str>,
 ) -> Result<Option<DownloadedTableData>, String> {
     let table_start = std::time::Instant::now();
     let (cached_url, cached_comp) = {
@@ -2085,52 +2086,84 @@ async fn download_export_payload(
     let mut last_network_err = String::new();
     let max_retries_per_candidate = 3;
 
+    let export_format = format_what.unwrap_or("sql");
+    let is_csv = export_format == "csv";
+
     'candidate_loop: for (export_url, compression_mode) in candidates {
         let is_gz = compression_mode == "gzip";
 
         let is_structure_only = struct_or_data == "structure";
         let sql_data_val = if is_structure_only { "0" } else { "1" };
 
-        let mut form: Vec<(String, String)> = vec![
-            ("db".to_string(), pma_config.database.clone()),
-            ("table".to_string(), table_name.to_string()),
-            ("table_select[]".to_string(), table_name.to_string()),
-            ("table_structure[]".to_string(), table_name.to_string()),
-            ("single_table".to_string(), "true".to_string()),
-            ("what".to_string(), "sql".to_string()),
-            ("export_type".to_string(), "table".to_string()),
-            ("export_method".to_string(), "custom".to_string()),
-            ("quick_or_custom".to_string(), "custom".to_string()),
-            ("output_format".to_string(), "sendit".to_string()),
-            ("compression".to_string(), compression_mode.clone()),
-            ("asfile".to_string(), "sendit".to_string()),
-            (
-                "sql_structure_or_data".to_string(),
-                struct_or_data.to_string(),
-            ),
-            ("sql_structure".to_string(), sql_structure.to_string()),
-            ("sql_data".to_string(), sql_data_val.to_string()),
-            ("sql_create_table".to_string(), sql_create.to_string()),
-            ("sql_drop_table".to_string(), "false".to_string()),
-            ("sql_if_not_exists".to_string(), "true".to_string()),
-            ("sql_auto_increment".to_string(), "1".to_string()),
-            ("sql_backquotes".to_string(), "1".to_string()),
-            ("sql_type".to_string(), sql_type_val.to_string()),
-            ("sql_extended_inserts".to_string(), "true".to_string()),
-            ("sql_max_query_size".to_string(), "4194304".to_string()),
-            ("sql_disable_fk".to_string(), "true".to_string()),
-            ("sql_use_transaction".to_string(), "true".to_string()),
-        ];
+        let mut form: Vec<(String, String)> = if is_csv {
+            let mut f = vec![
+                ("db".to_string(), pma_config.database.clone()),
+                ("table".to_string(), table_name.to_string()),
+                ("table_select[]".to_string(), table_name.to_string()),
+                ("single_table".to_string(), "true".to_string()),
+                ("what".to_string(), "csv".to_string()),
+                ("export_type".to_string(), "table".to_string()),
+                ("export_method".to_string(), "custom".to_string()),
+                ("quick_or_custom".to_string(), "custom".to_string()),
+                ("output_format".to_string(), "sendit".to_string()),
+                ("compression".to_string(), compression_mode.clone()),
+                ("asfile".to_string(), "sendit".to_string()),
+                ("csv_separator".to_string(), ",".to_string()),
+                ("csv_enclosed".to_string(), "\"".to_string()),
+                ("csv_escaped".to_string(), "\\".to_string()),
+                ("csv_terminated".to_string(), "\n".to_string()),
+                ("csv_null".to_string(), "NULL".to_string()),
+                ("csv_columns".to_string(), "true".to_string()),
+            ];
+            if let Some(ref limited_query) = custom_query_opt {
+                f.push(("sql_query".to_string(), limited_query.clone()));
+                f.push(("query_type".to_string(), "table".to_string()));
+                f.push(("sql_query_input".to_string(), "true".to_string()));
+            }
+            f
+        } else {
+            let mut f = vec![
+                ("db".to_string(), pma_config.database.clone()),
+                ("table".to_string(), table_name.to_string()),
+                ("table_select[]".to_string(), table_name.to_string()),
+                ("table_structure[]".to_string(), table_name.to_string()),
+                ("single_table".to_string(), "true".to_string()),
+                ("what".to_string(), "sql".to_string()),
+                ("export_type".to_string(), "table".to_string()),
+                ("export_method".to_string(), "custom".to_string()),
+                ("quick_or_custom".to_string(), "custom".to_string()),
+                ("output_format".to_string(), "sendit".to_string()),
+                ("compression".to_string(), compression_mode.clone()),
+                ("asfile".to_string(), "sendit".to_string()),
+                (
+                    "sql_structure_or_data".to_string(),
+                    struct_or_data.to_string(),
+                ),
+                ("sql_structure".to_string(), sql_structure.to_string()),
+                ("sql_data".to_string(), sql_data_val.to_string()),
+                ("sql_create_table".to_string(), sql_create.to_string()),
+                ("sql_drop_table".to_string(), "false".to_string()),
+                ("sql_if_not_exists".to_string(), "true".to_string()),
+                ("sql_auto_increment".to_string(), "1".to_string()),
+                ("sql_backquotes".to_string(), "1".to_string()),
+                ("sql_type".to_string(), sql_type_val.to_string()),
+                ("sql_extended_inserts".to_string(), "true".to_string()),
+                ("sql_max_query_size".to_string(), "4194304".to_string()),
+                ("sql_disable_fk".to_string(), "true".to_string()),
+                ("sql_use_transaction".to_string(), "true".to_string()),
+            ];
 
-        if !is_structure_only {
-            form.push(("table_data[]".to_string(), table_name.to_string()));
-        }
+            if !is_structure_only {
+                f.push(("table_data[]".to_string(), table_name.to_string()));
+            }
 
-        if let Some(ref limited_query) = custom_query_opt {
-            form.push(("sql_query".to_string(), limited_query.clone()));
-            form.push(("query_type".to_string(), "table".to_string()));
-            form.push(("sql_query_input".to_string(), "true".to_string()));
-        }
+            if let Some(ref limited_query) = custom_query_opt {
+                f.push(("sql_query".to_string(), limited_query.clone()));
+                f.push(("query_type".to_string(), "table".to_string()));
+                f.push(("sql_query_input".to_string(), "true".to_string()));
+            }
+            f
+        };
 
         if !csrf_token.is_empty() {
             form.push(("token".to_string(), csrf_token.to_string()));
@@ -2437,11 +2470,12 @@ async fn fetch_table_export_stream(
     let effective_row_limit = pma_config.row_limit.filter(|limit| *limit > 0);
 
     let is_forced_chunk = forced_chunk_size.is_some();
+    let chunk_threshold = 100_000usize;
     let should_chunk_initially = !is_structure_only
         && !has_incremental_watermark
         && (is_forced_chunk
-            || est_rows >= 100_000
-            || effective_row_limit.map(|l| l >= 100_000).unwrap_or(false));
+            || est_rows >= chunk_threshold
+            || effective_row_limit.map(|l| l >= chunk_threshold).unwrap_or(false));
 
     // Jika tidak perlu chunking di awal, coba unduh langsung (direct export)
     if !should_chunk_initially {
@@ -2544,6 +2578,7 @@ async fn fetch_table_export_stream(
             cached_endpoint,
             app,
             None,
+            Some("sql"),
         ).await;
 
         match direct_res {
@@ -2658,6 +2693,49 @@ async fn fetch_table_export_stream(
         return Err(format!("Gagal menulis inisialisasi prelude ke MySQL lokal: {}", e));
     }
 
+    // Ambil skema DDL struktur tabel terlebih dahulu sekali di awal (jika bukan incremental)
+    // agar tabel dan seluruh definisi kolomnya siap menerima data CSV
+    if !is_incremental {
+        emit_log(
+            app,
+            "info",
+            format!("[Tabel '{}'] Menyiapkan skema DDL struktur tabel di MySQL lokal...", table_name),
+        );
+        let struct_res = download_export_payload(
+            client,
+            base_url,
+            csrf_token,
+            pma_config,
+            table_name,
+            "structure",
+            "1",
+            "true",
+            "INSERT",
+            None,
+            cached_endpoint,
+            app,
+            Some("skema DDL"),
+            Some("sql"),
+        ).await;
+
+        if let Ok(Some(struct_data)) = struct_res {
+            let raw_struct_sql = if struct_data.is_gzip {
+                decompress_gzip_bytes(&struct_data.response_bytes).unwrap_or(struct_data.response_bytes)
+            } else {
+                struct_data.response_bytes
+            };
+            if !raw_struct_sql.is_empty() {
+                if let Err(e) = child_stdin.write_all(&raw_struct_sql).await {
+                    let _ = child.start_kill();
+                    stderr_task.abort();
+                    return Err(format!("Gagal menulis skema DDL struktur ke MySQL lokal: {}", e));
+                }
+                let _ = child_stdin.write_all(b"\nCOMMIT;\n").await;
+                let _ = child_stdin.flush().await;
+            }
+        }
+    }
+
     let mut chunk_idx = 0usize;
     let mut current_offset = 0usize;
     let mut last_seen_pk: Option<String> = None;
@@ -2677,9 +2755,9 @@ async fn fetch_table_export_stream(
             return Err("__WORKER_ABORTED__".to_string());
         }
 
-        let chunk_struct = if chunk_idx == 0 && !is_incremental { "structure_and_data" } else { "data" };
-        let chunk_sql_struct = if chunk_idx == 0 && !is_incremental { "1" } else { "0" };
-        let chunk_sql_create = if chunk_idx == 0 && !is_incremental { "true" } else { "false" };
+        let chunk_struct = "data";
+        let chunk_sql_struct = "0";
+        let chunk_sql_create = "false";
 
         let chunk_label = if total_chunks > 0 {
             let display_total = total_chunks.max(chunk_idx + 1);
@@ -2696,10 +2774,6 @@ async fn fetch_table_export_stream(
             sql_type_val
         };
 
-        // Percobaan per-chunk:
-        // Percobaan 1: 100k -> jika timeout langsung ke 50k
-        // Percobaan 2: 50k  -> jika timeout langsung ke 25k (chunk terkecil)
-        // Percobaan 3..5: 25k (mencoba ulang hingga 3 kali pada ukuran minimal)
         let mut chunk_attempt = 0usize;
         let mut chunk_res = None;
         let max_chunk_attempts = 5usize;
@@ -2742,7 +2816,8 @@ async fn fetch_table_export_stream(
             .collect::<Vec<_>>()
             .join(" ");
 
-            match download_export_payload(
+            // Coba ambil data chunk dalam format CSV (GZIP) terlebih dahulu untuk menghemat CPU & RAM server remote
+            let mut attempt_res = download_export_payload(
                 client,
                 base_url,
                 csrf_token,
@@ -2752,11 +2827,41 @@ async fn fetch_table_export_stream(
                 chunk_sql_struct,
                 chunk_sql_create,
                 chunk_sql_type,
-                Some(chunk_query),
+                Some(chunk_query.clone()),
                 cached_endpoint,
                 app,
                 Some(&chunk_label),
-            ).await {
+                Some("csv"),
+            ).await;
+
+            // Fallback otomatis ke format SQL jika PMA remote tidak mengaktifkan modul/fitur CSV
+            if let Err(ref e) = attempt_res {
+                if !e.contains("TIMEOUT") && !is_user_cancelled() && !is_aborted() {
+                    emit_log(
+                        app,
+                        "warn",
+                        format!("[Tabel '{}'] Mode CSV tidak didukung oleh PMA ({}), mencoba fallback format SQL...", table_name, e),
+                    );
+                    attempt_res = download_export_payload(
+                        client,
+                        base_url,
+                        csrf_token,
+                        pma_config,
+                        table_name,
+                        chunk_struct,
+                        chunk_sql_struct,
+                        chunk_sql_create,
+                        chunk_sql_type,
+                        Some(chunk_query),
+                        cached_endpoint,
+                        app,
+                        Some(&chunk_label),
+                        Some("sql"),
+                    ).await;
+                }
+            }
+
+            match attempt_res {
                 Ok(res) => {
                     chunk_res = res;
                     break;
@@ -2798,24 +2903,62 @@ async fn fetch_table_export_stream(
         }
 
         if let Some(chunk_data) = chunk_res {
-            let raw_chunk_sql = if chunk_data.is_gzip {
+            let decompressed = if chunk_data.is_gzip {
                 decompress_gzip_bytes(&chunk_data.response_bytes)
                     .unwrap_or(chunk_data.response_bytes)
             } else {
                 chunk_data.response_bytes
             };
 
-            let chunk_len = raw_chunk_sql.len();
-            let row_count_in_chunk = count_imported_sql_rows(&raw_chunk_sql);
-            let has_insert = raw_chunk_sql.windows(11).any(|w| w == b"INSERT INTO")
-                || raw_chunk_sql.windows(12).any(|w| w == b"REPLACE INTO");
-
-            // Update last_seen_pk dari chunk yang baru selesai untuk Keyset Pagination chunk berikutnya
-            if let Some(pk_col) = pk_col_opt {
-                if let Some(new_pk) = extract_last_pk_value(&raw_chunk_sql, pk_col) {
-                    last_seen_pk = Some(new_pk);
-                }
+            let chunk_len = decompressed.len();
+            if chunk_len == 0 {
+                break;
             }
+
+            let is_csv_data = !decompressed.starts_with(b"--")
+                && !decompressed.starts_with(b"/*")
+                && !decompressed.starts_with(b"INSERT")
+                && !decompressed.starts_with(b"REPLACE")
+                && !decompressed.starts_with(b"DROP")
+                && !decompressed.starts_with(b"CREATE");
+
+            let (raw_chunk_sql, row_count_in_chunk, has_insert) = if is_csv_data {
+                match convert_csv_to_sql_batch(&decompressed, table_name, pk_col_opt, chunk_sql_type) {
+                    Ok((sql_bytes, rows, new_pk)) => {
+                        if let Some(pk_val) = new_pk {
+                            last_seen_pk = Some(pk_val);
+                        }
+                        let has_rows = rows > 0;
+                        (sql_bytes, rows, has_rows)
+                    }
+                    Err(conv_err) => {
+                        emit_log(
+                            app,
+                            "warn",
+                            format!("[Tabel '{}'] Parse CSV catatan: {}. Menjalankan fallback SQL scanner...", table_name, conv_err),
+                        );
+                        let rows = count_imported_sql_rows(&decompressed);
+                        let has_rows = rows > 0;
+                        if let Some(pk_col) = pk_col_opt {
+                            if let Some(new_pk) = extract_last_pk_value(&decompressed, pk_col) {
+                                last_seen_pk = Some(new_pk);
+                            }
+                        }
+                        (decompressed, rows, has_rows)
+                    }
+                }
+            } else {
+                let rows = count_imported_sql_rows(&decompressed);
+                let has_rows = rows > 0
+                    || decompressed.windows(11).any(|w| w == b"INSERT INTO")
+                    || decompressed.windows(12).any(|w| w == b"REPLACE INTO");
+                if let Some(pk_col) = pk_col_opt {
+                    if let Some(new_pk) = extract_last_pk_value(&decompressed, pk_col) {
+                        last_seen_pk = Some(new_pk);
+                    }
+                }
+                (decompressed, rows, has_rows)
+            };
 
             // Cek apakah child process MySQL masih hidup sebelum menulis
             if let Ok(Some(status)) = child.try_wait() {
@@ -2884,8 +3027,8 @@ async fn fetch_table_export_stream(
                 break;
             }
 
-            // Jeda throttling singkat antar chunk agar memory & I/O remote server PMA tidak overload
-            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+            // Jeda throttling micro-pause antar chunk (250ms) agar CPU remote server PMA sempat bernapas
+            tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
         } else {
             let _ = child.start_kill();
             stderr_task.abort();
@@ -3049,6 +3192,7 @@ fn spawn_mysql_child(
             .arg(container_name)
             .arg(&docker_cli)
             .arg("--skip-ssl")
+            .arg("--local-infile=1")
             .arg("--binary-mode")
             .arg("--quick")
             .arg("--max-allowed-packet=1024M")
@@ -3067,6 +3211,7 @@ fn spawn_mysql_child(
     } else {
         let mut c = crate::process_utils::new_tokio_command(cli_bin);
         c.arg("--skip-ssl")
+            .arg("--local-infile=1")
             .arg("--binary-mode")
             .arg("--quick")
             .arg("--max-allowed-packet=1024M")
@@ -3126,6 +3271,124 @@ fn spawn_mysql_child(
     Ok((child, child_stdin, child_stderr))
 }
 
+/// Helper untuk meng-escape karakter spesial SQL MySQL standar secara aman
+fn escape_mysql_string(val: &str) -> String {
+    let mut escaped = String::with_capacity(val.len() + 16);
+    for c in val.chars() {
+        match c {
+            '\'' => escaped.push_str("\\'"),
+            '\"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\0' => escaped.push_str("\\0"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            '\x1a' => escaped.push_str("\\Z"),
+            other => escaped.push(other),
+        }
+    }
+    escaped
+}
+
+/// Mengonversi chunk data CSV dari phpMyAdmin ke dalam format batch SQL (INSERT/REPLACE INTO)
+/// secara instan di CPU lokal client, membebaskan server remote PMA dari beban formatting SQL.
+fn convert_csv_to_sql_batch(
+    csv_bytes: &[u8],
+    table_name: &str,
+    pk_col_opt: Option<&str>,
+    sql_verb: &str, // "REPLACE" atau "INSERT"
+) -> Result<(Vec<u8>, usize, Option<String>), String> {
+    if csv_bytes.is_empty() {
+        return Ok((Vec::new(), 0, None));
+    }
+
+    let mut rdr = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .flexible(true)
+        .trim(csv::Trim::None)
+        .from_reader(csv_bytes);
+
+    let headers = match rdr.headers() {
+        Ok(h) => h.clone(),
+        Err(e) => return Err(format!("Gagal membaca header CSV: {}", e)),
+    };
+
+    if headers.is_empty() {
+        return Ok((Vec::new(), 0, None));
+    }
+
+    let pk_index = pk_col_opt.and_then(|pk| {
+        let clean_pk = pk.trim().trim_matches('`').to_lowercase();
+        headers.iter().position(|h| h.trim().trim_matches('`').to_lowercase() == clean_pk)
+    });
+
+    let safe_table = table_name.replace('`', "``");
+    let columns_str = headers
+        .iter()
+        .map(|h| format!("`{}`", h.trim().trim_matches('"').replace('`', "``")))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let mut output_sql = Vec::new();
+    let mut total_rows = 0usize;
+    let mut last_pk_val = None;
+
+    let mut batch_rows: Vec<String> = Vec::with_capacity(1000);
+
+    for result in rdr.records() {
+        let record = match result {
+            Ok(rec) => rec,
+            Err(_) => continue,
+        };
+
+        if let Some(pk_idx) = pk_index {
+            if let Some(val) = record.get(pk_idx) {
+                let trimmed = val.trim();
+                if !trimmed.is_empty() && trimmed != "NULL" {
+                    last_pk_val = Some(trimmed.to_string());
+                }
+            }
+        }
+
+        let mut row_values = Vec::with_capacity(record.len());
+        for field in record.iter() {
+            if field == "NULL" {
+                row_values.push("NULL".to_string());
+            } else {
+                let escaped = escape_mysql_string(field);
+                row_values.push(format!("'{}'", escaped));
+            }
+        }
+
+        batch_rows.push(format!("({})", row_values.join(", ")));
+        total_rows += 1;
+
+        if batch_rows.len() >= 1000 {
+            let stmt = format!(
+                "{} INTO `{}` ({}) VALUES\n{};\n",
+                sql_verb,
+                safe_table,
+                columns_str,
+                batch_rows.join(",\n")
+            );
+            output_sql.extend_from_slice(stmt.as_bytes());
+            batch_rows.clear();
+        }
+    }
+
+    if !batch_rows.is_empty() {
+        let stmt = format!(
+            "{} INTO `{}` ({}) VALUES\n{};\n",
+            sql_verb,
+            safe_table,
+            columns_str,
+            batch_rows.join(",\n")
+        );
+        output_sql.extend_from_slice(stmt.as_bytes());
+    }
+
+    Ok((output_sql, total_rows, last_pk_val))
+}
 
 /// Mengekstrak nilai Primary Key terbesar/terakhir dari chunk SQL dump phpMyAdmin
 /// untuk mendukung Keyset Pagination (Seek Method) O(1) yang super cepat.
@@ -4009,14 +4272,14 @@ pub async fn export_pma_database(
     let total_tables = tables.len();
     let (concurrency, cpu_cores) = calculate_optimal_workers(total_tables);
     let buffer_capacity = 8.min(total_tables).max(2);
-    // Remote PMA download concurrency dibatasi maksimal 2 worker agar session file remote tidak terkunci dan CPU remote hosting tidak di-throttle
-    let download_concurrency = (cpu_cores / 4).clamp(1, 2).min(total_tables);
+    // Remote PMA download concurrency diatur ke 2 worker untuk pengujian paralel
+    let download_concurrency = 2.min(total_tables).max(1);
 
     emit_log(
         &app,
         "info",
         format!(
-            "🚀 Memulai sinkronisasi pipeline {} tabel (terdeteksi {} CPU cores, {} download workers, {} import workers, buffer antrean: {} tabel)...",
+            "🚀 Memulai sinkronisasi pipeline {} tabel (terdeteksi {} CPU cores, {} remote download workers, {} local import workers, buffer antrean: {} tabel)...",
             total_tables, cpu_cores, download_concurrency, concurrency, buffer_capacity
         ),
     );
@@ -4134,8 +4397,9 @@ pub async fn export_pma_database(
                         }
                     }
 
-                    // Jeda throttling antar tabel (300ms) agar server remote hosting tidak kehabisan CPU / terkena CloudLinux LVE throttle
-                    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+                    // Jeda throttling antar tabel agar server remote hosting tidak kehabisan CPU / terkena CloudLinux LVE throttle
+                    let throttle_dur = pma_config_p.throttle_ms.unwrap_or(300);
+                    tokio::time::sleep(tokio::time::Duration::from_millis(throttle_dur)).await;
                 }
             }
             Ok::<(), String>(())
