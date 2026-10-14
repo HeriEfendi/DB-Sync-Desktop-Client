@@ -1,23 +1,34 @@
 # 🗄️ DB-Sync Desktop Client
 
-![Version](https://img.shields.io/badge/version-0.22.1-emerald)
+![Version](https://img.shields.io/badge/version-0.24.3-emerald)
 ![Tauri](https://img.shields.io/badge/Tauri-v2-blue?logo=tauri)
 ![Vue](https://img.shields.io/badge/Vue.js-3.5-brightgreen?logo=vuedotjs)
 ![Rust](https://img.shields.io/badge/Rust-2021-orange?logo=rust)
 ![License](https://img.shields.io/badge/license-Proprietary-red)
 
-**DB-Sync Desktop Client** adalah aplikasi desktop **Tauri v2 (Rust)** + **Vue 3** berkinerja tinggi untuk menyalin data dari **PhpMyAdmin (PMA) Remote** ke **MySQL/MariaDB lokal**. Remote PMA diperlakukan sebagai sumber data **read-only**: aplikasi login lalu mengekspor data SQL/GZIP terkompresi; seluruh operasi penulisan, `DROP`, `DELETE`, dan penyesuaian skema hanya dieksekusi di database lokal.
+**DB-Sync Desktop Client** adalah aplikasi desktop **Tauri v2 (Rust)** + **Vue 3** berkinerja tinggi untuk menyalin data dari **PhpMyAdmin (PMA) Remote** ke **MySQL/MariaDB lokal**. Remote PMA diperlakukan sebagai sumber data **read-only**: aplikasi login lalu mengekspor data terkompresi; seluruh operasi penulisan, `DROP`, `DELETE`, dan penyesuaian skema hanya dieksekusi di database lokal.
 
-Aplikasi dirancang untuk menangani database skala kecil hingga besar (~5+ GB) dengan strategi _Zero-Memory-Bloat Direct GZIP Stream_ tanpa membebani memori sistem ataupun menyebabkan server timeout.
+Aplikasi dirancang untuk menangani database skala kecil hingga besar (~5+ GB) dengan strategi _Zero-Memory-Bloat Direct CSV/GZIP Stream Pipeline_ tanpa membebani memori sistem ataupun menyebabkan server hosting remote overload / timeout.
 
 ---
 
 ## ✨ Fitur Utama
 
 - 🔒 **Remote PMA 100% Read-Only**: Tidak ada query modifikasi data (`INSERT`, `UPDATE`, `DELETE`, `DROP`, `ALTER`, `TRUNCATE`) yang dikirim ke server remote. PMA remote hanya menerima autentikasi login dan query `SELECT` untuk proses export.
-- 🚀 **Direct GZIP Stream (Zero-Memory-Bloat)**: Mengalirkan data chunked stream langsung dari endpoint native `export.php` PMA remote, didekompresi secara real-time di Rust (`flate2`), dan langsung di-pipe ke STDIN `mysql` lokal tanpa menyimpan file dump raksasa di disk.
-- 🐳 **Dukungan Native Docker Container**: MySQL lokal berjalan di dalam kontainer Docker? DB-Sync mendukung eksekusi direct stream via `docker exec -i <container> mysql` tanpa mewajibkan Anda menginstall CLI `mysql`/`mariadb` di OS host.
-- ⚡ **Bounded Pre-fetching Pipeline (Producer-Consumer)**: Download export tabel dari remote dijalankan secara pre-fetch paralel sesuai jumlah core CPU, sementara proses dekompresi dan import ke MySQL lokal dijalankan berurutan dengan throttling terkontrol agar CPU server remote tidak overload.
+- ⚡ **Native CSV + GZIP Stream (Ultra-Ringan di Server)**:
+  - Mengambil data dalam format **CSV terkompresi GZIP** (`what=csv`, `compression=gzip`) dari endpoint native `export.php` PMA.
+  - Membebaskan PHP server remote dari beban formatting string SQL yang memeras CPU hingga 100%. Beban CPU PHP-FPM di server remote turun drastis (hanya ~20%–35%) dan penggunaan RAM server tetap dingin (< 20 MB).
+- 🦀 **Local Rust Batch Engine & Fail-Safe Fallback**:
+  - Rust client mendekompresi GZIP on-the-fly (`flate2`) dan mem-parse baris CSV secara instan di CPU lokal pengguna (`csv` crate).
+  - Mengalirkan batch SQL `REPLACE INTO / INSERT INTO` yang aman langsung ke STDIN child process `mysql` lokal dengan transaksi InnoDB (`COMMIT`).
+  - Dilengkapi **Auto-Fallback**: Jika modul CSV tidak aktif di server remote tertentu, sistem otomatis beralih ke mode SQL stream standar.
+- 🐳 **Dukungan Native Docker Container**: MySQL lokal berjalan di dalam kontainer Docker? DB-Sync mendukung eksekusi direct stream via `docker exec -i <container> mysql` dengan dukungan `--local-infile=1` tanpa mewajibkan Anda menginstall CLI `mysql`/`mariadb` di OS host.
+- 🎯 **Keyset Pagination (Seek Method) Berbasis Index O(1)**:
+  - Chunking tabel skala besar tidak menggunakan `OFFSET` besar yang membebani I/O disk server.
+  - Nilai Primary Key terakhir diambil langsung dari baris CSV, dan chunk berikutnya mengambil data secara instan via B-Tree index: `WHERE pk > last_id ORDER BY pk ASC LIMIT 100000`.
+- ⏱️ **Adaptive Throttling & Micro-Pause**:
+  - Jeda napas mikro (250ms) antar-chunk dan jeda inter-tabel (300ms–500ms) memberikan waktu bagi CPU server remote untuk kembali idle, menjaga *Load Average* server tetap rendah dan mencegah throttle CloudLinux LVE / alert admin server.
+- 🏗️ **Skema DDL Pre-fetch**: Struktur tabel (`CREATE TABLE IF NOT EXISTS`) diambil sekali secara terpisah di awal, menjamin definisi kolom dan tipe data di MySQL lokal 100% presisi sebelum data dialirkan.
 - 🔄 **Dua Mode Sinkronisasi**:
   - **Sync Server (New & Update)**: Menggunakan watermark `Last ID` dan `Last Sync Time`. Data lokal dengan `id > Last ID` dihapus, lalu mengimpor data baru (`id > Last ID`) dan data yang berubah (`updated_at > Last Sync Time`).
   - **Fresh Sync**: Menjalankan `DROP TABLE IF EXISTS` **hanya di MySQL lokal**, lalu mengimpor ulang struktur skema (`CREATE TABLE`) dan seluruh data dari remote.
@@ -44,24 +55,28 @@ Aplikasi dirancang untuk menangani database skala kecil hingga besar (~5+ GB) de
 ```
                      +---------------------------------------+
                      |         PhpMyAdmin Remote             |
-                     |  (Web / Apache / Nginx / PHP Engine)  |
+                     |  (Web / Apache / Nginx / PHP-FPM)     |
                      +-------------------+-------------------+
                                          |
-                                         | POST export.php (GZIP Stream)
+                                         | POST export.php (CSV + GZIP Stream)
+                                         | [Sangat ringan: No SQL formatting in PHP]
                                          v
                      +---------------------------------------+
-                     |     Rust Exporter (Bounded Queue)     |
-                     |  Reqwest (Cookie + CSRF) -> Decoder   |
+                     |         Rust Engine (Client)          |
+                     |  1. flate2 (GzDecoder Stream)         |
+                     |  2. csv parser -> Instant SQL Batch   |
+                     |  3. Keyset Pagination (Seek O(1))     |
                      +-------------------+-------------------+
                                          |
-                       Direct STDIN Pipe | (Tanpa simpan file dump ke disk)
+                        Direct STDIN Pipe | (Zero-Memory-Bloat, Tanpa temp file)
                                          |
-               +-------------------------+-------------------------+
-               | (Mode Standar Host)                               | (Mode Docker Container)
-               v                                                   v
+                +-------------------------+-------------------------+
+                | (Mode Standar Host)                               | (Mode Docker Container)
+                v                                                   v
 +-----------------------------+                     +-----------------------------+
 |    Local MySQL / MariaDB    |                     |   Docker Container Engine   |
 |      (Host CLI Client)      |                     | `docker exec -i <c> mysql`  |
+|      `--local-infile=1`     |                     |     `--local-infile=1`      |
 +-----------------------------+                     +-----------------------------+
                |                                                   |
                +-------------------------+-------------------------+
@@ -77,12 +92,13 @@ Aplikasi dirancang untuk menangani database skala kecil hingga besar (~5+ GB) de
 1. **Verifikasi Database Lokal**: Backend Rust memastikan database lokal tujuan sudah ada (`CREATE DATABASE IF NOT EXISTS`) melalui MySQL CLI host atau Docker container.
 2. **Autentikasi & Handshake**: Mengambil sesi cookie dan CSRF token dari login PMA remote.
 3. **Auto-Discovery Skema**: Mengambil daftar Primary Key dan tabel dengan kolom `updated_at` langsung dari `INFORMATION_SCHEMA`.
-4. **Producer (Pre-fetch)**: Mengunduh export SQL GZIP terkompresi per tabel secara paralel melalui antrean berbatas (_bounded queue_) dengan jeda throttling aman (300ms–500ms).
-5. **Consumer (Decompress & Pipe)**:
+4. **Prefetch Struktur (DDL)**: Mengambil definisi skema tabel (`CREATE TABLE`) sekali di awal untuk menyiapkan struktur lokal.
+5. **Producer (Pre-fetch)**: Mengunduh data per tabel dalam potongan CSV + GZIP terkompresi melalui antrean terkelola (*bounded queue*) dengan 2 download worker paralel dan jeda micro-pause (250ms).
+6. **Consumer (Decompress, Convert & Pipe)**:
    - Jika tabel 0 baris dan tidak butuh rebuild skema: **Fast-Skip**.
-   - Jika tabel berisi data: Membuka STDIN child process `mysql` (atau `docker exec -i`) dan menyalurkan chunk data dekompresi secara real-time.
+   - Jika tabel berisi data: Rust mendekompresi GZIP dan mem-parse CSV menjadi batch SQL `REPLACE/INSERT INTO` secara lokal, lalu menyalurkan langsung ke STDIN child process `mysql` lokal secara real-time.
    - Jika terjadi error skema (kolom tidak cocok): Menjalankan _Auto-Fallback ke Fresh Sync_.
-6. **Commit Watermark**: Membaca `MAX(primary_key)` lokal baru dan memperbarui timestamp di riwayat lokal.
+7. **Commit Watermark**: Membaca `MAX(primary_key)` lokal baru dan memperbarui timestamp di riwayat lokal.
 
 ---
 
@@ -96,9 +112,10 @@ Aplikasi dirancang untuk menangani database skala kecil hingga besar (~5+ GB) de
 | **Iconography**      | **Lucide Vue Next**                           | Icon set modern dan konsisten                                   |
 | **Desktop Core**     | **Tauri v2**                                  | Framework aplikasi desktop native lintas platform               |
 | **Backend Engine**   | **Rust (Edition 2021)**                       | Logika sinkronisasi native memori aman berkecepatan tinggi      |
+| **CSV Processing**   | **csv 1.4 / csv-core**                        | Parsing data CSV tabular streaming ultra-cepat di sisi client   |
 | **Database Client**  | **sqlx 0.8** (Tokio Async, Native TLS, MySQL) | Driver MySQL TCP async untuk inspeksi tabel & query lokal       |
 | **HTTP & Streaming** | **reqwest / flate2 / urlencoding**            | Client HTTP cookie-store, streaming dekompresi GZIP real-time   |
-| **IPC & Serde**      | **serde / serde_json / tauri-macros**         | Komunikasi data asinkron antara UI Vue dan backend Rust         |
+| **IPC & Serde**      | **serde / serde_json / tauri-macros**         | Komunikasi data asinkron antara UI Vue dan backend Rust         |omunikasi data asinkron antara UI Vue dan backend Rust         |
 
 ---
 
