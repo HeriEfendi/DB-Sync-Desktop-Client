@@ -1626,6 +1626,23 @@ pub async fn get_pma_tables(
     fetch_pma_tables(&pma_config, &app).await
 }
 
+fn strip_html_tags(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let mut inside_tag = false;
+    for c in input.chars() {
+        if c == '<' {
+            inside_tag = true;
+            result.push(' ');
+        } else if c == '>' {
+            inside_tag = false;
+            result.push(' ');
+        } else if !inside_tag {
+            result.push(c);
+        }
+    }
+    result
+}
+
 fn extract_tables_from_html(html: &str) -> Vec<String> {
     let mut tables = Vec::new();
 
@@ -1648,7 +1665,7 @@ fn extract_tables_from_html(html: &str) -> Vec<String> {
         if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
             return false;
         }
-        // Exclude known PMA UI / system values / export options / compatibility modes
+        // Exclude known PMA UI / system values / export options / compatibility modes / HTML tags / CSS classes
         let nl = n.to_lowercase();
         !matches!(
             nl.as_str(),
@@ -1732,6 +1749,27 @@ fn extract_tables_from_html(html: &str) -> Vec<String> {
                 | "empty"
                 | "drop"
                 | "operations"
+                | "not_null"
+                | "text_plain"
+                | "pre_wrap"
+                | "td"
+                | "tr"
+                | "th"
+                | "span"
+                | "div"
+                | "class"
+                | "text"
+                | "data"
+                | "nowrap"
+                | "grid_edit"
+                | "inline_edit"
+                | "hover_show_full"
+                | "syntax"
+                | "syntax_keyword"
+                | "information_schema"
+                | "performance_schema"
+                | "sys"
+                | "mysql"
         )
     };
 
@@ -1797,23 +1835,38 @@ fn extract_tables_from_html(html: &str) -> Vec<String> {
         }
     }
 
-    // Pattern 3: <td ... class="...data...">table_name</td> in SQL query results HTML
-    for line in html.lines() {
-        if line.contains("<td") && (line.contains("class=\"data") || line.contains("class='data") || line.contains("class=\"text")) {
-            if let Some(start) = line.find('>') {
-                let rest = &line[start + 1..];
-                if let Some(end) = rest.find("</td>") {
-                    let text = rest[..end].trim();
-                    // Strip inner HTML tags if any (e.g. <span>table_name</span>)
-                    let clean_text = text.replace(['<', '>'], " ");
-                    let words: Vec<&str> = clean_text.split_whitespace().collect();
-                    for w in words {
-                        if is_valid_table_name(w) && !tables.contains(&w.to_string()) {
-                            tables.push(w.to_string());
-                        }
+    // Pattern 3: <td ... class="...data...">...</td> in SQL query results HTML
+    let mut remaining = html;
+    while let Some(td_idx) = remaining.find("<td") {
+        let after_td = &remaining[td_idx + 3..];
+        if let Some(open_tag_end) = after_td.find('>') {
+            let td_attrs = &after_td[..open_tag_end];
+            let after_open_tag = &after_td[open_tag_end + 1..];
+            if let Some(close_td_idx) = after_open_tag.find("</td>") {
+                let inner_content = &after_open_tag[..close_td_idx];
+                remaining = &after_open_tag[close_td_idx + 5..];
+
+                // Only consider data cells (PMA marks data cells with class="data...")
+                if td_attrs.contains("class=\"data")
+                    || td_attrs.contains("class='data")
+                    || td_attrs.contains("class=\"text")
+                    || td_attrs.contains("class='text")
+                {
+                    let cleaned = strip_html_tags(inner_content);
+                    let candidate = cleaned.trim();
+                    // A table cell for TABLE_NAME contains exactly ONE valid table name
+                    if is_valid_table_name(candidate)
+                        && !candidate.contains(' ')
+                        && !tables.contains(&candidate.to_string())
+                    {
+                        tables.push(candidate.to_string());
                     }
                 }
+            } else {
+                remaining = after_open_tag;
             }
+        } else {
+            break;
         }
     }
 

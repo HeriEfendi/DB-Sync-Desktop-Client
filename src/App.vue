@@ -482,7 +482,10 @@ const fetchTablesFromPma = async () => {
       }
     }
 
+    const isPmaArtifact = (name) => ['td', 'text', 'not_null', 'text_plain', 'pre_wrap', 'data'].includes(String(name).toLowerCase());
+
     if (tables && tables.length > 0) {
+      tables = tables.filter((t) => !isPmaArtifact(t));
       availableTables.value = tables;
       pmaStatus.value.connected = true;
 
@@ -521,9 +524,8 @@ const fetchTablesFromPma = async () => {
             const prevServerTables = new Set(availableTables.value || []);
 
             // Drop: HANYA tabel yang sebelumnya memang pernah terdaftar di server PMA ini,
-            // dan ada di MySQL lokal, namun sekarang sudah tidak ada lagi di PMA server ini.
-            // Ini mencegah terhapusnya tabel lokal yang berasal dari server PMA lain!
-            const droppedTables = localTables.filter((t) => prevServerTables.has(t) && !pmaTableSet.has(t));
+            // atau tabel artefak HTML/CSS phpMyAdmin yang sempat terbuat.
+            const droppedTables = localTables.filter((t) => (prevServerTables.has(t) || isPmaArtifact(t)) && !pmaTableSet.has(t));
             const newTables = tables.filter((t) => !localTableSet.has(t));
 
             // 1. Drop tabel lokal yang sudah tidak ada di PMA
