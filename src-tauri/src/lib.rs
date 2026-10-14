@@ -1,8 +1,10 @@
 mod commands;
 mod pma_export;
+mod process_utils;
 
 pub use commands::*;
 pub use pma_export::*;
+pub use process_utils::*;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {

@@ -134,7 +134,7 @@ pub async fn test_local_connection(config: LocalDbConfig) -> Result<String, Stri
         };
 
         // 1. Coba perintah 'mysql --version' di dalam kontainer
-        let docker_check_mysql = std::process::Command::new("docker")
+        let docker_check_mysql = crate::process_utils::new_std_command("docker")
             .arg("exec")
             .arg(container)
             .arg("mysql")
@@ -158,7 +158,7 @@ pub async fn test_local_connection(config: LocalDbConfig) -> Result<String, Stri
             }
             Ok(out_mysql) => {
                 // 2. Jika 'mysql' gagal, coba 'mariadb --version' (image MariaDB baru seperti Ubuntu 24.04 menggunakan binary 'mariadb')
-                let docker_check_mariadb = std::process::Command::new("docker")
+                let docker_check_mariadb = crate::process_utils::new_std_command("docker")
                     .arg("exec")
                     .arg(container)
                     .arg("mariadb")

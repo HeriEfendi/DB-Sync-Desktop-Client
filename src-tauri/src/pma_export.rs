@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tauri::Emitter;
-use tokio::process::Command;
 
 pub static USER_CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
 pub static WORKER_ABORT_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -50,7 +49,7 @@ pub fn kill_all_child_processes() {
         }
         #[cfg(windows)]
         {
-            let _ = std::process::Command::new("taskkill").args(["/F", "/T", "/PID", &pid.to_string()]).output();
+            let _ = crate::process_utils::new_std_command("taskkill").args(["/F", "/T", "/PID", &pid.to_string()]).output();
         }
     }
 }
@@ -2877,10 +2876,10 @@ fn get_mysql_cli_binary() -> &'static str {
     static BINARY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     BINARY.get_or_init(|| {
         // 1. Coba perintah di PATH
-        if std::process::Command::new("mariadb").arg("--version").output().is_ok() {
+        if crate::process_utils::new_std_command("mariadb").arg("--version").output().is_ok() {
             return "mariadb".to_string();
         }
-        if std::process::Command::new("mysql").arg("--version").output().is_ok() {
+        if crate::process_utils::new_std_command("mysql").arg("--version").output().is_ok() {
             return "mysql".to_string();
         }
 
@@ -2934,7 +2933,7 @@ pub fn get_docker_mysql_cli(container: &str) -> String {
         }
     }
 
-    let detected = if let Ok(out) = std::process::Command::new("docker")
+    let detected = if let Ok(out) = crate::process_utils::new_std_command("docker")
         .arg("exec")
         .arg(container)
         .arg("mysql")
@@ -2943,7 +2942,7 @@ pub fn get_docker_mysql_cli(container: &str) -> String {
     {
         if out.status.success() {
             "mysql".to_string()
-        } else if let Ok(out_m) = std::process::Command::new("docker")
+        } else if let Ok(out_m) = crate::process_utils::new_std_command("docker")
             .arg("exec")
             .arg(container)
             .arg("mariadb")
@@ -2991,7 +2990,7 @@ fn spawn_mysql_child(
     };
 
     let mut cmd = if use_docker {
-        let mut c = tokio::process::Command::new("docker");
+        let mut c = crate::process_utils::new_tokio_command("docker");
         c.arg("exec")
             .arg("-i")
             .arg(container_name)
@@ -3013,7 +3012,7 @@ fn spawn_mysql_child(
         c.arg(db_name);
         c
     } else {
-        let mut c = tokio::process::Command::new(cli_bin);
+        let mut c = crate::process_utils::new_tokio_command(cli_bin);
         c.arg("--skip-ssl")
             .arg("--binary-mode")
             .arg("--quick")
@@ -3779,7 +3778,7 @@ async fn ensure_local_database_exists(local_config: &LocalDbConfig, app: &tauri:
 
     let mut cmd = if use_docker {
         let docker_cli = get_docker_mysql_cli(container_name);
-        let mut c = Command::new("docker");
+        let mut c = crate::process_utils::new_tokio_command("docker");
         c.arg("exec")
             .arg(container_name)
             .arg(&docker_cli)
@@ -3796,7 +3795,7 @@ async fn ensure_local_database_exists(local_config: &LocalDbConfig, app: &tauri:
         c
     } else {
         let cli_bin = get_mysql_cli_binary();
-        let mut c = Command::new(cli_bin);
+        let mut c = crate::process_utils::new_tokio_command(cli_bin);
         c.arg("--skip-ssl")
             .arg("--connect-timeout=60")
             .arg("-h")
