@@ -2031,10 +2031,12 @@ struct DownloadedTableData {
     table_name: String,
     response_bytes: Vec<u8>,
     is_gzip: bool,
+    format: String,
     table_start: std::time::Instant,
     already_imported: bool,
     imported_rows: usize,
 }
+
 
 /// Helper download low-level payload dari phpMyAdmin server
 async fn download_export_payload(
@@ -2068,7 +2070,7 @@ async fn download_export_payload(
     let default_compressions = vec!["gzip".to_string(), "none".to_string()];
 
     let mut candidates = Vec::new();
-    if let (Some(u), Some(c)) = (cached_url, cached_comp) {
+    if let (Some(u), Some(c)) = (&cached_url, &cached_comp) {
         candidates.push((u.clone(), c.clone()));
         if c == "gzip" {
             candidates.push((u.clone(), "none".to_string()));
@@ -2258,12 +2260,20 @@ async fn download_export_payload(
                 let err_html = response.text().await.unwrap_or_default();
                 last_html_err = sanitize_html_error(&err_html);
                 println!(
-                    "[PMA-DEBUG] Endpoint {} (comp={}) mengembalikan HTML response: {}",
-                    export_url, compression_mode, last_html_err
+                    "[PMA-DEBUG] Endpoint {} (comp={}, format={}) mengembalikan HTML response: {}",
+                    export_url, compression_mode, export_format, last_html_err
                 );
-                let mut guard = cached_endpoint.lock().await;
-                if guard.as_ref().map(|(u, _)| u == &export_url).unwrap_or(false) {
-                    *guard = None;
+                // Hanya hapus cached_endpoint jika kegagalan terjadi pada mode SQL standar
+                // Jangan merusak cache endpoint yang valid jika kegagalan disebabkan oleh mode CSV
+                if !is_csv {
+                    let mut guard = cached_endpoint.lock().await;
+                    if guard.as_ref().map(|(u, _)| u == &export_url).unwrap_or(false) {
+                        *guard = None;
+                    }
+                } else if cached_url.is_some() {
+                    // Jika CSV gagal di endpoint yang sudah terbukti valid untuk SQL,
+                    // jangan buang waktu mencoba kandidat route lainnya.
+                    break 'candidate_loop;
                 }
                 continue 'candidate_loop;
             }
@@ -2383,6 +2393,7 @@ async fn download_export_payload(
                 table_name: table_name.to_string(),
                 response_bytes: response_bytes.to_vec(),
                 is_gzip: is_gz,
+                format: export_format.to_string(),
                 table_start,
                 already_imported: false,
                 imported_rows: 0,
@@ -2409,6 +2420,7 @@ async fn fetch_table_export_stream(
     local_config: &LocalDbConfig,
     table_name: &str,
     cached_endpoint: &std::sync::Arc<tokio::sync::Mutex<Option<(String, String)>>>,
+    csv_supported: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     table_row_counts: &std::sync::Arc<HashMap<String, usize>>,
     app: &tauri::AppHandle,
     forced_chunk_size: Option<usize>,
@@ -2816,32 +2828,43 @@ async fn fetch_table_export_stream(
             .collect::<Vec<_>>()
             .join(" ");
 
-            // Coba ambil data chunk dalam format CSV (GZIP) terlebih dahulu untuk menghemat CPU & RAM server remote
-            let mut attempt_res = download_export_payload(
-                client,
-                base_url,
-                csrf_token,
-                pma_config,
-                table_name,
-                chunk_struct,
-                chunk_sql_struct,
-                chunk_sql_create,
-                chunk_sql_type,
-                Some(chunk_query.clone()),
-                cached_endpoint,
-                app,
-                Some(&chunk_label),
-                Some("csv"),
-            ).await;
+            // Coba ambil data chunk dalam format CSV (GZIP) terlebih dahulu jika PMA diketahui mendukung CSV
+            let try_csv = csv_supported.load(std::sync::atomic::Ordering::Relaxed);
+            let mut attempt_res = if try_csv {
+                download_export_payload(
+                    client,
+                    base_url,
+                    csrf_token,
+                    pma_config,
+                    table_name,
+                    chunk_struct,
+                    chunk_sql_struct,
+                    chunk_sql_create,
+                    chunk_sql_type,
+                    Some(chunk_query.clone()),
+                    cached_endpoint,
+                    app,
+                    Some(&chunk_label),
+                    Some("csv"),
+                ).await
+            } else {
+                Err("SKIP_CSV".to_string())
+            };
 
             // Fallback otomatis ke format SQL jika PMA remote tidak mengaktifkan modul/fitur CSV
             if let Err(ref e) = attempt_res {
                 if !e.contains("TIMEOUT") && !is_user_cancelled() && !is_aborted() {
-                    emit_log(
-                        app,
-                        "warn",
-                        format!("[Tabel '{}'] Mode CSV tidak didukung oleh PMA ({}), mencoba fallback format SQL...", table_name, e),
-                    );
+                    if try_csv {
+                        csv_supported.store(false, std::sync::atomic::Ordering::Relaxed);
+                        emit_log(
+                            app,
+                            "warn",
+                            format!(
+                                "[Tabel '{}'] Mode CSV tidak didukung oleh PMA ({}), beralih otomatis ke format SQL stream standar...",
+                                table_name, e
+                            ),
+                        );
+                    }
                     attempt_res = download_export_payload(
                         client,
                         base_url,
@@ -2915,12 +2938,29 @@ async fn fetch_table_export_stream(
                 break;
             }
 
-            let is_csv_data = !decompressed.starts_with(b"--")
-                && !decompressed.starts_with(b"/*")
-                && !decompressed.starts_with(b"INSERT")
-                && !decompressed.starts_with(b"REPLACE")
-                && !decompressed.starts_with(b"DROP")
-                && !decompressed.starts_with(b"CREATE");
+            // Deteksi format data secara ketat:
+            // Data HANYA boleh diproses sebagai CSV jika diunduh dengan format "csv" DAN tidak menyerupai SQL
+            let trimmed_start = decompressed.iter().position(|&b| !b.is_ascii_whitespace()).unwrap_or(0);
+            let slice = &decompressed[trimmed_start..];
+            let looks_like_sql = slice.starts_with(b"--")
+                || slice.starts_with(b"/*")
+                || slice.starts_with(b"SET ")
+                || slice.starts_with(b"set ")
+                || slice.starts_with(b"/*!")
+                || slice.starts_with(b"INSERT ")
+                || slice.starts_with(b"insert ")
+                || slice.starts_with(b"REPLACE ")
+                || slice.starts_with(b"replace ")
+                || slice.starts_with(b"DROP ")
+                || slice.starts_with(b"drop ")
+                || slice.starts_with(b"CREATE ")
+                || slice.starts_with(b"create ")
+                || slice.starts_with(b"USE ")
+                || slice.starts_with(b"use ")
+                || slice.starts_with(b"LOCK ")
+                || slice.starts_with(b"lock ");
+
+            let is_csv_data = chunk_data.format == "csv" && !looks_like_sql;
 
             let (raw_chunk_sql, row_count_in_chunk, has_insert) = if is_csv_data {
                 match convert_csv_to_sql_batch(&decompressed, table_name, pk_col_opt, chunk_sql_type) {
@@ -3062,6 +3102,7 @@ async fn fetch_table_export_stream(
         table_name: table_name.to_string(),
         response_bytes: Vec::new(),
         is_gzip: false,
+        format: "sql".to_string(),
         table_start,
         already_imported: true,
         imported_rows: total_imported_rows,
@@ -3315,6 +3356,23 @@ fn convert_csv_to_sql_batch(
 
     if headers.is_empty() {
         return Ok((Vec::new(), 0, None));
+    }
+
+    // Validasi apakah header CSV sebenarnya adalah SQL statement atau script
+    let is_sql_in_header = headers.iter().any(|h| {
+        let upper = h.trim().to_uppercase();
+        upper.starts_with("SET ")
+            || upper.starts_with("/*!")
+            || upper.starts_with("--")
+            || upper.starts_with("/*")
+            || upper.starts_with("INSERT ")
+            || upper.starts_with("REPLACE ")
+            || upper.starts_with("CREATE ")
+            || upper.starts_with("DROP ")
+            || upper.ends_with(';')
+    });
+    if is_sql_in_header {
+        return Err("Payload terdeteksi sebagai SQL stream, bukan data tabular CSV".to_string());
     }
 
     let pk_index = pk_col_opt.and_then(|pk| {
@@ -3928,6 +3986,7 @@ async fn import_table_to_local_with_fallback(
     base_url: &str,
     csrf_token: &str,
     cached_endpoint: &std::sync::Arc<tokio::sync::Mutex<Option<(String, String)>>>,
+    csv_supported: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     table_row_counts: &std::sync::Arc<HashMap<String, usize>>,
     pma_config: &PmaExportConfig,
     local_config: &LocalDbConfig,
@@ -3982,6 +4041,7 @@ async fn import_table_to_local_with_fallback(
                     local_config,
                     &table_name,
                     cached_endpoint,
+                    csv_supported,
                     table_row_counts,
                     app,
                     None, // Tidak ada limit override pada fallback fresh re-download
@@ -4287,6 +4347,7 @@ pub async fn export_pma_database(
     let (tx, rx) = tokio::sync::mpsc::channel::<Option<DownloadedTableData>>(buffer_capacity);
     let rx = std::sync::Arc::new(tokio::sync::Mutex::new(rx));
     let cached_endpoint = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+    let csv_supported = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let completed_tables = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let total_rows = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
@@ -4310,6 +4371,7 @@ pub async fn export_pma_database(
         let pma_config_p = pma_config.clone();
         let local_config_p = local_config.clone();
         let cached_endpoint_p = cached_endpoint.clone();
+        let csv_supported_p = csv_supported.clone();
         let table_row_counts_p = table_row_counts.clone();
         let app_p = app.clone();
         let tx_c = tx.clone();
@@ -4342,6 +4404,7 @@ pub async fn export_pma_database(
                     &local_config_p,
                     &table_name,
                     &cached_endpoint_p,
+                    &csv_supported_p,
                     &table_row_counts_p,
                     &app_p,
                     None,
@@ -4421,6 +4484,7 @@ pub async fn export_pma_database(
         let base_url_c = base_url.clone();
         let csrf_token_c = csrf_token.clone();
         let cached_endpoint_c = cached_endpoint.clone();
+        let csv_supported_c = csv_supported.clone();
         let table_row_counts_c = table_row_counts.clone();
         let app_c = app.clone();
 
@@ -4456,6 +4520,7 @@ pub async fn export_pma_database(
                             &base_url_c,
                             &csrf_token_c,
                             &cached_endpoint_c,
+                            &csv_supported_c,
                             &table_row_counts_c,
                             &pma_config_c,
                             &local_config_c,
@@ -4661,4 +4726,23 @@ INSERT INTO `users` VALUES
         let pk = extract_last_pk_value(sql, "id");
         assert_eq!(pk, Some("42".to_string()));
     }
+
+    #[test]
+    fn test_convert_csv_to_sql_batch_rejects_sql_prelude() {
+        let sql_dump = b"SET FOREIGN_KEY_CHECKS=0;\nSET SQL_MODE = \"NO_AUTO_VALUE_ON_ZERO\";\nSTART TRANSACTION;\n/*!40101 SET @OLD_CHARACTER_SET_CLIENT=@@CHARACTER_SET_CLIENT */;\n";
+        let res = convert_csv_to_sql_batch(sql_dump, "omni_test", Some("id"), "REPLACE");
+        assert!(res.is_err(), "Expected SQL prelude to be rejected by CSV batch converter");
+    }
+
+    #[test]
+    fn test_convert_csv_to_sql_batch_valid_csv() {
+        let csv_data = b"\"id\",\"name\",\"email\"\n1,\"John Doe\",\"john@example.com\"\n2,\"Jane Doe\",\"jane@example.com\"\n";
+        let (sql_bytes, rows, last_pk) = convert_csv_to_sql_batch(csv_data, "users", Some("id"), "REPLACE").unwrap();
+        assert_eq!(rows, 2);
+        assert_eq!(last_pk, Some("2".to_string()));
+        let sql_str = String::from_utf8(sql_bytes).unwrap();
+        assert!(sql_str.starts_with("REPLACE INTO `users` (`id`, `name`, `email`) VALUES"));
+        assert!(sql_str.contains("('1', 'John Doe', 'john@example.com')"));
+    }
 }
+
